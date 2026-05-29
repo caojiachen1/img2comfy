@@ -1,13 +1,13 @@
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'sendImageToComfyUI') {
-        processImage(request.imgSrc, request.pageUrl)
+        processImage(request.imgSrc, request.pageUrl, request.autoQueue)
             .then(() => sendResponse({ success: true }))
             .catch((err) => sendResponse({ success: false, error: err.message }));
         return true; // 保持异步返回通道
     }
 });
 
-async function processImage(imgSrc, pageUrl) {
+async function processImage(imgSrc, pageUrl, autoQueue = false) {
     const isHttp = imgSrc.startsWith('http');
     const ruleId = 1;
     
@@ -88,7 +88,7 @@ async function processImage(imgSrc, pageUrl) {
         const uploadedFilename = uploadData.name;
 
         // 5. 根据模式执行
-        await executeProfile(uploadedFilename, profile, comfyuiUrl);
+        await executeProfile(uploadedFilename, profile, comfyuiUrl, autoQueue);
     } finally {
         // 清理我们刚配置的伪装规则以便下一次干净运行
         if (isHttp) {
@@ -97,7 +97,7 @@ async function processImage(imgSrc, pageUrl) {
     }
 }
 
-async function executeProfile(filename, profile, comfyuiUrl) {
+async function executeProfile(filename, profile, comfyuiUrl, autoQueue) {
     if (profile.mode === 'api') {
         // API 模式：读取 JSON 并通过 API 触发
         if (!profile.workflowJson) throw new Error("API 模式下必须配置工作流 JSON 内容");
@@ -146,7 +146,7 @@ async function executeProfile(filename, profile, comfyuiUrl) {
     await chrome.scripting.executeScript({
         target: { tabId: comfyTabId },
         world: "MAIN", 
-        func: (newFilename, targetNodeType) => {
+        func: (newFilename, targetNodeType, autoQueue) => {
             if (!window.app || !window.app.graph) {
                 alert("未检测到 ComfyUI 视图 (app/graph)，其可能尚未加载完毕。");
                 return;
@@ -205,6 +205,20 @@ async function executeProfile(filename, profile, comfyuiUrl) {
 
                     window.app.graph.setDirtyCanvas(true, true);
                     console.log("成功应用图像并触发刷新 =", finalValue);
+                    
+                    if (autoQueue) {
+                        try {
+                            if (window.app.queuePrompt) {
+                                window.app.queuePrompt(0);
+                            } else {
+                                // 备用方案，模拟点击队列按钮
+                                const queueBtn = document.getElementById("queue-button") || document.querySelector("button.p-button-primary");
+                                if (queueBtn) queueBtn.click();
+                            }
+                        } catch (e) {
+                            console.warn("自动执行队列失败:", e);
+                        }
+                    }
                 } else {
                     alert('找到了节点，但节点中丢失了对应的 "image" 输入框');
                 }
@@ -212,6 +226,6 @@ async function executeProfile(filename, profile, comfyuiUrl) {
                 alert("未在画布中找到图像加载节点。\n请在配置中填入正确的节点类型名称，或在画布中用鼠标左键单击选中您想要传送的节点！");
             }
         },
-        args: [filename, targetNodeType]
+        args: [filename, targetNodeType, autoQueue]
     });
 }

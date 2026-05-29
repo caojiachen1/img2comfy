@@ -1,6 +1,12 @@
-#comfyui-send-extension-btn {
+#comfyui-extension-wrap {
   position: absolute;
   z-index: 2147483647; /* 保证总在最上面 */
+  display: none;
+  pointer-events: auto;
+  gap: 4px;
+}
+
+.comfyui-extension-btn {
   background-color: rgba(28, 28, 28, 0.85); /* 更深、更不透明的高级灰 */
   backdrop-filter: blur(12px) saturate(180%); /* Fluent Design 亚克力玻璃效果 */
   -webkit-backdrop-filter: blur(12px) saturate(180%);
@@ -13,13 +19,19 @@
   font-weight: 500;
   font-family: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif; /* 融入 Windows Fluent 字体 */
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); /* 阴影更柔和现代 */
-  display: none;
-  pointer-events: auto;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
 }
 
-#comfyui-send-extension-btn:hover {
+.comfyui-extension-btn:hover {
   background-color: rgba(45, 45, 45, 0.95);
   border-color: rgba(255, 255, 255, 0.3);
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
+
+.comfyui-extension-btn:active {
+  transform: scale(0.96);
 }
