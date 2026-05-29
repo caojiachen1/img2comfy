@@ -1,5 +1,8 @@
 document.addEventListener('DOMContentLoaded', async () => {
     const serverAddressInput = document.getElementById('serverAddress');
+    const buttonPositionSelect = document.getElementById('buttonPosition');
+    const offsetXInput = document.getElementById('offsetX');
+    const offsetYInput = document.getElementById('offsetY');
     const workflowSelect = document.getElementById('workflowSelect');
     const addWorkflowBtn = document.getElementById('addWorkflowBtn');
     const delWorkflowBtn = document.getElementById('delWorkflowBtn');
@@ -23,6 +26,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let config = {
         serverAddress: 'http://127.0.0.1:8188',
+        buttonPosition: 'top-right',
+        offsetX: 0,
+        offsetY: 0,
         activeProfileId: 'default',
         disabledHosts: [],
         profiles: {
@@ -51,6 +57,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     serverAddressInput.value = config.serverAddress || 'http://127.0.0.1:8188';
+    buttonPositionSelect.value = config.buttonPosition || 'top-right';
+    offsetXInput.value = config.offsetX || 0;
+    offsetYInput.value = config.offsetY || 0;
 
     // Get current tab info and update site enable toggle
     chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
@@ -166,6 +175,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     saveBtn.addEventListener('click', async () => {
         saveCurrentProfileData();
         config.serverAddress = serverAddressInput.value.trim().replace(/\/$/, ""); // remove trailing slash
+        config.buttonPosition = buttonPositionSelect.value;
+        config.offsetX = parseInt(offsetXInput.value) || 0;
+        config.offsetY = parseInt(offsetYInput.value) || 0;
         
         // 保存网站开关状态
         if (currentHostname) {

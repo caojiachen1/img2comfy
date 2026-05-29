@@ -49,7 +49,7 @@
             color: #cccccc;
         }
 
-        input[type="text"], select, textarea { 
+        input[type="text"], input[type="number"], select, textarea { 
             width: 100%; 
             box-sizing: border-box; 
             padding: 4px 6px; 
@@ -62,7 +62,7 @@
             transition: border-color 0.2s;
         }
 
-        input[type="text"]:focus, select:focus, textarea:focus {
+        input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus {
             border-color: var(--primary-color);
         }
 
@@ -154,6 +154,27 @@
             <input type="checkbox" id="siteEnableToggle" style="width: auto; margin: 0 6px 0 0; transform: scale(0.9);"> 
             <span id="siteEnableLabel">获取网站中...</span>
         </label>
+    </div>
+
+    <div class="form-group">
+        <label for="buttonPosition">按钮相对图片的基础位置</label>
+        <select id="buttonPosition" style="margin-bottom: 6px;">
+            <option value="top-right">右上角</option>
+            <option value="top-left">左上角</option>
+            <option value="bottom-right">右下角</option>
+            <option value="bottom-left">左下角</option>
+            <option value="center">中心 (覆盖在图片正中)</option>
+        </select>
+        <div style="display: flex; gap: 8px; justify-content: flex-start;">
+            <div style="width: 80px;">
+                <label for="offsetX" style="color:#aaa;">X偏移 (px)</label>
+                <input type="number" id="offsetX" placeholder="0">
+            </div>
+            <div style="width: 80px;">
+                <label for="offsetY" style="color:#aaa;">Y偏移 (px)</label>
+                <input type="number" id="offsetY" placeholder="0">
+            </div>
+        </div>
     </div>
     
     <div class="form-group">

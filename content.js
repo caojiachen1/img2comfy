@@ -24,10 +24,23 @@
         if (isComfyUIPage) {
             return; // 在 ComfyUI 页面直接退出，不注入按钮
         }
-        initExtensionButton();
+        initExtensionButton(data.comfyConfig || {});
     });
 
-    function initExtensionButton() {
+    function initExtensionButton(config) {
+        let btnPosition = config.buttonPosition || 'top-right';
+        let offsetX = parseInt(config.offsetX) || 0;
+        let offsetY = parseInt(config.offsetY) || 0;
+
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local' && changes.comfyConfig) {
+                btnPosition = changes.comfyConfig.newValue?.buttonPosition || 'top-right';
+                offsetX = parseInt(changes.comfyConfig.newValue?.offsetX) || 0;
+                offsetY = parseInt(changes.comfyConfig.newValue?.offsetY) || 0;
+                updateBtnPosition();
+            }
+        });
+
         const btn = document.createElement('button');
     btn.id = 'comfyui-send-extension-btn';
     btn.innerHTML = '发送到 ComfyUI';
@@ -47,8 +60,26 @@
             return;
         }
         
-        btn.style.top = (window.scrollY + rect.top + 10) + 'px';
-        btn.style.left = (window.scrollX + rect.right - btn.offsetWidth - 10) + 'px';
+        const scrollY = window.scrollY;
+        const scrollX = window.scrollX;
+        
+        if (btnPosition === 'top-left') {
+            btn.style.top = (scrollY + rect.top + 10 + offsetY) + 'px';
+            btn.style.left = (scrollX + rect.left + 10 + offsetX) + 'px';
+        } else if (btnPosition === 'bottom-right') {
+            btn.style.top = (scrollY + rect.bottom - btn.offsetHeight - 10 + offsetY) + 'px';
+            btn.style.left = (scrollX + rect.right - btn.offsetWidth - 10 + offsetX) + 'px';
+        } else if (btnPosition === 'bottom-left') {
+            btn.style.top = (scrollY + rect.bottom - btn.offsetHeight - 10 + offsetY) + 'px';
+            btn.style.left = (scrollX + rect.left + 10 + offsetX) + 'px';
+        } else if (btnPosition === 'center') {
+            btn.style.top = (scrollY + rect.top + (rect.height - btn.offsetHeight) / 2 + offsetY) + 'px';
+            btn.style.left = (scrollX + rect.left + (rect.width - btn.offsetWidth) / 2 + offsetX) + 'px';
+        } else {
+            // 默认右上角
+            btn.style.top = (scrollY + rect.top + 10 + offsetY) + 'px';
+            btn.style.left = (scrollX + rect.right - btn.offsetWidth - 10 + offsetX) + 'px';
+        }
     }
 
     // 鼠标悬浮移入图片
