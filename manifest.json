@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Send image to ComfyUI",
+  "version": "1.0",
+  "description": "一键将网页中的图片发送到本地 ComfyUI 的 LoadImageOutput 节点，自动突破防盗链。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"]
+    }
+  ],
+  "action": {
+    "default_title": "ComfyUI Sender",
+    "default_popup": "popup.html"
+  }
+}

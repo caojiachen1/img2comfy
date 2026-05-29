@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ComfyUI Sender 配置</title>
+    <style>
+        /* ... existing styles */
+        :root {
+            --bg-color: #1e1e1e;
+            --panel-bg: #2a2a2a;
+            --text-color: #e0e0e0;
+            --text-muted: #a0a0a0;
+            --border-color: #3e3e42;
+            --input-bg: #333333;
+            --input-border: #444444;
+            --primary-color: #007acc;
+            --primary-hover: #0098ff;
+            --btn-bg: #3a3a3d;
+            --btn-hover: #4a4a4d;
+            --danger-color: #f48771;
+            --success-color: #73c991;
+        }
+
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            padding: 10px; 
+            width: 300px; 
+            font-size: 11px; 
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+        }
+
+        h3 {
+            margin: 0 0 8px 0;
+            padding-bottom: 6px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .form-group { margin-bottom: 8px; }
+        
+        label { 
+            display: block; 
+            font-weight: 500; 
+            margin-bottom: 3px; 
+            font-size: 11px;
+            color: #cccccc;
+        }
+
+        input[type="text"], select, textarea { 
+            width: 100%; 
+            box-sizing: border-box; 
+            padding: 4px 6px; 
+            font-size: 11px; 
+            background-color: var(--input-bg);
+            color: var(--text-color);
+            border: 1px solid var(--input-border); 
+            border-radius: 3px; 
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input[type="text"]:focus, select:focus, textarea:focus {
+            border-color: var(--primary-color);
+        }
+
+        textarea { 
+            height: 60px; 
+            resize: vertical; 
+            font-family: inherit; 
+            font-size: 10px; 
+            line-height: 1.3;
+        }
+
+        .btn-group { 
+            margin-top: 10px; 
+            text-align: right; 
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+        }
+
+        button { 
+            padding: 4px 10px; 
+            cursor: pointer; 
+            border-radius: 3px; 
+            border: 1px solid var(--border-color); 
+            background: var(--btn-bg); 
+            color: var(--text-color);
+            font-size: 11px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        button:hover { 
+            background: var(--btn-hover); 
+        }
+
+        button.primary { 
+            background: var(--primary-color); 
+            color: white; 
+            border: none; 
+        }
+
+        button.primary:hover { 
+            background: var(--primary-hover); 
+        }
+
+        #addWorkflowBtn { font-weight: bold; width: 24px; padding: 3px 0; display: inline-flex; justify-content: center; align-items: center; }
+        #delWorkflowBtn { font-weight: bold; width: 24px; padding: 3px 0; color: var(--danger-color); display: inline-flex; justify-content: center; align-items: center; }
+        #delWorkflowBtn:hover { background-color: rgba(244, 135, 113, 0.1); border-color: var(--danger-color); }
+
+        .status { 
+            font-size: 11px; 
+            color: var(--success-color); 
+            margin-right: 10px; 
+            display: none; 
+            font-weight: 500;
+        }
+
+        #workflowConfig { 
+            border: 1px solid var(--border-color); 
+            padding: 8px; 
+            border-radius: 5px; 
+            background: var(--panel-bg); 
+            margin-top: 8px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .help-text { 
+            font-size: 10px; 
+            color: var(--text-muted); 
+            margin-top: 3px; 
+            line-height: 1.2; 
+        }
+        
+        .row { display: flex; gap: 8px; }
+        .row > * { flex: 1; }
+        
+        ::placeholder {
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+        <h3 style="margin: 0; padding: 0; border: none; font-size: 13px;">🖼️ ComfyUI Sender</h3>
+    </div>
+
+    <div class="form-group" style="padding-bottom: 8px; border-bottom: 1px solid var(--border-color); margin-bottom: 8px;">
+        <label style="display: flex; align-items: center; cursor: pointer; color: var(--text-color); font-size: 11px; margin: 0;">
+            <input type="checkbox" id="siteEnableToggle" style="width: auto; margin: 0 6px 0 0; transform: scale(0.9);"> 
+            <span id="siteEnableLabel">获取网站中...</span>
+        </label>
+    </div>
+    
+    <div class="form-group">
+        <label for="serverAddress">ComfyUI 地址 (包含 http:// 及端口，支持远程)</label>
+        <input type="text" id="serverAddress" placeholder="例如: http://127.0.0.1:8188 或 http://192.168.1.100:8188">
+    </div>
+
+    <div class="form-group">
+        <label>工作流配置 (Profile)</label>
+        <div style="display: flex; gap: 6px;">
+            <select id="workflowSelect" style="flex: 1;"></select>
+            <button id="addWorkflowBtn" title="新增工作流配置">+</button>
+            <button id="delWorkflowBtn" title="删除当前配置" style="color: red;">-</button>
+        </div>
+    </div>
+
+    <div id="workflowConfig">
+        <div class="form-group">
+            <label for="workflowName">当前配置名称</label>
+            <input type="text" id="workflowName" placeholder="例如: 默认发送到前端画布">
+        </div>
+        
+        <div class="form-group">
+            <label>发送模式</label>
+            <select id="executionMode">
+                <option value="frontend">前端注入模式：发送到已打开的 ComfyUI 网页标签</option>
+                <option value="api">后台 API 模式：静默执行，无需打开 ComfyUI 网页</option>
+            </select>
+        </div>
+
+        <!-- 前端模式配置 -->
+        <div id="frontendConfig">
+            <div class="form-group">
+                <label for="targetNodeType">前端目标 Load Image 控件识别特征</label>
+                <input type="text" id="targetNodeType" placeholder="留空自动寻找选中节点，或填节点标题，如: LoadImage">
+                <div class="help-text">向打开的 ComfyUI 画布注入图片时，尝试匹配此名称或类型的节点。</div>
+            </div>
+        </div>
+
+        <!-- API 模式配置 -->
+        <div id="apiConfig" style="display: none;">
+            <div class="form-group">
+                <label for="targetNodeId">Load Image 节点 ID (JSON中)</label>
+                <input type="text" id="targetNodeId" placeholder="例如: 15">
+                <div class="help-text">在此节点填入收到的图片，然后在后台作为工作流启动。</div>
+            </div>
+            <div class="form-group">
+                <label for="workflowJson">工作流 API JSON内容 (开启开发者模式保存)</label>
+                <textarea id="workflowJson" placeholder='{"15": {"class_type": "LoadImage", ...}}'></textarea>
+            </div>
+        </div>
+    </div>
+
+    <div class="btn-group">
+        <span class="status" id="saveStatus">✅ 保存成功</span>
+        <button id="saveBtn" class="primary">保存关闭</button>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

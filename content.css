@@ -1,0 +1,25 @@
+#comfyui-send-extension-btn {
+  position: absolute;
+  z-index: 2147483647; /* 保证总在最上面 */
+  background-color: rgba(28, 28, 28, 0.85); /* 更深、更不透明的高级灰 */
+  backdrop-filter: blur(12px) saturate(180%); /* Fluent Design 亚克力玻璃效果 */
+  -webkit-backdrop-filter: blur(12px) saturate(180%);
+  color: rgba(255, 255, 255, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 4px 10px; /* 尺寸变小 */
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px; /* 字号调小 */
+  font-weight: 500;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif; /* 融入 Windows Fluent 字体 */
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); /* 阴影更柔和现代 */
+  display: none;
+  pointer-events: auto;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+#comfyui-send-extension-btn:hover {
+  background-color: rgba(45, 45, 45, 0.95);
+  border-color: rgba(255, 255, 255, 0.3);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
