@@ -166,13 +166,17 @@
             <option value="center">中心 (覆盖在图片正中)</option>
         </select>
         <div style="display: flex; gap: 8px; justify-content: flex-start;">
-            <div style="width: 80px;">
-                <label for="offsetX" style="color:#aaa;">X偏移 (px)</label>
+            <div style="width: 70px;">
+                <label for="offsetX" style="color:#aaa;">X偏移(px)</label>
                 <input type="number" id="offsetX" placeholder="0">
             </div>
-            <div style="width: 80px;">
-                <label for="offsetY" style="color:#aaa;">Y偏移 (px)</label>
+            <div style="width: 70px;">
+                <label for="offsetY" style="color:#aaa;">Y偏移(px)</label>
                 <input type="number" id="offsetY" placeholder="0">
+            </div>
+            <div style="width: 100px;">
+                <label for="minImgSize" style="color:#aaa;" title="限制图片尺寸，可过滤掉类似九宫格未放大的小图片">最小尺寸(px)</label>
+                <input type="number" id="minImgSize" placeholder="200" min="0">
             </div>
         </div>
     </div>

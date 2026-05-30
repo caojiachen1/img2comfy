@@ -31,12 +31,14 @@
         let btnPosition = config.buttonPosition || 'top-right';
         let offsetX = parseInt(config.offsetX) || 0;
         let offsetY = parseInt(config.offsetY) || 0;
+        let minImgSize = config.minImgSize !== undefined ? parseInt(config.minImgSize) : 200;
 
         chrome.storage.onChanged.addListener((changes, area) => {
             if (area === 'local' && changes.comfyConfig) {
                 btnPosition = changes.comfyConfig.newValue?.buttonPosition || 'top-right';
                 offsetX = parseInt(changes.comfyConfig.newValue?.offsetX) || 0;
                 offsetY = parseInt(changes.comfyConfig.newValue?.offsetY) || 0;
+                minImgSize = changes.comfyConfig.newValue?.minImgSize !== undefined ? parseInt(changes.comfyConfig.newValue?.minImgSize) : 200;
                 updateBtnPosition();
             }
         });
@@ -67,8 +69,8 @@
             if (!currentImg) return;
             const rect = currentImg.getBoundingClientRect();
             
-            // 忽略太细小的图标或底图，防止干扰
-            if (rect.width < 100 || rect.height < 100) {
+            // 忽略太细小的图标或底图，防止干扰（可通过配置的 minImgSize 过滤掉九宫格等未放大的缩略图）
+            if (rect.width < minImgSize || rect.height < minImgSize) {
                 wrap.style.display = 'none';
                 return;
             }

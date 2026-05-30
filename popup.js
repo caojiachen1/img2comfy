@@ -3,6 +3,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const buttonPositionSelect = document.getElementById('buttonPosition');
     const offsetXInput = document.getElementById('offsetX');
     const offsetYInput = document.getElementById('offsetY');
+    const minImgSizeInput = document.getElementById('minImgSize');
     const workflowSelect = document.getElementById('workflowSelect');
     const addWorkflowBtn = document.getElementById('addWorkflowBtn');
     const delWorkflowBtn = document.getElementById('delWorkflowBtn');
@@ -29,6 +30,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         buttonPosition: 'top-right',
         offsetX: 0,
         offsetY: 0,
+        minImgSize: 200,
         activeProfileId: 'default',
         disabledHosts: [],
         profiles: {
@@ -60,6 +62,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     buttonPositionSelect.value = config.buttonPosition || 'top-right';
     offsetXInput.value = config.offsetX || 0;
     offsetYInput.value = config.offsetY || 0;
+    minImgSizeInput.value = config.minImgSize !== undefined ? config.minImgSize : 200;
 
     // Get current tab info and update site enable toggle
     chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
@@ -178,6 +181,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         config.buttonPosition = buttonPositionSelect.value;
         config.offsetX = parseInt(offsetXInput.value) || 0;
         config.offsetY = parseInt(offsetYInput.value) || 0;
+        config.minImgSize = parseInt(minImgSizeInput.value);
+        if (isNaN(config.minImgSize)) config.minImgSize = 200;
         
         // 保存网站开关状态
         if (currentHostname) {
