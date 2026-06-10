@@ -157,6 +157,13 @@
     </div>
 
     <div class="form-group">
+        <label style="display: flex; align-items: center; cursor: pointer; color: var(--text-color); font-size: 11px; margin: 0;">
+            <input type="checkbox" id="alwaysShowToggle" style="width: auto; margin: 0 6px 0 0; transform: scale(0.9);"> 
+            <span>始终显示按钮（不用悬停图片也显示在图片上方）</span>
+        </label>
+    </div>
+
+    <div class="form-group">
         <label for="buttonPosition">按钮相对图片的基础位置</label>
         <select id="buttonPosition" style="margin-bottom: 6px;">
             <option value="top-right">右上角</option>
@@ -233,8 +240,7 @@
     </div>
 
     <div class="btn-group">
-        <span class="status" id="saveStatus">✅ 保存成功</span>
-        <button id="saveBtn" class="primary">保存关闭</button>
+        <span class="status" id="saveStatus" style="display: none;">✅ 已自动保存</span>
     </div>
 
     <script src="popup.js"></script>

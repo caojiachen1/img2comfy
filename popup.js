@@ -18,11 +18,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const frontendConfig = document.getElementById('frontendConfig');
     const apiConfig = document.getElementById('apiConfig');
     
-    const saveBtn = document.getElementById('saveBtn');
     const saveStatus = document.getElementById('saveStatus');
 
     const siteEnableToggle = document.getElementById('siteEnableToggle');
     const siteEnableLabel = document.getElementById('siteEnableLabel');
+    const alwaysShowToggle = document.getElementById('alwaysShowToggle');
     let currentHostname = '';
 
     let config = {
@@ -31,6 +31,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         offsetX: 0,
         offsetY: 0,
         minImgSize: 200,
+        alwaysShow: false,
         activeProfileId: 'default',
         disabledHosts: [],
         profiles: {
@@ -63,6 +64,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     offsetXInput.value = config.offsetX || 0;
     offsetYInput.value = config.offsetY || 0;
     minImgSizeInput.value = config.minImgSize !== undefined ? config.minImgSize : 200;
+    alwaysShowToggle.checked = config.alwaysShow || false;
 
     // Get current tab info and update site enable toggle
     chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
@@ -175,35 +177,50 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
-    saveBtn.addEventListener('click', async () => {
-        saveCurrentProfileData();
-        config.serverAddress = serverAddressInput.value.trim().replace(/\/$/, ""); // remove trailing slash
-        config.buttonPosition = buttonPositionSelect.value;
-        config.offsetX = parseInt(offsetXInput.value) || 0;
-        config.offsetY = parseInt(offsetYInput.value) || 0;
-        config.minImgSize = parseInt(minImgSizeInput.value);
-        if (isNaN(config.minImgSize)) config.minImgSize = 200;
-        
-        // 保存网站开关状态
-        if (currentHostname) {
-            config.disabledHosts = config.disabledHosts || [];
-            if (siteEnableToggle.checked) {
-                config.disabledHosts = config.disabledHosts.filter(h => h !== currentHostname);
-            } else {
-                if (!config.disabledHosts.includes(currentHostname)) {
-                    config.disabledHosts.push(currentHostname);
+    // 自动保存函数
+    let saveTimeout = null;
+    function autoSave() {
+        if (saveTimeout) clearTimeout(saveTimeout);
+        saveTimeout = setTimeout(async () => {
+            saveCurrentProfileData();
+            config.serverAddress = serverAddressInput.value.trim().replace(/\/$/, "");
+            config.buttonPosition = buttonPositionSelect.value;
+            config.offsetX = parseInt(offsetXInput.value) || 0;
+            config.offsetY = parseInt(offsetYInput.value) || 0;
+            config.minImgSize = parseInt(minImgSizeInput.value);
+            if (isNaN(config.minImgSize)) config.minImgSize = 200;
+            config.alwaysShow = alwaysShowToggle.checked;
+            
+            if (currentHostname) {
+                config.disabledHosts = config.disabledHosts || [];
+                if (siteEnableToggle.checked) {
+                    config.disabledHosts = config.disabledHosts.filter(h => h !== currentHostname);
+                } else {
+                    if (!config.disabledHosts.includes(currentHostname)) {
+                        config.disabledHosts.push(currentHostname);
+                    }
                 }
             }
-        }
 
-        await chrome.storage.local.set({ comfyConfig: config });
-        
-        saveStatus.style.display = 'inline';
-        setTimeout(() => {
-            saveStatus.style.display = 'none';
-            window.close(); // Close popup after save
-        }, 800);
+            await chrome.storage.local.set({ comfyConfig: config });
+            
+            saveStatus.style.display = 'inline';
+            setTimeout(() => {
+                saveStatus.style.display = 'none';
+            }, 1500);
+        }, 300);
+    }
+
+    // 监听所有输入的变化并自动保存
+    const allInputs = [serverAddressInput, buttonPositionSelect, offsetXInput, offsetYInput, minImgSizeInput, alwaysShowToggle, siteEnableToggle, executionModeSelect, targetNodeTypeInput, targetNodeIdInput, workflowNameInput];
+    allInputs.forEach(input => {
+        input.addEventListener('change', autoSave);
+        if (input.tagName === 'INPUT' && input.type !== 'checkbox') {
+            input.addEventListener('input', autoSave);
+        }
     });
+    workflowJsonInput.addEventListener('input', autoSave);
+    workflowJsonInput.addEventListener('change', autoSave);
 
     renderProfiles();
 });

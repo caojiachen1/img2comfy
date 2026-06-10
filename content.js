@@ -32,6 +32,7 @@
         let offsetX = parseInt(config.offsetX) || 0;
         let offsetY = parseInt(config.offsetY) || 0;
         let minImgSize = config.minImgSize !== undefined ? parseInt(config.minImgSize) : 200;
+        let alwaysShow = config.alwaysShow || false;
 
         chrome.storage.onChanged.addListener((changes, area) => {
             if (area === 'local' && changes.comfyConfig) {
@@ -39,6 +40,7 @@
                 offsetX = parseInt(changes.comfyConfig.newValue?.offsetX) || 0;
                 offsetY = parseInt(changes.comfyConfig.newValue?.offsetY) || 0;
                 minImgSize = changes.comfyConfig.newValue?.minImgSize !== undefined ? parseInt(changes.comfyConfig.newValue?.minImgSize) : 200;
+                alwaysShow = changes.comfyConfig.newValue?.alwaysShow || false;
                 updateBtnPosition();
             }
         });
@@ -111,7 +113,7 @@
 
         // 鼠标移出图片及按钮
         document.addEventListener('mousemove', (e) => {
-            if (wrap.style.display === 'flex') {
+            if (wrap.style.display === 'flex' && !alwaysShow) {
                 if (!wrap.contains(e.target) && e.target !== currentImg) {
                     wrap.style.display = 'none';
                     currentImg = null;
