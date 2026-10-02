@@ -104,6 +104,18 @@
             }
         }
 
+        // 抖音等站点用 blur 滤镜的同图副本做全屏衬底，命中时必须避开，优先取清晰原图
+        function isBlurred(el) {
+            let node = el, hops = 0;
+            while (node && hops < 5) {
+                const f = getComputedStyle(node).filter;
+                if (f && f.includes('blur')) return true;
+                node = node.parentElement;
+                hops++;
+            }
+            return false;
+        }
+
         // 轮播图（如抖音图文）把各分页图片叠放在同一位置切换显隐，而 opacity:0 的元素
         // 依然可以被 elementsFromPoint 命中，必须按计算样式过滤掉不可见的，
         // 才能选到当前实际展示的那一张
@@ -123,21 +135,49 @@
         }
 
         // 抖音等站点会在 <img>/<video> 上方覆盖透明的交互层（播放器控制层、图文滑动切换层等），
-        // 鼠标事件的 target 是覆盖层而不是媒体元素本身，
-        // 因此用 elementsFromPoint 穿透整层元素栈向下查找真正的媒体元素
+        // 鼠标事件的 target 是覆盖层而不是媒体元素本身，因此用 elementsFromPoint 穿透元素栈查找。
+        // 更关键的是：抖音图文的分页大图本身带 pointer-events:none（手势交给上层容器），
+        // 根本不会出现在 elementsFromPoint 结果里——已实测确认，必须对栈内容器做后代扫描才能找到，
+        // 且要从模糊衬底图（filter:blur 的同图副本）和 data:URI 覆盖图标中选出真正展示的那张
         function findMediaAtPoint(x, y) {
             const stack = document.elementsFromPoint(x, y);
-            for (const el of stack) {
+            const candidates = [];
+            const seen = new Set();
+
+            const consider = (media, stackIdx) => {
+                if (!media || seen.has(media)) return;
+                if (!(media.tagName === 'IMG' || media.tagName === 'VIDEO')) return;
+                if (!isElementVisible(media)) return;
+                const rect = media.getBoundingClientRect();
+                // 只认与探测点实际交叠的媒体（轮播平移出视口的分页、相邻图被排除）
+                if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return;
+                if (rect.width < minImgSize || rect.height < minImgSize) return;
+                const src = media.currentSrc || media.src || '';
+                // 尚未加载内容的占位 img 没有可下载的地址
+                if (media.tagName === 'IMG' && !src) return;
+                seen.add(media);
+                candidates.push({
+                    el: media,
+                    srcOverride: null,
+                    stackIdx,
+                    blurred: isBlurred(media),
+                    dataSrc: media.tagName === 'IMG' && src.startsWith('data:'),
+                    area: rect.width * rect.height,
+                });
+            };
+
+            for (let i = 0; i < stack.length; i++) {
+                const el = stack[i];
                 if (!el.closest) continue;
                 if (el.closest('#comfyui-extension-wrap')) continue;
 
-                const media = el.closest('img, video');
-                if (media) {
-                    // 跳过被切换隐藏的轮播分页，且只认与鼠标点有实际交叠的媒体（closest 会向上冒泡到不相邻的祖先）
-                    if (!isElementVisible(media)) continue;
-                    const rect = media.getBoundingClientRect();
-                    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
-                    return { el: media, src: null };
+                // 直接命中的媒体（pointer-events 正常的 img/video）
+                const direct = el.closest('img, video');
+                if (direct) consider(direct, i);
+
+                // 后代扫描：pointer-events:none 的媒体不在命中栈里，但它们的容器在
+                if (el.querySelectorAll) {
+                    for (const m of el.querySelectorAll('img, video')) consider(m, i);
                 }
 
                 // 部分站点用 background-image 展示图片，没有 <img> 可悬浮，
@@ -149,13 +189,33 @@
                         if (bg && bg !== 'none') {
                             const m = bg.match(/url\(["']?(https?:[^"')]+)["']?\)/);
                             if (m) {
-                                return { el: el, src: m[1] };
+                                candidates.push({
+                                    el: el,
+                                    srcOverride: m[1],
+                                    stackIdx: i,
+                                    blurred: isBlurred(el),
+                                    dataSrc: false,
+                                    kind: 1,
+                                    area: rect.width * rect.height,
+                                });
                             }
                         }
                     }
                 }
             }
-            return null;
+
+            if (candidates.length === 0) return null;
+            // 排序：非模糊衬底 > 真实图片URL（data:URI 通常是覆盖图标）> 真实媒体优先于背景图容器
+            // > 栈序靠前（绘制在上层，即用户看到的那张）> 面积大者优先
+            for (const c of candidates) if (c.kind === undefined) c.kind = 0;
+            candidates.sort((a, b) =>
+                (a.blurred - b.blurred) ||
+                (a.dataSrc - b.dataSrc) ||
+                (a.kind - b.kind) ||
+                (a.stackIdx - b.stackIdx) ||
+                (b.area - a.area));
+            const best = candidates[0];
+            return { el: best.el, src: best.srcOverride };
         }
 
         // 按给定坐标重新探测并写回 currentImg，返回探测到的媒体元素（没有则 null）。
