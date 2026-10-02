@@ -67,6 +67,8 @@
         let currentImg = null;
         // 当媒体是以 background-image 形式展示时，其图片地址存放在这里（此时 currentImg 上没有 src）
         let currentSrcOverride = null;
+        // 最近一次鼠标位置，用于在点击发送/切换分页时重新探测当前位置的可见媒体
+        const lastMouse = { x: 0, y: 0 };
         let originalTitle = btn.innerHTML;
 
         // 更新按钮位置使其贴附在图片右上角
@@ -102,6 +104,23 @@
             }
         }
 
+        // 轮播图（如抖音图文）把各分页图片叠放在同一位置用 opacity 控制显示，
+        // elementsFromPoint 会命中底下的旧分页，必须过滤掉不可见的才能选到当前展示的那张
+        function isElementVisible(el) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return false;
+            const style = getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            // 逐层祖先检查 opacity/display/visibility，覆盖抖音用容器控制显隐的情况
+            let node = el.parentElement;
+            while (node && node !== document.body) {
+                const s = getComputedStyle(node);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                node = node.parentElement;
+            }
+            return true;
+        }
+
         // 抖音等站点会在 <img>/<video> 上方覆盖透明的交互层（播放器控制层、图文滑动切换层等），
         // 鼠标事件的 target 是覆盖层而不是媒体元素本身，
         // 因此用 elementsFromPoint 穿透整层元素栈向下查找真正的媒体元素
@@ -113,6 +132,10 @@
 
                 const media = el.closest('img, video');
                 if (media) {
+                    // 跳过被切换隐藏的轮播分页，且只认与鼠标点有实际交叠的媒体（closest 会向上冒泡到不相邻的祖先）
+                    const rect = media.getBoundingClientRect();
+                    if (!isElementVisible(media)) continue;
+                    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
                     return { el: media, src: null };
                 }
 
@@ -134,8 +157,32 @@
             return null;
         }
 
+        // 将悬浮目标同步为当前鼠标位置下实际可见的媒体。
+        // 轮播切图后旧 <img> 可能仍占位显示旧内容，不重新探测就会发错图。
+        // 仅当新探测到的媒体与原目标位置重叠时才替换（轮播分页叠放在同一位置），
+        // 防止按钮被偏移到图片外时误把旁边的无关媒体当成发送目标
+        function refreshCurrentMedia() {
+            const found = findMediaAtPoint(lastMouse.x, lastMouse.y);
+            if (!found || found.el === currentImg) return;
+            if (!currentImg) {
+                currentImg = found.el;
+                currentSrcOverride = found.src;
+                return;
+            }
+            const a = found.el.getBoundingClientRect();
+            const b = currentImg.getBoundingClientRect();
+            const ix = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+            const iy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+            if (ix > 0 && iy > 0) {
+                currentImg = found.el;
+                currentSrcOverride = found.src;
+            }
+        }
+
         // 鼠标悬浮移入图片/视频
         document.addEventListener('mouseover', (e) => {
+            lastMouse.x = e.clientX;
+            lastMouse.y = e.clientY;
             const found = findMediaAtPoint(e.clientX, e.clientY);
             if (!found) return;
             currentImg = found.el;
@@ -234,6 +281,12 @@
             e.preventDefault();
             e.stopPropagation();
             if(!currentImg) return;
+
+            // 发送瞬间以鼠标当前位置下实际可见的媒体为准。
+            // 轮播切图通常不触发 mouseover（点箭头时鼠标不动），currentImg 里缓存的还是切换前的分页，
+            // 所以这里必须重新探测一次，避免发出去的是第一张旧图
+            refreshCurrentMedia();
+            if (!currentImg) return;
 
             const isVideo = currentImg.tagName === 'VIDEO';
             const media = currentImg;
