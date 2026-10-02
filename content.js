@@ -63,11 +63,11 @@
         wrap.appendChild(playBtn);
         document.body.appendChild(wrap);
 
-        // 当前悬浮的媒体元素（<img>、<video> 或带 background-image 的元素）
+        // 探测结果（始终反映"鼠标位置下当前可见的媒体"，不做跨时机缓存——
+        // 轮播切图不会触发 mouseover，任何缓存到点击时刻都可能是过期的第一张）
         let currentImg = null;
         // 当媒体是以 background-image 形式展示时，其图片地址存放在这里（此时 currentImg 上没有 src）
         let currentSrcOverride = null;
-        // 最近一次鼠标位置，用于在点击发送/切换分页时重新探测当前位置的可见媒体
         const lastMouse = { x: 0, y: 0 };
         let originalTitle = btn.innerHTML;
 
@@ -104,14 +104,15 @@
             }
         }
 
-        // 轮播图（如抖音图文）把各分页图片叠放在同一位置用 opacity 控制显示，
-        // elementsFromPoint 会命中底下的旧分页，必须过滤掉不可见的才能选到当前展示的那张
+        // 轮播图（如抖音图文）把各分页图片叠放在同一位置切换显隐，而 opacity:0 的元素
+        // 依然可以被 elementsFromPoint 命中，必须按计算样式过滤掉不可见的，
+        // 才能选到当前实际展示的那一张
         function isElementVisible(el) {
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return false;
             const style = getComputedStyle(el);
             if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-            // 逐层祖先检查 opacity/display/visibility，覆盖抖音用容器控制显隐的情况
+            // 逐层祖先检查，覆盖用容器类名控制分页显隐的情况
             let node = el.parentElement;
             while (node && node !== document.body) {
                 const s = getComputedStyle(node);
@@ -133,17 +134,17 @@
                 const media = el.closest('img, video');
                 if (media) {
                     // 跳过被切换隐藏的轮播分页，且只认与鼠标点有实际交叠的媒体（closest 会向上冒泡到不相邻的祖先）
-                    const rect = media.getBoundingClientRect();
                     if (!isElementVisible(media)) continue;
+                    const rect = media.getBoundingClientRect();
                     if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
                     return { el: media, src: null };
                 }
 
                 // 部分站点用 background-image 展示图片，没有 <img> 可悬浮，
-                // 只有足够大的背景图才认定为内容图片（避免小图标层抢先命中）
+                // 只有足够大且可见的背景图才认定为内容图片（避免隐藏分页/小图标层抢先命中）
                 if (el instanceof HTMLElement) {
                     const rect = el.getBoundingClientRect();
-                    if (rect.width >= minImgSize && rect.height >= minImgSize) {
+                    if (rect.width >= minImgSize && rect.height >= minImgSize && isElementVisible(el)) {
                         const bg = getComputedStyle(el).backgroundImage;
                         if (bg && bg !== 'none') {
                             const m = bg.match(/url\(["']?(https?:[^"')]+)["']?\)/);
@@ -157,61 +158,60 @@
             return null;
         }
 
-        // 将悬浮目标同步为当前鼠标位置下实际可见的媒体。
-        // 轮播切图后旧 <img> 可能仍占位显示旧内容，不重新探测就会发错图。
-        // 仅当新探测到的媒体与原目标位置重叠时才替换（轮播分页叠放在同一位置），
-        // 防止按钮被偏移到图片外时误把旁边的无关媒体当成发送目标
-        function refreshCurrentMedia() {
-            const found = findMediaAtPoint(lastMouse.x, lastMouse.y);
-            if (!found || found.el === currentImg) return;
-            if (!currentImg) {
+        // 按给定坐标重新探测并写回 currentImg，返回探测到的媒体元素（没有则 null）。
+        // 这是唯一为 currentImg 赋值的入口
+        function probeAt(x, y) {
+            const found = findMediaAtPoint(x, y);
+            if (found) {
                 currentImg = found.el;
                 currentSrcOverride = found.src;
-                return;
+                return found.el;
             }
-            const a = found.el.getBoundingClientRect();
-            const b = currentImg.getBoundingClientRect();
-            const ix = Math.min(a.right, b.right) - Math.max(a.left, b.left);
-            const iy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
-            if (ix > 0 && iy > 0) {
-                currentImg = found.el;
-                currentSrcOverride = found.src;
-            }
+            return null;
         }
 
-        // 鼠标悬浮移入图片/视频
-        document.addEventListener('mouseover', (e) => {
-            lastMouse.x = e.clientX;
-            lastMouse.y = e.clientY;
-            const found = findMediaAtPoint(e.clientX, e.clientY);
-            if (!found) return;
-            currentImg = found.el;
-            currentSrcOverride = found.src;
+        function showWrap() {
             wrap.style.display = 'flex';
             btn.innerHTML = originalTitle;
             btn.disabled = false;
             playBtn.disabled = false;
             updateBtnPosition();
+        }
+
+        function hideWrap() {
+            wrap.style.display = 'none';
+            currentImg = null;
+            currentSrcOverride = null;
+        }
+
+        document.addEventListener('mouseover', (e) => {
+            lastMouse.x = e.clientX;
+            lastMouse.y = e.clientY;
+            if (probeAt(e.clientX, e.clientY)) showWrap();
         });
 
-        // 鼠标移出媒体区域及按钮后隐藏。
-        // 不能像旧版那样用 e.target !== currentImg 判断（媒体上方常有覆盖层，target 永远不是媒体元素），
-        // 改用几何位置判断鼠标是否仍在媒体矩形内
+        // 鼠标每动一次就按当前位置重新探测：悬浮目标始终跟随"此刻鼠标下可见的媒体"，
+        // 轮播切图后移回图内会立刻指向新分页；移出媒体区域则隐藏。
+        // 不能用 e.target !== currentImg 判断（媒体上方常有覆盖层，target 永远不是媒体元素）
         document.addEventListener('mousemove', (e) => {
-            if (wrap.style.display === 'flex' && !alwaysShow) {
-                if (wrap.contains(e.target)) return;
-                if (currentImg) {
-                    const r = currentImg.getBoundingClientRect();
-                    if (e.clientX >= r.left && e.clientX <= r.right &&
-                        e.clientY >= r.top && e.clientY <= r.bottom) {
-                        return;
-                    }
-                }
-                wrap.style.display = 'none';
-                currentImg = null;
-                currentSrcOverride = null;
+            lastMouse.x = e.clientX;
+            lastMouse.y = e.clientY;
+            if (wrap.style.display !== 'flex' || alwaysShow) return;
+            if (wrap.contains(e.target)) return;
+            if (probeAt(e.clientX, e.clientY)) {
+                updateBtnPosition();
+            } else {
+                hideWrap();
             }
         });
+
+        // 兜底：轮播自动播放/切页动画结束等不产生鼠标事件的切换，
+        // 按最后鼠标位置周期性重新探测，保证点击发送时目标不会停留在旧分页。
+        // 探测失败时不隐藏（那是 mousemove 的职责），只保持现状
+        setInterval(() => {
+            if (wrap.style.display !== 'flex') return;
+            if (probeAt(lastMouse.x, lastMouse.y)) updateBtnPosition();
+        }, 300);
 
         // 保持滚动和改变大小时按钮跟随
         window.addEventListener('scroll', updateBtnPosition);
@@ -280,18 +280,17 @@
         function handleSend(e, autoQueue) {
             e.preventDefault();
             e.stopPropagation();
-            if(!currentImg) return;
 
-            // 发送瞬间以鼠标当前位置下实际可见的媒体为准。
-            // 轮播切图通常不触发 mouseover（点箭头时鼠标不动），currentImg 里缓存的还是切换前的分页，
-            // 所以这里必须重新探测一次，避免发出去的是第一张旧图
-            refreshCurrentMedia();
-            if (!currentImg) return;
+            // 发送瞬间以"点击位置下实际可见的媒体"为准重新探测。
+            // 轮播切图（点箭头/拖拽/自动播放）都不触发 mouseover，且旧分页元素可能被平移、
+            // 重建或置为 opacity:0，任何此前缓存的 currentImg 都可能还是第一张
+            if (!probeAt(e.clientX, e.clientY) && !currentImg) return;
 
-            const isVideo = currentImg.tagName === 'VIDEO';
             const media = currentImg;
+            const isVideo = media.tagName === 'VIDEO';
             const imgSrc = isVideo ? null : (currentSrcOverride || media.currentSrc || media.src);
             const pageUrl = window.location.href;
+            console.debug('[ComfyUI Sender] 发送目标:', isVideo ? '视频当前帧' : imgSrc);
 
             const targetBtn = autoQueue ? playBtn : btn;
             targetBtn.innerHTML = '⏳';
