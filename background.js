@@ -1,14 +1,28 @@
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'captureVisibleTab') {
+        // 供内容脚本在视频画布被跨域污染时降级截图取帧使用
+        chrome.tabs.captureVisibleTab(null, { format: 'png' }, (dataUrl) => {
+            if (chrome.runtime.lastError) {
+                sendResponse({ success: false, error: chrome.runtime.lastError.message });
+            } else {
+                sendResponse({ success: true, dataUrl: dataUrl });
+            }
+        });
+        return true; // 保持异步返回通道
+    }
     if (request.action === 'sendImageToComfyUI') {
-        processImage(request.imgSrc, request.pageUrl, request.autoQueue)
+        processImage(request)
             .then(() => sendResponse({ success: true }))
             .catch((err) => sendResponse({ success: false, error: err.message }));
         return true; // 保持异步返回通道
     }
 });
 
-async function processImage(imgSrc, pageUrl, autoQueue = false) {
-    const isHttp = imgSrc.startsWith('http');
+async function processImage(request) {
+    const imgSrc = request.imgSrc;
+    const dataUrl = request.dataUrl;
+    const autoQueue = request.autoQueue || false;
+    const isHttp = !!imgSrc && imgSrc.startsWith('http');
     const ruleId = 1;
     
     // 获取配置
@@ -35,7 +49,7 @@ async function processImage(imgSrc, pageUrl, autoQueue = false) {
                 action: {
                     type: 'modifyHeaders',
                     requestHeaders: [
-                        { header: 'Referer', operation: 'set', value: pageUrl }
+                        { header: 'Referer', operation: 'set', value: request.pageUrl }
                     ]
                 },
                 condition: {
@@ -47,23 +61,29 @@ async function processImage(imgSrc, pageUrl, autoQueue = false) {
     }
 
     try {
-        // 2. 将突破防盗链限制的图片下载至后台
-        const imgRes = await fetch(imgSrc);
-        if (!imgRes.ok) throw new Error(`背景下载图片失败: 状态码 ${imgRes.status}`);
-        const blob = await imgRes.blob();
+        // 2. 获取图片数据：视频帧是内容脚本已生成好的 dataUrl，网页图片则突破防盗链后台下载
+        let blob;
+        if (dataUrl) {
+            blob = await (await fetch(dataUrl)).blob();
+        } else {
+            const imgRes = await fetch(imgSrc);
+            if (!imgRes.ok) throw new Error(`背景下载图片失败: 状态码 ${imgRes.status}`);
+            blob = await imgRes.blob();
+        }
 
         // 3. 构建表单准备提交给本地 ComfyUI API
-        const formData = new FormData();
-        let filename = 'web_image_' + Date.now() + '.png';
-        
-        try {
-            const url = new URL(imgSrc);
-            const pathParts = url.pathname.split('/');
-            const pathName = pathParts[pathParts.length - 1];
-            if (pathName && pathName.includes('.')) {
-                filename = pathName;
-            }
-        } catch(e) {}
+        let filename = request.filename || 'web_image_' + Date.now() + '.png';
+
+        if (!request.filename) {
+            try {
+                const url = new URL(imgSrc);
+                const pathParts = url.pathname.split('/');
+                const pathName = pathParts[pathParts.length - 1];
+                if (pathName && pathName.includes('.')) {
+                    filename = pathName;
+                }
+            } catch(e) {}
+        }
         
         // 4. 调用本地 ComfyUI 上传接口 (将图片同时存入 input 和 output 确保对任意不同类型的图像节点都能生效)
         // 第一份发给 Input 文件夹（给常规 LoadImage 用）
