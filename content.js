@@ -134,6 +134,33 @@
             return true;
         }
 
+        // 判断元素是否为"不透明遮挡物"：信息流会把下一个视频/图文的封面预载在当前图层
+        // 下方（位置重叠、计算样式上"可见"），必须结合绘制层级把它们剔除。
+        // 渐变遮罩（可透出内容）与小图标不算遮挡
+        function isOpaqueOccluder(el) {
+            if (!el || !el.getBoundingClientRect) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < minImgSize || rect.height < minImgSize) return false;
+            if (el.tagName === 'VIDEO') return true;
+            if (el.tagName === 'IMG' && (el.currentSrc || el.src)) return true;
+            const cs = getComputedStyle(el);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return false;
+            const bgc = cs.backgroundColor;
+            if (bgc && bgc !== 'transparent') {
+                const m = bgc.match(/rgba?\(([^)]+)\)/);
+                if (m) {
+                    const parts = m[1].split(/[\s,/]+/).filter(s => s !== '').map(parseFloat);
+                    const alpha = parts.length >= 4 ? parts[3] : 1;
+                    if (alpha >= 0.9) return true;
+                } else {
+                    return true;
+                }
+            }
+            const bgi = cs.backgroundImage;
+            if (bgi && bgi !== 'none' && !bgi.includes('gradient')) return true;
+            return false;
+        }
+
         // 抖音等站点会在 <img>/<video> 上方覆盖透明的交互层（播放器控制层、图文滑动切换层等），
         // 鼠标事件的 target 是覆盖层而不是媒体元素本身，因此用 elementsFromPoint 穿透元素栈查找。
         // 更关键的是：抖音图文的分页大图本身带 pointer-events:none（手势交给上层容器），
@@ -205,16 +232,32 @@
             }
 
             if (candidates.length === 0) return null;
+
+            // 剔除被上层不透明内容压住的候选：绘制在候选之上（栈序更靠前）、
+            // 与探测点重叠、且不是候选自身祖先的不透明元素都算遮挡
+            const maxIdx = Math.max(...candidates.map(c => c.stackIdx));
+            const occluderFlags = [];
+            for (let j = 0; j < maxIdx; j++) {
+                occluderFlags[j] = isOpaqueOccluder(stack[j]);
+            }
+            const visibleCandidates = candidates.filter(c => {
+                for (let j = 0; j < c.stackIdx; j++) {
+                    if (occluderFlags[j] && !(stack[j].contains && stack[j].contains(c.el))) return false;
+                }
+                return true;
+            });
+            if (visibleCandidates.length === 0) return null;
+
             // 排序：非模糊衬底 > 真实图片URL（data:URI 通常是覆盖图标）> 真实媒体优先于背景图容器
             // > 栈序靠前（绘制在上层，即用户看到的那张）> 面积大者优先
-            for (const c of candidates) if (c.kind === undefined) c.kind = 0;
-            candidates.sort((a, b) =>
+            for (const c of visibleCandidates) if (c.kind === undefined) c.kind = 0;
+            visibleCandidates.sort((a, b) =>
                 (a.blurred - b.blurred) ||
                 (a.dataSrc - b.dataSrc) ||
                 (a.kind - b.kind) ||
                 (a.stackIdx - b.stackIdx) ||
                 (b.area - a.area));
-            const best = candidates[0];
+            const best = visibleCandidates[0];
             return { el: best.el, src: best.srcOverride };
         }
 

@@ -72,37 +72,45 @@ async function processImage(request) {
         }
 
         // 3. 构建表单准备提交给本地 ComfyUI API
+        // 从 URL 提取文件名。注意抖音等站点的路径段可能包含 Windows 非法字符
+        // （如 ~tplv-dy-aweme-images-v2:2160:1440:q75.webp 里的冒号），
+        // 不清洗会导致 ComfyUI 落盘失败、上传接口报错
         let filename = request.filename || 'web_image_' + Date.now() + '.png';
 
         if (!request.filename) {
             try {
                 const url = new URL(imgSrc);
-                const pathParts = url.pathname.split('/');
-                const pathName = pathParts[pathParts.length - 1];
-                if (pathName && pathName.includes('.')) {
-                    filename = pathName;
+                const pathName = url.pathname.split('/').pop() || '';
+                if (pathName.includes('.')) {
+                    filename = pathName.replace(/[\\/:*?"<>|]+/g, '_');
                 }
             } catch(e) {}
         }
-        
+
         // 4. 调用本地 ComfyUI 上传接口 (将图片同时存入 input 和 output 确保对任意不同类型的图像节点都能生效)
-        // 第一份发给 Input 文件夹（给常规 LoadImage 用）
-        const formInput = new FormData();
-        formInput.append('image', blob, filename);
-        formInput.append('type', 'input');
-        formInput.append('overwrite', 'true');
-        await fetch(`${comfyuiUrl}/upload/image`, { method: 'POST', body: formInput });
-        
-        // 第二份发给 Output 文件夹（给你的 LoadImageOutput 用）
-        const formOutput = new FormData();
-        formOutput.append('image', blob, filename);
-        formOutput.append('type', 'output');
-        formOutput.append('overwrite', 'true');
-        const uploadRes = await fetch(`${comfyuiUrl}/upload/image`, { method: 'POST', body: formOutput });
-        
-        if (!uploadRes.ok) {
-            throw new Error(`无法直连 ComfyUI，请检查地址是否正确: ${comfyuiUrl}`);
+        async function uploadToComfy(folderType) {
+            const form = new FormData();
+            form.append('image', blob, filename);
+            form.append('type', folderType);
+            form.append('overwrite', 'true');
+            let res;
+            try {
+                res = await fetch(`${comfyuiUrl}/upload/image`, { method: 'POST', body: form });
+            } catch (err) {
+                throw new Error(`无法连接 ComfyUI (${comfyuiUrl})：${err.message}。请确认 ComfyUI 已启动、地址填写正确。`);
+            }
+            if (!res.ok) {
+                let detail = '';
+                try { detail = (await res.text()).slice(0, 200); } catch (e) {}
+                throw new Error(`ComfyUI 上传失败(${folderType})：HTTP ${res.status} ${detail}`);
+            }
+            return res;
         }
+
+        // 第一份发给 Input 文件夹（给常规 LoadImage 用）
+        await uploadToComfy('input');
+        // 第二份发给 Output 文件夹（给你的 LoadImageOutput 用）
+        const uploadRes = await uploadToComfy('output');
         
         const uploadData = await uploadRes.json();
         const uploadedFilename = uploadData.name;
