@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>img2comfy 视频通用化测试</title>
+<style>
+  body { font-family: sans-serif; background: #222; color: #eee; margin: 20px; }
+  .case { margin: 30px 0; padding: 12px; border: 1px solid #555; }
+  .stage { position: relative; width: 640px; height: 360px; background: #000; }
+  .stage video { width: 100%; height: 100%; display: block; }
+  .overlay { position: absolute; inset: 0; z-index: 5; }
+  #pe-stage video { pointer-events: none; }
+  iframe { width: 700px; height: 900px; border: 2px solid #666; display: block; }
+  #fr-same { margin-left: 220px; }
+  #fr-cross { margin-left: 220px; }
+</style>
+</head>
+<body>
+<h2>img2comfy 视频当前帧通用化测试页</h2>
+
+<div class="case" id="case-plain">
+  <h3>1. 普通视频 + 透明覆盖层（同源，canvas 直取）</h3>
+  <div class="stage">
+    <video id="v-plain" src="/test/media/sample.mp4" muted autoplay loop playsinline controls></video>
+    <div class="overlay"></div>
+  </div>
+  <p><button id="fs-btn" onclick="document.querySelector('#case-plain .stage').requestFullscreen().catch(e=>console.log('fs-fail',e))">全屏容器</button>
+  （验证全屏时悬浮按钮迁入全屏元素并可用）</p>
+</div>
+
+<div class="case" id="case-taint">
+  <h3>2. 跨域直链视频（画布污染 → 截图裁剪降级）</h3>
+  <div class="stage">
+    <video id="v-taint" src="http://192.168.156.1:8766/test/media/sample.mp4" muted autoplay loop playsinline controls></video>
+    <div class="overlay"></div>
+  </div>
+</div>
+
+<div class="case" id="case-shadow">
+  <h3>3. Shadow DOM 内的视频（组件化播放器场景）</h3>
+  <div id="shadow-host" style="width:640px;height:360px;"></div>
+</div>
+
+<div class="case" id="case-penone">
+  <h3>4. pointer-events:none 视频（抖音分页场景回归）</h3>
+  <div class="stage" id="pe-stage">
+    <video id="v-penone" src="/test/media/sample.mp4" muted autoplay loop playsinline controls></video>
+    <div class="overlay" id="pe-overlay"></div>
+  </div>
+</div>
+
+<div class="case" id="case-bars">
+  <h3>6. 自带左右黑边的横屏视频（内部取帧后自动裁掉黑边）</h3>
+  <p>960x540 画布左右各 160px 烘焙纯黑，中间 640x360 是视频内容，经 captureStream 喂给 video——模拟源视频自带黑边。预期发送帧为 640x360 左右。</p>
+  <div class="stage" style="width:960px;height:540px;background:#000;">
+    <video id="v-bars" muted autoplay loop playsinline style="width:100%;height:100%;display:block;"></video>
+  </div>
+</div>
+
+<div class="case" id="case-iframes">
+  <h3>5. iframe（同源 child / 跨源 cross / 跨源污染专用 cross2）</h3>
+  <iframe id="fr-same" src="/test/child.html"></iframe>
+  <iframe id="fr-cross" src="http://192.168.156.1:8766/test/cross.html"></iframe>
+  <iframe id="fr-cross2" src="http://192.168.156.1:8766/test/cross2.html" style="height:470px"></iframe>
+</div>
+
+<script src="/test/harness.js"></script>
+<script src="/content.js"></script>
+<script>
+  // case 3: open shadow root 里的"组件播放器"——视频和透明控制层都在 shadow tree 内
+  const host = document.getElementById('shadow-host');
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = '<div class="player" style="position:relative;width:640px;height:360px;background:#000;">' +
+    '<video id="v-shadow" src="/test/media/sample.mp4" muted autoplay loop playsinline controls style="width:100%;height:100%;display:block;"></video>' +
+    '<div class="ctrl" style="position:absolute;inset:0;z-index:5;"></div>' +
+    '</div>';
+
+  // case 6: 把 16:9 内容嵌进 960x540 黑底画布模拟"源视频自带左右黑边"，经 captureStream 喂给 video。
+  // 烘焙在画面里的黑边会进入 drawImage 取出的帧，可端到端验证 trimLetterbox 裁剪
+  (function() {
+    const c = document.createElement('canvas');
+    c.width = 960; c.height = 540;
+    const g = c.getContext('2d');
+    g.fillStyle = '#000';
+    g.fillRect(0, 0, 960, 540);
+    const stream = c.captureStream(0);
+    const v = document.getElementById('v-bars');
+    v.srcObject = stream;
+    const src = document.createElement('video');
+    src.src = '/test/media/sample.mp4';
+    src.muted = true;
+    src.loop = true;
+    const draw = () => {
+      g.drawImage(src, 160, 90, 640, 360);
+      const t = stream.getVideoTracks()[0];
+      if (t.requestFrame) t.requestFrame();
+    };
+    src.addEventListener('loadeddata', () => { src.play().catch(()=>{}); draw(); setInterval(draw, 200); });
+    v.play().catch(()=>{});
+  })();
+</script>
+</body>
+</html>

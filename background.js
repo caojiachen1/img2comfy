@@ -1,6 +1,6 @@
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'captureVisibleTab') {
-        // 供内容脚本在视频画布被跨域污染时降级截图取帧使用
+        // 供内容脚本在视频画布被跨域污染且内部取帧也失败时兜底截图使用
         chrome.tabs.captureVisibleTab(null, { format: 'png' }, (dataUrl) => {
             if (chrome.runtime.lastError) {
                 sendResponse({ success: false, error: chrome.runtime.lastError.message });
@@ -9,6 +9,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
         });
         return true; // 保持异步返回通道
+    }
+    if (request.action === 'allowDirectMediaFetch') {
+        // 直链跨域视频内部取帧：临时放行该 URL 的跨域加载。
+        // 请求侧伪装 Referer 过防盗链（同图片路径），响应侧补 CORS 头。
+        // xmlhttprequest 给整包 fetch 兜底路径用；media 给 CORS 克隆 video 用
+        // （免整包下载，浏览器媒体栈按需拉取）。ACAO 必须回显具体源（不能是 *）
+        // 才能配合 use-credentials 带 cookie 取回
+        let origin;
+        try { origin = new URL(request.pageUrl).origin; } catch (e) { origin = '*'; }
+        chrome.declarativeNetRequest.updateDynamicRules({
+            removeRuleIds: [2],
+            addRules: [{
+                id: 2,
+                priority: 1,
+                action: {
+                    type: 'modifyHeaders',
+                    requestHeaders: [{ header: 'Referer', operation: 'set', value: request.pageUrl }],
+                    responseHeaders: [
+                        { header: 'Access-Control-Allow-Origin', operation: 'set', value: origin },
+                        { header: 'Access-Control-Allow-Credentials', operation: 'set', value: 'true' }
+                    ]
+                },
+                condition: { urlFilter: request.url, resourceTypes: ['xmlhttprequest', 'media'] }
+            }]
+        }).then(() => sendResponse({ success: true }))
+          .catch((e) => sendResponse({ success: false, error: e.message }));
+        return true;
+    }
+    if (request.action === 'removeDirectMediaFetch') {
+        chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [2] })
+            .then(() => sendResponse({ success: true }))
+            .catch(() => sendResponse({ success: true }));
+        return true;
     }
     if (request.action === 'sendImageToComfyUI') {
         processImage(request)

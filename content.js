@@ -82,8 +82,11 @@
                 return;
             }
 
-            const scrollY = window.scrollY;
-            const scrollX = window.scrollX;
+            // 全屏元素是铺满视口的 position:fixed 容器（也是 wrap 现在的包含块），
+            // 其内绝对定位直接使用视口坐标，不能再叠加页面滚动量
+            const inFullscreen = !!(document.fullscreenElement && document.fullscreenElement.contains(wrap));
+            const scrollY = inFullscreen ? 0 : window.scrollY;
+            const scrollX = inFullscreen ? 0 : window.scrollX;
 
             if (btnPosition === 'top-left') {
                 wrap.style.top = (scrollY + rect.top + 10 + offsetY) + 'px';
@@ -165,13 +168,17 @@
         // 鼠标事件的 target 是覆盖层而不是媒体元素本身，因此用 elementsFromPoint 穿透元素栈查找。
         // 更关键的是：抖音图文的分页大图本身带 pointer-events:none（手势交给上层容器），
         // 根本不会出现在 elementsFromPoint 结果里——已实测确认，必须对栈内容器做后代扫描才能找到，
-        // 且要从模糊衬底图（filter:blur 的同图副本）和 data:URI 覆盖图标中选出真正展示的那张
+        // 且要从模糊衬底图（filter:blur 的同图副本）和 data:URI 覆盖图标中选出真正展示的那张。
+        // 通用化补充：文档级命中测试遇到 open shadow root 只能拿到 host 元素，媒体藏在 shadow tree
+        // 里（不少自研/组件化播放器如此），需要递归进入 shadowRoot.elementsFromPoint 继续探测
         function findMediaAtPoint(x, y) {
             const stack = document.elementsFromPoint(x, y);
             const candidates = [];
             const seen = new Set();
 
-            const consider = (media, stackIdx) => {
+            // hostEl：媒体所在的 open shadow root 的文档侧 host（媒体直接在文档树里时为 null）。
+            // shadow 内元素不在文档树中，遮挡判定的 contains 检查必须落到 host 上
+            const consider = (media, stackIdx, hostEl) => {
                 if (!media || seen.has(media)) return;
                 if (!(media.tagName === 'IMG' || media.tagName === 'VIDEO')) return;
                 if (!isElementVisible(media)) return;
@@ -187,24 +194,25 @@
                     el: media,
                     srcOverride: null,
                     stackIdx,
+                    hostEl,
                     blurred: isBlurred(media),
                     dataSrc: media.tagName === 'IMG' && src.startsWith('data:'),
                     area: rect.width * rect.height,
                 });
             };
 
-            for (let i = 0; i < stack.length; i++) {
-                const el = stack[i];
-                if (!el.closest) continue;
-                if (el.closest('#comfyui-extension-wrap')) continue;
+            // 处理命中栈里的单个元素：直接命中的媒体（pointer-events 正常）、
+            // 容器后代扫描（pointer-events:none 的媒体不在命中栈里，但容器在）、
+            // 以及 background-image 展示的图片容器
+            const processHitEl = (el, stackIdx, hostEl) => {
+                if (!el || !el.closest) return;
+                if (!hostEl && el.closest('#comfyui-extension-wrap')) return;
 
-                // 直接命中的媒体（pointer-events 正常的 img/video）
                 const direct = el.closest('img, video');
-                if (direct) consider(direct, i);
+                if (direct) consider(direct, stackIdx, hostEl);
 
-                // 后代扫描：pointer-events:none 的媒体不在命中栈里，但它们的容器在
                 if (el.querySelectorAll) {
-                    for (const m of el.querySelectorAll('img, video')) consider(m, i);
+                    for (const m of el.querySelectorAll('img, video')) consider(m, stackIdx, hostEl);
                 }
 
                 // 部分站点用 background-image 展示图片，没有 <img> 可悬浮，
@@ -219,7 +227,8 @@
                                 candidates.push({
                                     el: el,
                                     srcOverride: m[1],
-                                    stackIdx: i,
+                                    stackIdx,
+                                    hostEl,
                                     blurred: isBlurred(el),
                                     dataSrc: false,
                                     kind: 1,
@@ -229,20 +238,41 @@
                         }
                     }
                 }
+            };
+
+            // 递归探测 open shadow root（closed root 无法访问，只能放弃）。
+            // shadow 内容绘制在 host 的渲染层之上，栈序直接继承 host 的索引：
+            // 文档栈中压在 host 之上的不透明元素同样压住 shadow 内的媒体
+            const scanShadow = (root, stackIdx, hostEl, depth) => {
+                if (depth > 3) return;
+                let els;
+                try { els = root.elementsFromPoint(x, y); } catch (e) { return; }
+                if (!els) return;
+                for (const el of els) {
+                    processHitEl(el, stackIdx, hostEl);
+                    if (el.shadowRoot) scanShadow(el.shadowRoot, stackIdx, hostEl, depth + 1);
+                }
+            };
+
+            for (let i = 0; i < stack.length; i++) {
+                const el = stack[i];
+                processHitEl(el, i, null);
+                if (el.shadowRoot) scanShadow(el.shadowRoot, i, el, 0);
             }
 
             if (candidates.length === 0) return null;
 
             // 剔除被上层不透明内容压住的候选：绘制在候选之上（栈序更靠前）、
-            // 与探测点重叠、且不是候选自身祖先的不透明元素都算遮挡
+            // 与探测点重叠、且不是候选自身（或其 shadow host）祖先的不透明元素都算遮挡
             const maxIdx = Math.max(...candidates.map(c => c.stackIdx));
             const occluderFlags = [];
             for (let j = 0; j < maxIdx; j++) {
                 occluderFlags[j] = isOpaqueOccluder(stack[j]);
             }
             const visibleCandidates = candidates.filter(c => {
+                const occlRef = c.hostEl || c.el;
                 for (let j = 0; j < c.stackIdx; j++) {
-                    if (occluderFlags[j] && !(stack[j].contains && stack[j].contains(c.el))) return false;
+                    if (occluderFlags[j] && !(stack[j].contains && stack[j].contains(occlRef))) return false;
                 }
                 return true;
             });
@@ -320,13 +350,49 @@
         window.addEventListener('scroll', updateBtnPosition);
         window.addEventListener('resize', updateBtnPosition);
 
-        // 将标签页截图按视频在页面中的位置裁剪出当前帧（截图是物理像素，需乘 devicePixelRatio）
+        // 全屏时只有全屏元素的子树会被渲染，按钮挂在 body 上不可见，必须迁入全屏元素；
+        // 退出时迁回 body。注意 video/img 等替换元素全屏时其子节点不渲染，无解，只能不显示
+        function attachWrapToActiveLayer() {
+            const fs = document.fullscreenElement;
+            const target = (fs && !['VIDEO', 'AUDIO', 'CANVAS', 'IMG', 'PICTURE'].includes(fs.tagName)) ? fs : document.body;
+            if (wrap.parentNode !== target) target.appendChild(wrap);
+            updateBtnPosition();
+        }
+        document.addEventListener('fullscreenchange', attachWrapToActiveLayer);
+
+        // 计算当前 frame 视口相对顶层页面视口的偏移（截图降级取帧用）。
+        // frameElement 只有在父子同源时可访问，跨源 iframe 链会拿到 null —— 此时无法定位，只能报错
+        function frameOffsetInTop() {
+            let dx = 0, dy = 0;
+            let w = window;
+            try {
+                while (w !== w.top) {
+                    const fe = w.frameElement;
+                    if (!fe) return null;
+                    const r = fe.getBoundingClientRect();
+                    dx += r.left;
+                    dy += r.top;
+                    w = w.parent;
+                }
+            } catch (e) {
+                return null;
+            }
+            return { dx, dy, vw: w.innerWidth, vh: w.innerHeight };
+        }
+
+        // 将标签页截图按视频在页面中的位置裁剪出当前帧（截图以顶层视口为基准，物理像素需乘 devicePixelRatio）。
+        // 视频在嵌套 iframe 中时 rect 是本 frame 视口坐标，必须叠加 frame 在顶层视口中的偏移。
+        // 返回 canvas 交由调用方继续做黑边裁剪
         function cropScreenshot(dataUrl, rect) {
+            const off = frameOffsetInTop();
+            if (!off) {
+                return Promise.reject(new Error('视频位于跨域 iframe 中且画面受跨域保护，无法通过截图取帧'));
+            }
             const dpr = window.devicePixelRatio || 1;
-            const left = Math.max(rect.left, 0);
-            const top = Math.max(rect.top, 0);
-            const right = Math.min(rect.right, window.innerWidth);
-            const bottom = Math.min(rect.bottom, window.innerHeight);
+            const left = Math.max(rect.left + off.dx, 0);
+            const top = Math.max(rect.top + off.dy, 0);
+            const right = Math.min(rect.right + off.dx, off.vw);
+            const bottom = Math.min(rect.bottom + off.dy, off.vh);
             return new Promise((resolve, reject) => {
                 const img = new Image();
                 img.onload = () => {
@@ -340,44 +406,305 @@
                     canvas.width = sw;
                     canvas.height = sh;
                     canvas.getContext('2d').drawImage(img, Math.round(left * dpr), Math.round(top * dpr), sw, sh, 0, 0, sw, sh);
-                    resolve(canvas.toDataURL('image/png'));
+                    resolve(canvas);
                 };
                 img.onerror = () => reject(new Error('标签页截图解析失败'));
                 img.src = dataUrl;
             });
         }
 
-        // 抓取视频当前帧
-        async function captureVideoFrame(video) {
+        function bgSend(msg) {
+            return new Promise((resolve) => {
+                try {
+                    chrome.runtime.sendMessage(msg, (res) => {
+                        if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
+                        else resolve(res);
+                    });
+                } catch (e) {
+                    resolve({ success: false, error: e.message });
+                }
+            });
+        }
+
+        // 裁掉画面四周的纯黑边：源视频自带的上下/左右黑边，或截图路径里播放器容器的留边。
+        // 黑边特征是接近纯黑（亮度阈值内），按行/列统计亮像素占比来判定，逐边推进到内容为止。
+        // 带三重防误裁：单边最多裁 45%、裁后任一维度不足 30%（暗场景误判）或小于 32px 就放弃。
+        // 用 480px 降采样副本做分析，1080p 帧也只有约 26 万像素的扫描量
+        function trimLetterbox(canvas) {
+            try {
+                const W = canvas.width, H = canvas.height;
+                if (W < 64 || H < 64) return canvas;
+                const scale = Math.min(1, 480 / Math.max(W, H));
+                const aw = Math.max(8, Math.round(W * scale));
+                const ah = Math.max(8, Math.round(H * scale));
+                const ac = document.createElement('canvas');
+                ac.width = aw;
+                ac.height = ah;
+                const actx = ac.getContext('2d', { willReadFrequently: true });
+                actx.drawImage(canvas, 0, 0, aw, ah);
+                const d = actx.getImageData(0, 0, aw, ah).data;
+                const BLACK = 30;              // 黑边允许的亮度上限（压缩噪点容忍）
+                const CONTENT = 0.015;         // 一行/列中亮像素超过 1.5% 才算内容
+                const rowContent = new Array(ah).fill(0);
+                const colContent = new Array(aw).fill(0);
+                for (let y = 0; y < ah; y++) {
+                    const rowBase = y * aw * 4;
+                    for (let x = 0; x < aw; x++) {
+                        const i = rowBase + x * 4;
+                        if (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] > BLACK) {
+                            rowContent[y]++;
+                            colContent[x]++;
+                        }
+                    }
+                }
+                const isContentRow = (y) => rowContent[y] > aw * CONTENT;
+                const isContentCol = (x) => colContent[x] > ah * CONTENT;
+                const maxTrimY = Math.floor(ah * 0.45), maxTrimX = Math.floor(aw * 0.45);
+                let top = 0, bottom = ah - 1, left = 0, right = aw - 1;
+                while (top < maxTrimY && !isContentRow(top)) top++;
+                while (bottom > ah - 1 - maxTrimY && !isContentRow(bottom)) bottom--;
+                while (left < maxTrimX && !isContentCol(left)) left++;
+                while (right > aw - 1 - maxTrimX && !isContentCol(right)) right--;
+                const nx = Math.round(left / scale), ny = Math.round(top / scale);
+                const nw = Math.round((right - left + 1) / scale);
+                const nh = Math.round((bottom - top + 1) / scale);
+                if (nw >= W && nh >= H) return canvas;
+                if (nw < W * 0.3 || nh < H * 0.3 || nw < 32 || nh < 32) return canvas;
+                const out = document.createElement('canvas');
+                out.width = nw;
+                out.height = nh;
+                out.getContext('2d').drawImage(canvas, nx, ny, nw, nh, 0, 0, nw, nh);
+                return out;
+            } catch (e) {
+                return canvas;
+            }
+        }
+
+        // 直链跨域视频的干净取帧（微博等）：画布被污染时，请后台临时给该 URL 放行 CORS
+        // 后在本 frame 内 fetch 视频字节，用同源 blob 重建 video 并 seek 到同一时刻画帧。
+        // 产出的依然是无播放器 UI 的干净帧，且不受 iframe 跨源截图坐标的限制。
+        // blob 按 src 缓存（上限 3 个），重复发送同一视频时不再重新下载；
+        // 进行中的下载也放入缓存，连点/重试共享同一次下载而不是各拉一份
+        const refetchCache = new Map();
+        // 内部取帧的文件大小上限：大文件也要帧，但要有度（74MB 级短视频完全没问题）。
+        // 用流式读取边下边查，超限立即中止连接，不会白下载整个文件
+        const MEDIA_FETCH_CAP = 500 * 1024 * 1024;
+
+        async function fetchMediaBlob(src, onProgress) {
+            await bgSend({ action: 'allowDirectMediaFetch', url: src, pageUrl: location.href });
+            try {
+                let res;
+                try {
+                    // 必须 no-store：页面自己以 no-cors 方式（媒体元素）缓存过的响应不带 CORS 头，
+                    // 默认缓存模式会让 fetch 复用该条目后过不了 CORS 检查（实测 ERR_FAILED）
+                    res = await fetch(src, { credentials: 'include', cache: 'no-store' });
+                } catch (e) {
+                    // 带 cookie 的取回可能被服务端 CORS 策略拒绝（如响应 ACAO:*），退回不带凭证再试
+                    res = await fetch(src, { credentials: 'omit', cache: 'no-store' });
+                }
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const total = parseInt(res.headers.get('Content-Length') || '0', 10);
+                if (total > MEDIA_FETCH_CAP) {
+                    if (res.body && res.body.cancel) res.body.cancel().catch(() => {});
+                    throw new Error('视频文件过大（' + Math.round(total / 1048576) + 'MB），超出内部取帧上限');
+                }
+                let blob;
+                if (res.body && res.body.getReader) {
+                    const reader = res.body.getReader();
+                    const chunks = [];
+                    let received = 0;
+                    let lastShown = '';
+                    for (;;) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        received += value.length;
+                        if (received > MEDIA_FETCH_CAP) {
+                            reader.cancel().catch(() => {});
+                            throw new Error('视频文件过大（超过 ' + Math.round(MEDIA_FETCH_CAP / 1048576) + 'MB），超出内部取帧上限');
+                        }
+                        if (onProgress) {
+                            const text = total
+                                ? '⏳ ' + Math.min(99, Math.round((received / total) * 100)) + '%'
+                                : '⏳ ' + (received / 1048576).toFixed(1) + 'MB';
+                            if (text !== lastShown) { lastShown = text; onProgress(text); }
+                        }
+                    }
+                    blob = new Blob(chunks, { type: res.headers.get('Content-Type') || 'video/mp4' });
+                } else {
+                    blob = await res.blob();
+                    if (blob.size > MEDIA_FETCH_CAP) throw new Error('视频文件过大，超出内部取帧上限');
+                }
+                return blob;
+            } finally {
+                bgSend({ action: 'removeDirectMediaFetch' });
+            }
+        }
+
+        // 直链跨域视频的"免整包下载"取帧：请后台放行该 URL 的 CORS 后，
+        // 用带 crossorigin 的克隆 video 直接指向原 URL 加载——CORS 模式的媒体不污染画布，
+        // 且浏览器媒体栈按需拉取（moov 索引 + 目标时刻附近的字节区间），通常只传 MB 级数据。
+        // use-credentials 配合后台注入的 ACAO=源 + ACAC:true，需要 cookie 的 CDN 也能过。
+        // 克隆元素按 src 缓存（≤3），重复发送只做 seek 不再联网
+        const corsCloneCache = new Map();
+
+        async function captureViaCorsClone(video, src, onProgress) {
+            await bgSend({ action: 'allowDirectMediaFetch', url: src, pageUrl: location.href });
+            try {
+                if (!corsCloneCache.has(src)) {
+                    const p = (async () => {
+                        const v2 = document.createElement('video');
+                        v2.crossOrigin = 'use-credentials';
+                        v2.muted = true;
+                        v2.preload = 'metadata';
+                        v2.src = src;
+                        try {
+                            await new Promise((resolve, reject) => {
+                                const to = setTimeout(() => reject(new Error('CORS 克隆加载超时')), 15000);
+                                v2.addEventListener('loadedmetadata', () => { clearTimeout(to); resolve(); }, { once: true });
+                                v2.addEventListener('error', () => { clearTimeout(to); reject(new Error('CORS 克隆加载失败')); }, { once: true });
+                            });
+                            return v2;
+                        } catch (e) {
+                            corsCloneCache.delete(src);
+                            v2.removeAttribute('src');
+                            v2.load();
+                            throw e;
+                        }
+                    })();
+                    corsCloneCache.set(src, p);
+                    if (corsCloneCache.size > 3) {
+                        const oldestKey = corsCloneCache.keys().next().value;
+                        if (oldestKey !== src) {
+                            Promise.resolve(corsCloneCache.get(oldestKey))
+                                .then((v) => { v.removeAttribute('src'); v.load(); }).catch(() => {});
+                            corsCloneCache.delete(oldestKey);
+                        }
+                    }
+                }
+                const v2 = await corsCloneCache.get(src);
+                if (onProgress) onProgress('⏳ 解码中');
+                const t = video.currentTime || 0;
+                const clamped = (isFinite(v2.duration) && v2.duration > 0) ? Math.max(0, Math.min(t, v2.duration - 0.05)) : t;
+                await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('CORS 克隆 seek 超时')), 15000);
+                    v2.addEventListener('seeked', () => { clearTimeout(to); resolve(); }, { once: true });
+                    v2.currentTime = clamped;
+                });
+                if (!v2.videoWidth || !v2.videoHeight) throw new Error('CORS 克隆画面未就绪');
+                const canvas = document.createElement('canvas');
+                canvas.width = v2.videoWidth;
+                canvas.height = v2.videoHeight;
+                canvas.getContext('2d').drawImage(v2, 0, 0, canvas.width, canvas.height);
+                canvas.getContext('2d').getImageData(0, 0, 1, 1); // 污染检查（CORS 模式不应污染）
+                return canvas;
+            } finally {
+                bgSend({ action: 'removeDirectMediaFetch' });
+            }
+        }
+
+        async function captureViaRefetch(video, src, onProgress) {
+            if (!refetchCache.has(src)) {
+                const p = fetchMediaBlob(src, onProgress)
+                    .then((blob) => ({ url: URL.createObjectURL(blob) }))
+                    .catch((e) => { refetchCache.delete(src); throw e; });
+                refetchCache.set(src, p);
+                if (refetchCache.size > 3) {
+                    const oldestKey = refetchCache.keys().next().value;
+                    if (oldestKey !== src) {
+                        Promise.resolve(refetchCache.get(oldestKey))
+                            .then((en) => URL.revokeObjectURL(en.url)).catch(() => {});
+                        refetchCache.delete(oldestKey);
+                    }
+                }
+            }
+            const entry = await refetchCache.get(src); // 拒绝时抛出原始错误（如文件过大）
+            if (onProgress) onProgress('⏳ 解码中');
+            const v2 = document.createElement('video');
+            v2.muted = true;
+            v2.playsInline = true;
+            v2.preload = 'auto';
+            v2.src = entry.url;
+            await new Promise((resolve, reject) => {
+                const to = setTimeout(() => reject(new Error('重建视频加载超时')), 20000);
+                v2.addEventListener('loadedmetadata', () => { clearTimeout(to); resolve(); }, { once: true });
+                v2.addEventListener('error', () => { clearTimeout(to); reject(new Error('重建视频加载失败')); }, { once: true });
+            });
+            const t = video.currentTime || 0;
+            const clamped = (isFinite(v2.duration) && v2.duration > 0) ? Math.max(0, Math.min(t, v2.duration - 0.05)) : t;
+            await new Promise((resolve, reject) => {
+                const to = setTimeout(() => reject(new Error('重建视频 seek 超时')), 10000);
+                v2.addEventListener('seeked', () => { clearTimeout(to); resolve(); }, { once: true });
+                v2.currentTime = clamped;
+            });
+            if (!v2.videoWidth || !v2.videoHeight) throw new Error('重建视频画面未就绪');
+            const canvas = document.createElement('canvas');
+            canvas.width = v2.videoWidth;
+            canvas.height = v2.videoHeight;
+            canvas.getContext('2d').drawImage(v2, 0, 0, canvas.width, canvas.height);
+            canvas.getContext('2d').getImageData(0, 0, 1, 1); // 触发污染检查（正常不应污染）
+            return canvas;
+        }
+
+        // 抓取视频当前帧，按优先级：
+        // 1) 直接从 video 画布取帧——MSE 播放器（抖音等）、同源或带 CORS 的直链画布不被污染，
+        //    拿到的是不带播放器 UI 的干净原图帧
+        // 2) 直链跨域视频（微博等，画布被污染）——CORS 克隆取帧，浏览器按需拉取几乎不下载（见 captureViaCorsClone）
+        // 3) CORS 克隆失败（如 CDN 拒绝带 Origin 的请求）——整包 fetch 字节重建后取帧（见 captureViaRefetch）
+        // 4) 兜底：截取标签页画面按视频位置裁剪——会带上播放器 UI；
+        //    跨源 iframe 中无法换算截图坐标时直接报错
+        async function captureVideoFrame(video, onProgress) {
             if (!video.videoWidth || !video.videoHeight) {
                 throw new Error('视频画面尚未加载，请稍候再试');
             }
-            // 优先直接从 video 画布取帧：抖音等基于 MSE 的播放器，画面数据由页面脚本注入，
-            // 画布不会被跨域污染，可以拿到不带播放器 UI 的干净原图帧
+            let canvas = null;
             try {
-                const canvas = document.createElement('canvas');
+                canvas = document.createElement('canvas');
                 canvas.width = video.videoWidth;
                 canvas.height = video.videoHeight;
                 canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-                return canvas.toDataURL('image/png');
+                canvas.getContext('2d').getImageData(0, 0, 1, 1); // 读取即触发跨域污染检查
             } catch (err) {
-                // 画布被跨域污染（直链视频且无 CORS 头）时，降级为截取当前标签页画面并按视频位置裁剪。
-                // 注意：此降级路径可能把播放器进度条等 UI 一起截进去
-                wrap.style.visibility = 'hidden';
-                let shot = null;
-                try {
-                    shot = await new Promise((resolve) => {
-                        chrome.runtime.sendMessage({ action: 'captureVisibleTab' }, (res) => {
-                            if (chrome.runtime.lastError) resolve(null);
-                            else resolve(res && res.success ? res.dataUrl : null);
-                        });
-                    });
-                } finally {
-                    wrap.style.visibility = 'visible';
-                }
-                if (!shot) throw new Error('无法截取标签页画面（视频画布受跨域保护且截图失败）');
-                return cropScreenshot(shot, video.getBoundingClientRect());
+                canvas = null;
             }
+            if (!canvas) {
+                const src = video.currentSrc || video.src || '';
+                if (/^https?:/i.test(src)) {
+                    try {
+                        canvas = await captureViaCorsClone(video, src, onProgress);
+                    } catch (e) {
+                        console.debug('[ComfyUI Sender] 免下载取帧失败，尝试整包取帧:', e && e.message);
+                    }
+                    if (!canvas) {
+                        try {
+                            canvas = await captureViaRefetch(video, src, onProgress);
+                        } catch (e) {
+                            console.debug('[ComfyUI Sender] 内部取帧失败，降级为截图:', e && e.message);
+                        }
+                    }
+                }
+            }
+            if (canvas) {
+                return trimLetterbox(canvas).toDataURL('image/png');
+            }
+            wrap.style.visibility = 'hidden';
+            let shot = null;
+            try {
+                const res = await bgSend({ action: 'captureVisibleTab' });
+                shot = res && res.success ? res.dataUrl : null;
+                if (!shot && res && res.error) {
+                    // 连续点击会撞上 Chrome 的每秒截图配额，给出可操作的提示
+                    if (/MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test(res.error)) {
+                        throw new Error('截图接口限流（连续点击过快），请等 1 秒再试');
+                    }
+                    console.debug('[ComfyUI Sender] 截图失败:', res.error);
+                }
+            } finally {
+                wrap.style.visibility = 'visible';
+            }
+            if (!shot) throw new Error('无法截取标签页画面（视频画布受跨域保护且截图失败）');
+            const cropped = await cropScreenshot(shot, video.getBoundingClientRect());
+            return trimLetterbox(cropped).toDataURL('image/png');
         }
 
         function handleSend(e, autoQueue) {
@@ -442,8 +769,9 @@
             };
 
             if (isVideo) {
-                // 视频：先在页面里抓取当前帧，再把帧数据交给后台上传
-                captureVideoFrame(media).then((dataUrl) => {
+                // 视频：先在页面里抓取当前帧，再把帧数据交给后台上传。
+                // 大视频内部取帧要下载字节，把进度实时刷在按钮上
+                captureVideoFrame(media, (text) => { targetBtn.innerHTML = text; }).then((dataUrl) => {
                     doSend({
                         action: 'sendImageToComfyUI',
                         dataUrl: dataUrl,

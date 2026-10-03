@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>同源 iframe 子页</title>
+<style>
+  body { font-family: sans-serif; background: #2a2a2a; color: #eee; }
+  .stage { position: relative; width: 640px; height: 360px; background: #000; margin-bottom: 20px; }
+  .stage video { width: 100%; height: 100%; display: block; }
+  .overlay { position: absolute; inset: 0; z-index: 5; }
+</style>
+</head>
+<body>
+<h3>child.html（同源 iframe）</h3>
+<div class="stage">
+  <video id="vc-clean" src="/test/media/sample.mp4" muted autoplay loop playsinline controls></video>
+  <div class="overlay"></div>
+</div>
+<div class="stage">
+  <video id="vc-taint" src="http://192.168.156.1:8766/test/media/sample.mp4" muted autoplay loop playsinline controls></video>
+  <div class="overlay"></div>
+</div>
+<script src="/test/harness.js"></script>
+<script src="/content.js"></script>
+</body>
+</html>
