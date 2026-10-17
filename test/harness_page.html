@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>mtb 页面侧验证台</title></head>
+<body style="margin:0;background:#2b2b31">
+<!-- 先装 chrome 桩，再加载内容脚本包；host 逻辑用同一份 steps/imgops 在页面里跑 -->
+<script src="/test/harness_stub.js"></script>
+<script src="/src/content/content.bundle.js"></script>
+<script type="module">
+import { runChain, STEPS } from '/src/common/steps.js';
+import { mkPx } from '/src/common/imgops/geometry.js';
+
+function toPx(img) {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(img, 0, 0);
+    const id = g.getImageData(0, 0, c.width, c.height);
+    return mkPx(id.width, id.height, new Uint8ClampedArray(id.data));
+}
+
+window.__mtbHostStub = {
+    // 内容脚本发来的 host 请求，在这里用同一份算子库回答
+    async op(req) {
+        const img = new Image();
+        img.src = req.url ? req.url : req.dataUrl;
+        await img.decode();
+        const px = toPx(img);
+        const out = runChain(px, req.chain || []);
+        const res = { ok: true, reports: out.reports, boxes: out.boxes, points: out.points, lines: out.lines };
+        if (out.image && out.image !== px) {
+            const c = document.createElement('canvas');
+            c.width = out.image.width; c.height = out.image.height;
+            c.getContext('2d').putImageData(new ImageData(out.image.data, out.image.width, out.image.height), 0, 0);
+            res.dataUrl = c.toDataURL(req.format === 'jpg' ? 'image/jpeg' : 'image/png');
+            res.width = out.image.width; res.height = out.image.height;
+        } else if (req.echoSource) { res.dataUrl = img.src.startsWith('data:') ? img.src : null; }
+        return res;
+    },
+};
+
+// 把桩里的 host 通道接上
+window.__mtbStubHandlers.mtbHost = async (msg) => {
+    if (msg.type === 'op') return window.__mtbHostStub.op(msg);
+    if (msg.type === 'ping') return { ok: true, host: true, stub: true };
+    if (msg.type === 'ai') return { ok: false, error: 'AI 任务请用 test/harness_ai.html' };
+    return { ok: false, error: 'stub 不支持 ' + msg.type };
+};
+window.__mtbReady = true;
+</script>
+
+<h3 style="color:#cfd6dd;font:14px system-ui;margin:10px">内容脚本包 · 工具栏 · 算子链 页面级验证</h3>
+<div style="height:160px"></div>
+<img id="big" width="600" height="400" alt="t" src="/test/make/edge.png">
+<div id="bgbox" style="width:600px;height:400px;background-image:url('/test/make/edge.png');background-size:cover;margin-top:12px"></div>
+<video id="vid" width="480" height="300" src="/test/make/sample.mp4" muted preload="auto" style="margin-top:12px"></video>
+<div id="out" style="color:#9aa;font:12px ui-monospace,monospace;padding:10px"></div>
+</body>
+</html>

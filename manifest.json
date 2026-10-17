@@ -1,32 +1,63 @@
 {
   "manifest_version": 3,
-  "name": "Send image to ComfyUI",
-  "version": "1.3",
-  "description": "一键将任意网页中的图片或视频当前帧发送到本地 ComfyUI 的 LoadImageOutput 节点，自动突破防盗链。视频帧内部解析提取（无播放器 UI，微博等直链视频同样支持），并自动裁剪黑边。",
+  "name": "Media Hover Toolbar（网页图片/视频悬浮工具栏）",
+  "version": "2.0",
+  "description": "悬停任意网页图片/视频即出可自定义工具栏：复制/下载/查看信息、Lanczos 等重采样与调色滤镜、Canny/OTSU/形态学等 CV 算子、Qwen-VL 看图说话、SAM 抠图、YuNet 人脸、swin2SR 超分，并支持脚本型与链接型自定义功能（内置 ComfyUI 发送示例）。",
   "permissions": [
+    "storage",
     "activeTab",
     "scripting",
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess",
-    "storage"
+    "offscreen",
+    "downloads",
+    "clipboardWrite",
+    "tabs"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开 Media Hover Toolbar 设置"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "css": ["content.css"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/content/content.bundle.js"
+      ],
       "all_frames": true,
-      "match_about_blank": true
+      "match_about_blank": true,
+      "run_at": "document_idle"
     }
   ],
-  "action": {
-    "default_title": "ComfyUI Sender",
-    "default_popup": "popup.html"
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "media/*",
+        "src/common/*",
+        "src/content/*",
+        "src/host/*",
+        "src/vendor/*",
+        "vendor/*",
+        "vendor/quickjs/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   }
 }

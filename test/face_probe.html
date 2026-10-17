@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>face probe</title></head><body>
+<pre id="out">running…</pre>
+<script type="module">
+// 定向探针：不动产品代码，直接把 YuNet 的输入规格与原始输出统计 dump 出来，
+// 用来判断「识别不到人脸」到底是预处理、解码还是阈值的问题。
+import { ensureOrt, loadOrtSession } from '/src/common/ai/ort-load.js';
+import { inferInputSpec, detectFaces } from '/src/common/ai/face.js';
+import { resize as resizePx } from '/src/common/imgops/geometry.js';
+
+const log = [];
+const say = (o) => { log.push(o); document.getElementById('out').textContent = JSON.stringify(log, null, 1); };
+window.__probe = () => log;
+
+try {
+    const vendorBase = location.origin + '/vendor';
+    await ensureOrt(vendorBase);
+    const ort = globalThis.ort;
+    const img = await (await fetch('/test/media/' + (new URLSearchParams(location.search).get('img') || 'face_lena.jpg'))).blob();
+    const bmp = await createImageBitmap(img);
+    const c = new OffscreenCanvas(bmp.width, bmp.height);
+    const g = c.getContext('2d');
+    g.drawImage(bmp, 0, 0);
+    const id = g.getImageData(0, 0, bmp.width, bmp.height);
+    const px = { width: id.width, height: id.height, data: new Uint8ClampedArray(id.data) };
+    say({ image: bmp.width + 'x' + bmp.height, mime: img.type });
+
+    const sess = await loadOrtSession({ url: '/test/media/yunet.onnx', device: 'wasm' });
+    const spec = inferInputSpec(sess, px);
+    say({ inputNames: sess.inputNames, outputNames: sess.outputNames, spec });
+
+    // 复刻 face.js 的预处理，但把张量统计也 dump 出来
+    const resized = (spec.width === px.width && spec.height === px.height) ? px : resizePx(px, spec.width, spec.height, 'triangle');
+    const MEAN = [104, 117, 123];
+    const n = resized.width * resized.height;
+    const arr = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) for (let ch = 0; ch < 3; ch++) arr[ch * n + i] = resized.data[i * 4 + (2 - ch)] - MEAN[ch];
+    const input = new ort.Tensor('float32', arr, [1, 3, resized.height, resized.width]);
+    const res = await sess.run({ [sess.inputNames[0]]: input });
+
+    const stat = (d) => { let mn = Infinity, mx = -Infinity, sum = 0, over = 0; for (const v of d) { if (v < mn) mn = v; if (v > mx) mx = v; sum += v; if (v > 0.5) over++; } return { min: +mn.toFixed(3), max: +mx.toFixed(3), mean: +(sum / d.length).toFixed(3), gt05: over }; };
+    const outs = {};
+    for (const name of sess.outputNames) { const t = res[name]; outs[name] = { dims: Array.from(t.dims || []), kind: t.data ? t.data.constructor.name : '?', stats: t.data ? stat(t.data) : null }; }
+    say({ outputs: outs });
+
+    // 逐通道找「最像人脸」的格子：cls_* 通道数与排布未知，按 [anchor][cls] 与 [cls][anchor] 两种假设都扫一遍
+    const scan = {};
+    for (const name of sess.outputNames.filter((x) => /^cls_/.test(x))) {
+        const t = res[name], d = t.data, dims = Array.from(t.dims || []);
+        const total = d.length;
+        const variants = {};
+        const feats = dims[1], spatial = dims[2] * (dims[3] || 1);
+        for (const mode of ['fc', 'cs']) {
+            let best = -Infinity, bi = -1;
+            for (let i = 0; i < total; i++) if (d[i] > best) { best = d[i]; bi = i; }
+            // fc：dims=[1,feats,H,W]，同类连续 spatial 个；cs：[1,H,W,feats] 交错
+            const featIdx = mode === 'fc' ? Math.floor(bi / spatial) : bi % feats;
+            variants[mode] = { rawMax: +best.toFixed(4), argmaxIdx: bi, featIdx, feats, spatial };
+        }
+        const chMax = [];
+        for (let f = 0; f < feats; f++) {
+            let m = -Infinity;
+            for (let s = 0; s < spatial; s++) { const v = d[f * spatial + s]; if (v > m) m = v; }
+            chMax.push(+m.toFixed(4));
+        }
+        scan[name] = { dims, variants, perFeatureMax: chMax.slice(0, 8) };
+    }
+    say({ clsScan: scan });
+
+    for (const conf of [0.6, 0.4, 0.2, 0.05]) {
+        const f = await detectFaces(sess, px, { confThreshold: conf });
+        say({ confThreshold: conf, faces: (f.faces || []).length, backend: f.backend, netInput: f.netInput, first: (f.faces || [])[0] || null });
+    }
+// 把检出框与 5 个特征点画回原图，存成 PNG 供肉眼核对（数字看着合理不等于几何对）
+try {
+    const best = (await detectFaces(sess, px, { confThreshold: 0.4 })).faces || [];
+    const cc = new OffscreenCanvas(bmp.width, bmp.height);
+    const gx = cc.getContext('2d');
+    gx.drawImage(bmp, 0, 0);
+    for (const f of best.slice(0, 8)) {
+        gx.strokeStyle = '#0f0'; gx.lineWidth = 2; gx.strokeRect(f.x, f.y, f.width, f.height);
+        gx.fillStyle = '#ff0';
+        for (const k of Object.keys(f.landmarks || {})) { const q = f.landmarks[k]; gx.fillRect(q[0] - 2, q[1] - 2, 4, 4); }
+        gx.fillStyle = '#0f0'; gx.font = '12px sans-serif'; gx.fillText(String(f.score), f.x + 2, Math.max(12, f.y - 4));
+    }
+    const blob = await cc.convertToBlob({ type: 'image/png' });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    window.__annot = 'data:image/png;base64,' + btoa(bin);
+    say({ annotated: best.length });
+} catch (e) { say({ annotError: String(e.message || e) }); }
+} catch (e) {
+    say({ fatal: String(e && e.stack || e.message || e).split('\n').slice(0, 5).join(' | ') });
+}
+window.__done = true;
+document.getElementById('out').textContent = JSON.stringify(log, null, 1);
+</script>
+</body></html>

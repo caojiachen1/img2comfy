@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>wasm probe</title></head><body>
+<pre id="out">running…</pre>
+<script type="module">
+// 验证「运行时自动安装」的核心机制：wasm 不在扩展包里，而是下载后存进 Cache API，
+// 再用 blob: 地址交给 ORT（MV3 的 script-src 'self' 挡的是脚本，wasm 走 wasm-unsafe-eval + blob 可行）。
+const log = [];
+const say = (o) => { log.push(o); document.getElementById('out').textContent = JSON.stringify(log, null, 1); };
+window.__probe = () => log;
+const KEY = 'https://mtb.runtime/ort-wasm-simd-threaded.asyncify.wasm';
+const NAME = 'ort-wasm-simd-threaded.asyncify.wasm';
+
+try {
+    const t0 = performance.now();
+    const ort = await import('/vendor/ort.webgpu.bundle.min.mjs');
+    say({ step: 'ort loaded', ms: Math.round(performance.now() - t0), version: ort.version || '?' });
+
+    const cache = await caches.open('mtb-runtime-v1');
+    let hit = await cache.match(KEY);
+    say({ firstRun: !hit, cached: hit ? hit.headers.get('content-length') : null });
+    if (!hit) {
+        const res = await fetch('/vendor/' + NAME);
+        const buf = await res.arrayBuffer();
+        await cache.put(KEY, new Response(buf, { headers: { 'Content-Type': 'application/wasm' } }));
+        say({ downloaded: buf.byteLength });
+        hit = await cache.match(KEY);
+    }
+    const bytes = await hit.arrayBuffer();
+    say({ fromCache: bytes.byteLength });
+
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));
+    ort.env.wasm.wasmPaths = { wasm: blobUrl, mjs: location.origin + '/vendor/ort-wasm-simd-threaded.asyncify.mjs' };
+    ort.env.wasm.numThreads = 1;
+    say({ wasmPaths: { wasm: blobUrl.slice(0, 30) + '…', mjs: ort.env.wasm.wasmPaths.mjs } });
+
+    const t1 = performance.now();
+    const sess = await ort.InferenceSession.create('/test/media/yunet.onnx', {
+        sess_options: { logSeverityLevel: 3 },
+        executionProviders: ['wasm'],
+    });
+    say({ step: 'session from blob wasm', ms: Math.round(performance.now() - t1), outputs: sess.outputNames.slice(0, 4) });
+
+    const input = new ort.Tensor('float32', new Float32Array(1 * 3 * 640 * 640), [1, 3, 640, 640]);
+    const t2 = performance.now();
+    const out = await sess.run({ [sess.inputNames[0]]: input });
+    say({ step: 'inference ok', ms: Math.round(performance.now() - t2), cls8: Array.from(out.cls_8.dims || []), maxScore: +Math.max(...out.cls_8.data).toFixed(4) });
+    say({ VERDICT: 'blob-wasm 可用' });
+} catch (e) {
+    say({ fatal: String(e && e.stack || e.message || e).split('\n').slice(0, 6).join(' | ') });
+}
+window.__done = true;
+document.getElementById('out').textContent = JSON.stringify(log, null, 1);
+</script>
+</body></html>

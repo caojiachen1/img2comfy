@@ -1,292 +1,423 @@
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === 'captureVisibleTab') {
-        // 供内容脚本在视频画布被跨域污染且内部取帧也失败时兜底截图使用
-        chrome.tabs.captureVisibleTab(null, { format: 'png' }, (dataUrl) => {
-            if (chrome.runtime.lastError) {
-                sendResponse({ success: false, error: chrome.runtime.lastError.message });
-            } else {
-                sendResponse({ success: true, dataUrl: dataUrl });
-            }
-        });
-        return true; // 保持异步返回通道
-    }
-    if (request.action === 'allowDirectMediaFetch') {
-        // 直链跨域视频内部取帧：临时放行该 URL 的跨域加载。
-        // 请求侧伪装 Referer 过防盗链（同图片路径），响应侧补 CORS 头。
-        // xmlhttprequest 给整包 fetch 兜底路径用；media 给 CORS 克隆 video 用
-        // （免整包下载，浏览器媒体栈按需拉取）。ACAO 必须回显具体源（不能是 *）
-        // 才能配合 use-credentials 带 cookie 取回
-        let origin;
-        try { origin = new URL(request.pageUrl).origin; } catch (e) { origin = '*'; }
-        chrome.declarativeNetRequest.updateDynamicRules({
-            removeRuleIds: [2],
-            addRules: [{
-                id: 2,
-                priority: 1,
-                action: {
-                    type: 'modifyHeaders',
-                    requestHeaders: [{ header: 'Referer', operation: 'set', value: request.pageUrl }],
-                    responseHeaders: [
-                        { header: 'Access-Control-Allow-Origin', operation: 'set', value: origin },
-                        { header: 'Access-Control-Allow-Credentials', operation: 'set', value: 'true' }
-                    ]
-                },
-                condition: { urlFilter: request.url, resourceTypes: ['xmlhttprequest', 'media'] }
-            }]
-        }).then(() => sendResponse({ success: true }))
-          .catch((e) => sendResponse({ success: false, error: e.message }));
-        return true;
-    }
-    if (request.action === 'removeDirectMediaFetch') {
-        chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [2] })
-            .then(() => sendResponse({ success: true }))
-            .catch(() => sendResponse({ success: true }));
-        return true;
-    }
-    if (request.action === 'sendImageToComfyUI') {
-        processImage(request)
-            .then(() => sendResponse({ success: true }))
-            .catch((err) => sendResponse({ success: false, error: err.message }));
-        return true; // 保持异步返回通道
-    }
+// MV3 后台服务（ESM service worker）：设置存储、DNR 防盗链改写、抓取代理、
+// 下载、离屏宿主生命周期、ComfyUI 上传与注入。
+
+import { migrateSettings, DEFAULT_SETTINGS } from './src/common/registry.js';
+import { ensureBuiltins } from './src/common/builtin-scripts.js';
+import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl } from './src/common/util.js';
+
+const HOST_PAGE = 'src/host/host.html';
+let hostTabId = null;
+let hostMode = null; // 'offscreen' | 'tab'
+
+chrome.runtime.onInstalled.addListener(() => {
+    chrome.storage.local.get(['mtbSettings', 'comfyConfig'], (data) => {
+        const s = ensureBuiltins(migrateSettings(data.mtbSettings || data.comfyConfig || DEFAULT_SETTINGS));
+        chrome.storage.local.set({ mtbSettings: s });
+    });
+    chrome.offscreen.hasDocument?.().then?.((has) => { if (!has) return; }).catch?.(() => {});
 });
 
-async function processImage(request) {
-    const imgSrc = request.imgSrc;
-    const dataUrl = request.dataUrl;
-    const autoQueue = request.autoQueue || false;
-    const isHttp = !!imgSrc && imgSrc.startsWith('http');
-    const ruleId = 1;
-    
-    // 获取配置
-    const data = await chrome.storage.local.get(['comfyConfig']);
-    let comfyuiUrl = 'http://127.0.0.1:8188';
-    let profile = { mode: 'frontend' };
-    
-    if (data.comfyConfig) {
-        if (data.comfyConfig.serverAddress) {
-            comfyuiUrl = data.comfyConfig.serverAddress.replace(/\/$/, "");
+chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+    if (!req || !req.action) return false;
+    const h = HANDLERS[req.action];
+    if (!h) return false;
+    Promise.resolve(h(req, sender)).then((r) => sendResponse(r === undefined ? { ok: true } : r))
+        .catch((e) => sendResponse({ ok: false, error: String(e && e.message || e) }));
+    return true; // 异步通道
+});
+
+const HANDLERS = {
+    getState: async () => {
+        const data = await chrome.storage.local.get(['mtbSettings', 'comfyConfig']);
+        const s = ensureBuiltins(migrateSettings(data.mtbSettings || data.comfyConfig || DEFAULT_SETTINGS));
+        return { ok: true, settings: s, hostMode, hostTabId };
+    },
+
+    patchSettings: async (req) => {
+        const data = await chrome.storage.local.get(['mtbSettings']);
+        const base = ensureBuiltins(migrateSettings(data.mtbSettings || DEFAULT_SETTINGS));
+        const next = deepMerge(base, req.patch || {});
+        await chrome.storage.local.set({ mtbSettings: next });
+        return { ok: true, settings: next };
+    },
+
+    setSettings: async (req) => {
+        const next = ensureBuiltins(migrateSettings(req.settings));
+        await chrome.storage.local.set({ mtbSettings: next });
+        return { ok: true, settings: next };
+    },
+
+    openOptions: async () => {
+        await chrome.runtime.openOptionsPage();
+        return { ok: true };
+    },
+
+    openTab: async (req) => {
+        const t = await chrome.tabs.create({ url: req.url, active: req.active !== false });
+        return { ok: true, id: t.id };
+    },
+
+    captureVisibleTab: async (req, sender) => {
+        try {
+            const dataUrl = await chrome.tabs.captureVisibleTab(sender.tab?.windowId ?? chrome.windows.WINDOW_ID_CURRENT, { format: 'png' });
+            return { success: true, dataUrl };
+        } catch (e) {
+            return { success: false, error: String(e.message || e) };
         }
-        if (data.comfyConfig.activeProfileId && data.comfyConfig.profiles) {
-            profile = data.comfyConfig.profiles[data.comfyConfig.activeProfileId] || profile;
-        }
-    }
-    
-    // 1. 如果是外网图片，动态添加请求头修改规则（针对微博等网站防盗链，伪装Referer）
-    if (isHttp) {
+    },
+
+    // 图片：伪装 Referer 过防盗链；视频：额外补 CORS 头以便克隆 video 取帧
+    allowDirectMediaFetch: async (req) => {
+        let origin = '*';
+        try { origin = new URL(req.pageUrl || '').origin; } catch (e) { /* 保留 * */ }
         await chrome.declarativeNetRequest.updateDynamicRules({
-            removeRuleIds: [ruleId],
+            removeRuleIds: [2],
             addRules: [{
-                id: ruleId,
-                priority: 1,
+                id: 2, priority: 1,
                 action: {
                     type: 'modifyHeaders',
-                    requestHeaders: [
-                        { header: 'Referer', operation: 'set', value: request.pageUrl }
-                    ]
+                    requestHeaders: [{ header: 'Referer', operation: 'set', value: req.pageUrl || '' }],
+                    responseHeaders: [
+                        { header: 'Access-Control-Allow-Origin', operation: 'set', value: origin },
+                        { header: 'Access-Control-Allow-Credentials', operation: 'set', value: 'true' },
+                    ],
                 },
-                condition: {
-                    urlFilter: imgSrc,
-                    resourceTypes: ['xmlhttprequest'] // 背景 fetch 使用的 type
-                }
-            }]
+                condition: { urlFilter: req.url, resourceTypes: ['xmlhttprequest', 'media', 'image'] },
+            }],
         });
-    }
+        return { ok: true };
+    },
 
+    removeDirectMediaFetch: async () => {
+        await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [2] });
+        return { ok: true };
+    },
+
+    fetchMedia: async (req) => bytesResult(await fetchWithReferer(req.url, req.pageUrl, req.filename)),
+
+    proxyFetch: async (req) => {
+        const opt = req.options || req || {};
+        const url = opt.url;
+        if (!url) throw new Error('fetch 缺少 url');
+        let headers = opt.headers || undefined;
+        const isLocal = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?\//i.test(url);
+        if (opt.referer !== false && !headers && !isLocal) headers = { Referer: opt.pageUrl || '' };
+        let rid = null;
+        if (opt.referer !== false && !isLocal) rid = await addRefererRule(url, opt.pageUrl || '');
+        try {
+            const init = { method: opt.method || 'GET', headers, body: opt.body, redirect: 'follow' };
+            const res = await fetch(url, init);
+            const text = opt.as === 'json' ? await safeJson(res) : await res.text();
+            if (opt.as === 'dataUrl') {
+                const b = await res.arrayBuffer();
+                return { ok: true, status: res.status, dataUrl: bytesToDataUrl(new Uint8Array(b), res.headers.get('content-type') || 'application/octet-stream') };
+            }
+            return { ok: res.ok, status: res.status, data: text };
+        } finally {
+            if (rid) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [rid] });
+        }
+    },
+
+    proxyPost: async (req) => HANDLERS.proxyFetch({ options: { ...req, method: 'POST', as: 'text' } }),
+
+    // 宿主（offscreen / 宿主标签页）→ UI 的事件转发。宿主发的是 action:'mtbEvent'，
+    // 这里以前没有对应 handler，消息被静默丢掉，于是模型下载进度、运行时安装进度、
+    // 以及 ctx.openUrl / ctx.panel（toolUi）全都不通。
+    // 内容脚本与扩展页各自要一条，用 target 标记让接收方过滤，避免同一事件被处理两次。
+    mtbEvent: async (req) => {
+        const { action, ...rest } = req;
+        const toPage = { action: 'mtbHostEvent', target: 'page', ...rest };
+        const toExt = { action: 'mtbHostEvent', target: 'ext', ...rest };
+        try {
+            const tabs = await chrome.tabs.query({});
+            for (const t of tabs) if (t.id != null) chrome.tabs.sendMessage(t.id, toPage).catch(() => {});
+        } catch (e) { /* 没有标签页 */ }
+        chrome.runtime.sendMessage(toExt).catch(() => {});
+        return { ok: true, type: req.type };
+    },
+
+    downloadUrl: async (req) => {
+        const { bytes, mime, filename } = await fetchWithReferer(req.url, req.pageUrl, req.filename);
+        return downloadBinary(bytes, mime, filename || filenameFromUrl(req.url));
+    },
+
+    downloadDataUrl: async (req) => {
+        const dataUrl = String(req.dataUrl || '');
+        const comma = dataUrl.indexOf(',');
+        if (comma < 0) throw new Error('dataUrl 非法');
+        const mime = (/^data:([^;,]+)/.exec(dataUrl) || [, 'image/png'])[1];
+        return downloadBinary(base64ToBytes(dataUrl.slice(comma + 1)), mime, sanitizeFilename(req.filename || 'image'));
+    },
+
+    videoQualities: async () => ({ ok: true, qualities: null }),
+
+    ensureHost: async () => {
+        const alive = await offscreenAlive();
+        if (alive === true) {
+            hostMode = 'offscreen';
+            await waitHostReady(4000).catch(() => null); // 可能还在初始化，消息照常排队
+            return { ok: true, mode: 'offscreen' };
+        }
+        if (hostMode === 'tab' && hostTabId != null) {
+            const t = await chrome.tabs.get(hostTabId).catch(() => null);
+            if (t) return { ok: true, mode: 'tab' };
+            hostTabId = null;
+        }
+        try {
+            await chrome.offscreen.createDocument({
+                url: HOST_PAGE,
+                reasons: ['WORKERS'],
+                justification: '在离屏文档中运行 WebAssembly/WebGPU 图像识别与像素处理',
+            });
+            hostMode = 'offscreen';
+            await waitHostReady();
+            return { ok: true, mode: 'offscreen' };
+        } catch (e) {
+            const err = String(e && e.message || e);
+            // 「已存在离屏文档」在各家浏览器里措辞不统一（Only a single offscreen document may be created /
+            // document already exists）。它表示离屏可用，绝不能掉进下面的标签页兜底——那样会凭空多一个宿主标签页，
+            // 而且等到标签页就绪的几秒里用户手势早已过期，复制图片之类的操作必然失败。
+            if (/single offscreen document|document already|only one offscreen|exists/i.test(err)) {
+                hostMode = 'offscreen';
+                await waitHostReady();
+                return { ok: true, mode: 'offscreen' };
+            }
+            if (!/offscreen/i.test(err)) throw e;
+        }
+        const t = await chrome.tabs.create({ url: chrome.runtime.getURL(HOST_PAGE), active: false, pinned: true });
+        hostTabId = t.id;
+        hostMode = 'tab';
+        await waitHostReady();
+        return { ok: true, mode: 'tab' };
+    },
+
+    hostSend: async (req, sender) => {
+        const r = await chrome.runtime.sendMessage({ ...req, __relayFrom: sender?.tab?.id || null }).catch((e) => ({ ok: false, error: String(e.message || e) }));
+        return r;
+    },
+
+    sendImageToComfyUI: async (req, sender) => comfySend(req, sender),
+
+    closeHost: async () => {
+        try { if (hostMode === 'offscreen') await chrome.offscreen.closeDocument(); } catch (e) { /* 没有文档 */ }
+        if (hostTabId != null) { await chrome.tabs.remove(hostTabId).catch(() => {}); hostTabId = null; }
+        hostMode = null;
+        return { ok: true };
+    },
+};
+
+chrome.tabs.onRemoved.addListener((id) => { if (id === hostTabId) { hostTabId = null; hostMode = null; } });
+
+// 工具栏图标没有 popup，点击直接开设置页
+chrome.action.onClicked.addListener(() => {
+    chrome.runtime.openOptionsPage();
+});
+
+async function offscreenAlive() {
+    // hasDocument 在部分内核上不存在；getContexts 是更可靠的问法。返回 null 表示问不出来。
     try {
-        // 2. 获取图片数据：视频帧是内容脚本已生成好的 dataUrl，网页图片则突破防盗链后台下载
-        let blob;
-        if (dataUrl) {
-            blob = await (await fetch(dataUrl)).blob();
-        } else {
-            const imgRes = await fetch(imgSrc);
-            if (!imgRes.ok) throw new Error(`背景下载图片失败: 状态码 ${imgRes.status}`);
-            blob = await imgRes.blob();
+        if (chrome.offscreen?.getContexts) {
+            const cs = await chrome.offscreen.getContexts({ url: [HOST_PAGE] }).catch(() => null);
+            if (Array.isArray(cs)) return cs.length > 0;
         }
+        if (chrome.offscreen?.hasDocument) return !!(await chrome.offscreen.hasDocument());
+    } catch (e) { /* 老版本没这两个 API */ }
+    return null;
+}
 
-        // 3. 构建表单准备提交给本地 ComfyUI API
-        // 从 URL 提取文件名。注意抖音等站点的路径段可能包含 Windows 非法字符
-        // （如 ~tplv-dy-aweme-images-v2:2160:1440:q75.webp 里的冒号），
-        // 不清洗会导致 ComfyUI 落盘失败、上传接口报错
-        let filename = request.filename || 'web_image_' + Date.now() + '.png';
+async function waitHostReady(timeout = 15000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+        const r = await chrome.runtime.sendMessage({ action: 'mtbHost', type: 'ping' }).catch(() => null);
+        if (r && r.ok) return r;
+        await new Promise((res) => setTimeout(res, 250));
+    }
+    throw new Error('AI 宿主未在 ' + Math.round(timeout / 1000) + ' 秒内就绪（vendor 运行时可能没安装，请先跑 node scripts/setup-vendor.mjs）');
+}
 
-        if (!request.filename) {
-            try {
-                const url = new URL(imgSrc);
-                const pathName = url.pathname.split('/').pop() || '';
-                if (pathName.includes('.')) {
-                    filename = pathName.replace(/[\\/:*?"<>|]+/g, '_');
-                }
-            } catch(e) {}
-        }
+async function addRefererRule(url, pageUrl) {
+    const rid = 1000 + Math.floor(Math.random() * 9000);
+    await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [rid],
+        addRules: [{
+            id: rid, priority: 1,
+            action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Referer', operation: 'set', value: pageUrl }] },
+            condition: { urlFilter: url, resourceTypes: ['xmlhttprequest'] },
+        }],
+    });
+    return rid;
+}
 
-        // 4. 调用本地 ComfyUI 上传接口 (将图片同时存入 input 和 output 确保对任意不同类型的图像节点都能生效)
-        async function uploadToComfy(folderType) {
-            const form = new FormData();
-            form.append('image', blob, filename);
-            form.append('type', folderType);
-            form.append('overwrite', 'true');
-            let res;
-            try {
-                res = await fetch(`${comfyuiUrl}/upload/image`, { method: 'POST', body: form });
-            } catch (err) {
-                throw new Error(`无法连接 ComfyUI (${comfyuiUrl})：${err.message}。请确认 ComfyUI 已启动、地址填写正确。`);
-            }
-            if (!res.ok) {
-                let detail = '';
-                try { detail = (await res.text()).slice(0, 200); } catch (e) {}
-                throw new Error(`ComfyUI 上传失败(${folderType})：HTTP ${res.status} ${detail}`);
-            }
-            return res;
-        }
-
-        // 第一份发给 Input 文件夹（给常规 LoadImage 用）
-        await uploadToComfy('input');
-        // 第二份发给 Output 文件夹（给你的 LoadImageOutput 用）
-        const uploadRes = await uploadToComfy('output');
-        
-        const uploadData = await uploadRes.json();
-        const uploadedFilename = uploadData.name;
-
-        // 5. 根据模式执行
-        await executeProfile(uploadedFilename, profile, comfyuiUrl, autoQueue);
+async function fetchWithReferer(url, pageUrl, filename) {
+    if (!url) throw new Error('缺少地址');
+    if (url.startsWith('data:')) {
+        const bytes = base64ToBytes(url);
+        return { bytes, mime: (/^data:([^;,]+)/.exec(url) || [, 'image/png'])[1], filename: filename || 'image.png' };
+    }
+    if (url.startsWith('blob:')) throw new Error('blob: 地址需在页面内取帧，不支持后台抓取');
+    let rid = null;
+    try { rid = await addRefererRule(url, pageUrl || ''); } catch (e) { /* 规则上限时直接试 */ }
+    try {
+        const res = await fetch(url, { credentials: 'include', redirect: 'follow' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const buf = new Uint8Array(await res.arrayBuffer());
+        const mime = res.headers.get('content-type')?.split(';')[0] || sniffMime(buf);
+        return { bytes: buf, mime, filename: filename || filenameFromUrl(url, mime.split('/')[1] || 'png'), contentLength: buf.length };
     } finally {
-        // 清理我们刚配置的伪装规则以便下一次干净运行
-        if (isHttp) {
-            await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
-        }
+        if (rid) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [rid] }).catch(() => {});
     }
 }
 
-async function executeProfile(filename, profile, comfyuiUrl, autoQueue) {
-    if (profile.mode === 'api') {
-        // API 模式：读取 JSON 并通过 API 触发
-        if (!profile.workflowJson) throw new Error("API 模式下必须配置工作流 JSON 内容");
-        
-        let workflow;
+function bytesResult({ bytes, mime, filename }) {
+    return { ok: true, data: bytesToBase64(bytes), mime, filename, size: bytes.length };
+}
+
+function bytesToDataUrl(bytes, mime) {
+    return `data:${mime};base64,${bytesToBase64(bytes)}`;
+}
+
+async function safeJson(res) {
+    const text = await res.text();
+    try { return JSON.parse(text); } catch (e) { return text; }
+}
+
+async function downloadSettled(id, ms = 3000) {
+    // 只有查回收终态才知道下载到底成没成；否则错误全被 chrome 咽掉，表现就是「点了没反应」
+    const t0 = Date.now();
+    let last = null;
+    while (Date.now() - t0 < ms) {
+        const items = await chrome.downloads.search({ id }).catch(() => null);
+        last = (items && items[0]) || last;
+        if (last && (last.state === 'complete' || last.state === 'interrupted')) return last;
+        await new Promise((r) => setTimeout(r, 150));
+    }
+    return last;
+}
+
+const msgOf = (e) => String((e && e.message) || e || 'unknown');
+
+async function downloadBinary(bytes, mime, filename) {
+    // MV3 的 service worker 里没有 URL.createObjectURL，blob: 地址这条老路走不通；
+    // chrome.downloads 自 111 起直接收 base64 的 data + contentType，这才是正路。
+    const name = sanitizeFilename(filename || 'image');
+    const b64 = bytesToBase64(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+    const tries = [];
+    for (const spec of [{ data: b64, contentType: mime }, { url: `data:${mime};base64,${b64}` }]) {
         try {
-            workflow = JSON.parse(profile.workflowJson);
-        } catch (e) {
-            throw new Error("API 模式下配置的工作流 JSON 格式错误: " + e.message);
-        }
+            const id = await chrome.downloads.download({ ...spec, filename: name, saveAs: false, conflictAction: 'uniquify' });
+            return settled(id, name);
+        } catch (e) { tries.push(msgOf(e)); }
+    }
+    throw new Error('下载启动失败 → ' + tries.join(' ; '));
+}
 
-        const nodeId = profile.targetNodeId;
-        if (!nodeId || !workflow[nodeId]) {
-            throw new Error(`找不到配置的节点 ID: ${nodeId || '空'}`);
-        }
+async function settled(id, name) {
+    const st = await downloadSettled(id);
+    if (st && st.state === 'interrupted') throw new Error('下载被中断: ' + (st.error || 'unknown'));
+    return { ok: true, id, filename: (st && st.filename) || name };
+}
 
-        if (workflow[nodeId].inputs) {
-            workflow[nodeId].inputs.image = filename;
-        }
+function deepMerge(base, patch) {
+    if (Array.isArray(patch)) return patch;
+    if (!patch || typeof patch !== 'object') return base;
+    const out = { ...(base || {}) };
+    for (const k of Object.keys(patch)) {
+        out[k] = patch[k] && typeof patch[k] === 'object' && !Array.isArray(patch[k]) && base && typeof base[k] === 'object' && base[k] && !Array.isArray(base[k])
+            ? deepMerge(base[k], patch[k])
+            : patch[k];
+    }
+    return out;
+}
 
-        const res = await fetch(`${comfyuiUrl}/prompt`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: workflow })
-        });
-        
-        if (!res.ok) {
-            const err = await res.text();
-            throw new Error('API 模式触发工作流失败: ' + err);
-        }
+// ---------------------------------------------------------- ComfyUI
+
+async function comfySend(req, sender) {
+    const data = await chrome.storage.local.get(['mtbSettings']);
+    const settings = migrateSettings(data.mtbSettings || DEFAULT_SETTINGS);
+    const cfg = { ...settings.comfy, ...(req.comfy || {}) };
+    const server = (cfg.server || 'http://127.0.0.1:8188').replace(/\/$/, '');
+    const autoQueue = req.autoQueue ?? cfg.autoQueue ?? false;
+
+    let blob;
+    if (req.dataUrl) blob = await (await fetch(req.dataUrl)).blob();
+    else if (req.imgSrc) {
+        const r = await fetchWithReferer(req.imgSrc, req.pageUrl || '');
+        blob = new Blob([r.bytes], { type: r.mime });
+    } else throw new Error('既没有 dataUrl 也没有图片地址');
+
+    const filename = sanitizeFilename(req.filename || (blob.type.includes('jpeg') ? 'web_image.jpg' : 'web_image.png'));
+    let last = null;
+    const folders = cfg.uploadFolders || 'both';
+    const targets = folders === 'both' ? ['input', 'output'] : [folders];
+    for (const folderType of targets) {
+        const form = new FormData();
+        form.append('image', blob, filename);
+        form.append('type', folderType);
+        form.append('overwrite', 'true');
+        let res;
+        try { res = await fetch(`${server}/upload/image`, { method: 'POST', body: form }); }
+        catch (e) { throw new Error(`连不上 ComfyUI (${server})：${e.message}`); }
+        if (!res.ok) throw new Error(`ComfyUI 上传失败(${folderType})：HTTP ${res.status} ${(await res.text().catch(() => '')).slice(0, 160)}`);
+        last = await res.json().catch(() => ({}));
+    }
+    const uploaded = last?.name || filename;
+    try { await executeProfile(uploaded, cfg, server, autoQueue); }
+    catch (e) { return { ok: false, error: String(e.message || e), uploaded }; }
+    return { ok: true, uploaded };
+}
+
+async function executeProfile(filename, cfg, server, autoQueue) {
+    if (cfg.mode === 'api') {
+        if (!cfg.workflowJson) throw new Error('API 模式必须配置工作流 JSON');
+        let workflow;
+        try { workflow = JSON.parse(cfg.workflowJson); } catch (e) { throw new Error('工作流 JSON 格式错误: ' + e.message); }
+        const nodeId = cfg.targetNodeId;
+        if (!nodeId || !workflow[nodeId]) throw new Error(`找不到节点 ID: ${nodeId || '空'}`);
+        if (workflow[nodeId].inputs) workflow[nodeId].inputs.image = filename;
+        const res = await fetch(`${server}/prompt`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: workflow }) });
+        if (!res.ok) throw new Error('API 触发失败: ' + (await res.text()));
         return;
     }
-
-    // 前端模式：向打开的标签页注入代码
-    // 匹配 ComfyUI 页面
-    const allTabs = await chrome.tabs.query({});
-    const tabs = allTabs.filter(t => t.url && t.url.startsWith(comfyuiUrl));
-    
-    if (tabs.length === 0) {
-        throw new Error(`没有找到在浏览器中打开的 ComfyUI 标签页 (${comfyuiUrl})\n如果想在后台静默运行，请在配置中切换到 API 模式。`);
-    }
-
-    const comfyTabId = tabs[0].id;
-    const targetNodeType = profile.targetNodeType || "";
-
+    const tabs = (await chrome.tabs.query({})).filter((t) => t.url && t.url.startsWith(server));
+    if (!tabs.length) throw new Error(`没有找到打开的 ComfyUI 标签页 (${server})；要后台静默执行请切到 API 模式`);
     await chrome.scripting.executeScript({
-        target: { tabId: comfyTabId },
-        world: "MAIN", 
-        func: (newFilename, targetNodeType, autoQueue) => {
-            if (!window.app || !window.app.graph) {
-                alert("未检测到 ComfyUI 视图 (app/graph)，其可能尚未加载完毕。");
-                return;
-            }
-
-            let targetNode = null;
-            let selectedNodes = Object.keys(window.app.canvas.selected_nodes || {}).map(k => window.app.canvas.selected_nodes[k]);
-
-            if (targetNodeType) {
-                // 如果用户指定了节点名称，尝试通过标题或类型精确寻找
-                const nodes = window.app.graph._nodes;
-                targetNode = nodes.find(n => n.title === targetNodeType || n.type === targetNodeType || n.comfyClass === targetNodeType);
-            } else {
-                // 1. 优先寻找用户当前“鼠标点击选中”的包含 image 属性的节点
-                targetNode = selectedNodes.find(n => n.widgets && n.widgets.some(w => w.name === "image"));
-
-                // 2. 降级去全局寻找
-                if (!targetNode) {
-                    const nodes = window.app.graph._nodes;
-                    targetNode = nodes.find(n => n.type === "LoadImageOutput" || n.comfyClass === "LoadImageOutput");
-                    if (!targetNode) {
-                        targetNode = nodes.find(n => n.type === "LoadImage" || n.comfyClass === "LoadImage");
-                    }
-                }
-            }
-
-            if (targetNode) {
-                const imgWidget = targetNode.widgets.find(w => w.name === "image" && w.type !== "button");
-                if (imgWidget) {
-                    let finalValue = newFilename;
-                    const isOutputNode = targetNode.type === "LoadImageOutput" || targetNode.comfyClass === "LoadImageOutput";
-                    if (isOutputNode) {
-                        finalValue = newFilename + " [output]";
-                    }
-                    
-                    if (imgWidget.options && Array.isArray(imgWidget.options.values)) {
-                        if (!imgWidget.options.values.includes(finalValue)) {
-                            imgWidget.options.values.push(finalValue);
-                        }
-                    }
-                    imgWidget.value = finalValue;
-                    
-                    if (typeof imgWidget.callback === "function") {
-                        try {
-                            imgWidget.callback(finalValue);
-                        } catch (e) {
-                            console.warn("Widget callback 调用失败:", e);
-                        }
-                    }
-
-                    targetNode.setDirtyCanvas(true, true);
-                    if (window.app.api && typeof window.app.api.dispatchEvent === "function") {
-                        const folderType = isOutputNode ? "output" : "input";
-                        window.app.api.dispatchEvent(new CustomEvent("b_preview", { detail: { image: newFilename, type: folderType } }));
-                    }
-
-                    window.app.graph.setDirtyCanvas(true, true);
-                    console.log("成功应用图像并触发刷新 =", finalValue);
-                    
-                    if (autoQueue) {
-                        try {
-                            if (window.app.queuePrompt) {
-                                window.app.queuePrompt(0);
-                            } else {
-                                // 备用方案，模拟点击队列按钮
-                                const queueBtn = document.getElementById("queue-button") || document.querySelector("button.p-button-primary");
-                                if (queueBtn) queueBtn.click();
-                            }
-                        } catch (e) {
-                            console.warn("自动执行队列失败:", e);
-                        }
-                    }
-                } else {
-                    alert('找到了节点，但节点中丢失了对应的 "image" 输入框');
-                }
-            } else {
-                alert("未在画布中找到图像加载节点。\n请在配置中填入正确的节点类型名称，或在画布中用鼠标左键单击选中您想要传送的节点！");
-            }
-        },
-        args: [filename, targetNodeType, autoQueue]
+        target: { tabId: tabs[0].id },
+        world: 'MAIN',
+        func: injectComfy,
+        args: [filename, cfg.targetNodeType || '', !!autoQueue],
     });
+}
+
+// 与旧版一致：优先选中节点 -> LoadImageOutput -> LoadImage，并刷新预览
+function injectComfy(newFilename, targetNodeType, autoQueue) {
+    if (!window.app || !window.app.graph) { console.warn('[mtb] 未检测到 ComfyUI app/graph'); return { ok: false, error: 'ComfyUI 页面未就绪' }; }
+    let targetNode = null;
+    const selected = Object.values(window.app.canvas?.selected_nodes || {});
+    if (targetNodeType) {
+        targetNode = window.app.graph._nodes.find((n) => n.title === targetNodeType || n.type === targetNodeType || n.comfyClass === targetNodeType);
+    } else {
+        targetNode = selected.find((n) => n.widgets && n.widgets.some((w) => w.name === 'image'));
+        if (!targetNode) {
+            targetNode = window.app.graph._nodes.find((n) => n.type === 'LoadImageOutput' || n.comfyClass === 'LoadImageOutput')
+                || window.app.graph._nodes.find((n) => n.type === 'LoadImage' || n.comfyClass === 'LoadImage');
+        }
+    }
+    if (!targetNode) return { ok: false, error: '画布里找不到图像加载节点' };
+    const imgWidget = targetNode.widgets?.find((w) => w.name === 'image' && w.type !== 'button');
+    if (!imgWidget) return { ok: false, error: '节点缺少 image 输入框' };
+    const isOutput = targetNode.type === 'LoadImageOutput' || targetNode.comfyClass === 'LoadImageOutput';
+    const value = isOutput ? newFilename + ' [output]' : newFilename;
+    if (imgWidget.options && Array.isArray(imgWidget.options.values) && !imgWidget.options.values.includes(value)) imgWidget.options.values.push(value);
+    imgWidget.value = value;
+    try { imgWidget.callback?.(value); } catch (e) { /* 部分节点无 callback */ }
+    targetNode.setDirtyCanvas(true, true);
+    window.app.graph?.setDirtyCanvas(true, true);
+    window.app.api?.dispatchEvent?.(new CustomEvent('b_preview', { detail: { image: newFilename, type: isOutput ? 'output' : 'input' } }));
+    if (autoQueue) {
+        try {
+            if (window.app.queuePrompt) window.app.queuePrompt(0);
+            else (document.getElementById('queue-button') || document.querySelector('button.p-button-primary'))?.click();
+        } catch (e) { console.warn('[mtb] 排队失败', e); }
+    }
+    return { ok: true, value };
 }

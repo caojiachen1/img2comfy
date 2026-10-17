@@ -1,0 +1,24 @@
+# 依赖与生成物
+vendor/
+.vendor-tmp/
+node_modules/
+test/.browsers/
+
+# 测试跑出来的东西
+test/out_*.txt
+test/out_*.json
+test/out_*.png
+test/out_extract.txt
+test/out_proxy.log
+
+# 第三方二进制素材：模型权重与真人照片都不入库，测试会自己下载
+test/media/*.onnx
+test/media/face_*.jpg
+
+# 一次性排障脚本（debug3 会改写 manifest.json，别提交）
+scripts/debug*.mjs
+test/face_fit.*
+test/hf_probe.mjs
+test/hf_search.mjs
+
+.DS_Store

@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>mtb options harness</title>
+<script src="/test/harness_stub.js"></script>
+<style>
+body { font: 13px/1.5 system-ui, sans-serif; margin: 8px; }
+#log { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Consolas, monospace; }
+</style>
+</head>
+<body>
+<div id="log">载入中…</div>
+<script type="module">
+// 设置页真机测试：把 options.html 的 DOM 搬进普通网页（扩展页在无头里打不开），用 chrome 桩喂后台响应，
+// 然后逐个点开标签页、点每个按钮。目的不是验样式，而是把「只有点到那个按钮才炸」的
+// ReferenceError / TypeError 逼出来——这类错误语法检查和单测都看不见。
+const logEl = document.getElementById('log');
+const out = { steps: [] };
+const log = (t) => { logEl.textContent += '\n' + t; };
+const step = (name, ok, info) => { out.steps.push({ name, ok, info }); log((ok ? 'OK   ' : 'FAIL ') + name + (info ? '  ' + JSON.stringify(info).slice(0, 260) : '')); };
+window.__errs = [];
+addEventListener('error', (e) => window.__errs.push(String(e.message || e)));
+addEventListener('unhandledrejection', (e) => window.__errs.push('rej: ' + String((e && e.reason && e.reason.message) || e.reason)));
+
+// 「代码 bug」的形状：未定义标识符、读 undefined 的属性、把非函数当函数调
+const CODE_BUG = /is not defined|ReferenceError|Cannot read propert(?:y|ies) of (?:undefined|null)|is not a function|is not iterable/;
+const anyBug = (t) => CODE_BUG.test(String(t || ''));
+
+const rtStatus = (ready) => ({
+    ortVersion: '1.31.0-dev-test', cacheName: 'mtb-runtime-v1',
+    files: [
+        { name: 'ort-wasm-simd-threaded.asyncify.wasm', label: 'ORT WASM 后端（asyncify）', bytes: 26861777, required: true, inPackage: ready ? 0 : 0, inCache: ready ? 26861777 : 0, have: ready ? 26861777 : 0, ready, source: ready ? 'cache' : 'missing' },
+        { name: 'ort-wasm-simd-threaded.jsep.wasm', label: 'ORT WASM 后端（jsep）', bytes: 28352885, required: false, inPackage: 0, inCache: 0, have: 0, ready: false, source: 'missing' },
+        { name: 'ort-wasm-simd-threaded.wasm', label: 'ORT WASM 后端（threaded）', bytes: 14264838, required: false, inPackage: 0, inCache: 0, have: 0, ready: false, source: 'missing' },
+    ],
+    ready, requiredBytes: 26861777, totalBytes: 69479500, cachedBytes: ready ? 26861777 : 0, packageBytes: 0,
+    storage: { quota: 2147483648, usage: 1048576 },
+});
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const until = async (fn, ms = 8000) => { for (let i = 0; i < ms / 100; i++) { if (fn()) return true; await wait(100); } return false; };
+const txt = (sel) => { const el = $(sel); return el ? String(el.textContent) : '__缺元素 ' + sel; };
+// 缺元素要报 FAIL，不能让脚本半路抛异常把整轮测试带走
+const clickIf = (sel, label) => {
+    const el = typeof sel === 'string' ? $(sel) : sel;
+    if (!el) { step('按钮存在：' + (label || sel), false, { missing: String(label || sel) }); return null; }
+    el.click();
+    return el;
+};
+
+// ---- 后台/宿主桩响应：够让处理函数跑到头，而不是提前 return
+Object.assign(window.__mtbStubHandlers, {
+    mtbHost: async (msg) => {
+        if (msg.type === 'runtime') return { ok: true, runtime: { webgpu: false, reason: 'stub 里无 GPU', device: 'wasm', hub: 'hf-mirror' } };
+        if (msg.type === 'ai' && msg.task === 'cacheSummary') return { ok: true, result: { entries: [{ bytes: 12345, model: 'Xenova/stub' }], count: 1, totalText: '12.1 KB' } };
+        if (msg.type === 'ai' && msg.task === 'clearCache') return { ok: true, result: { cleared: 1 } };
+        if (msg.type === 'ai') return { ok: true, text: '一张测试图（stub）', ms: 900 };
+        if (msg.type === 'compile') return { ok: true };
+        if (msg.type === 'runtimeStatus') return { ok: true, status: rtStatus(false) };
+        if (msg.type === 'installRuntime') {
+            const size = 26861777;
+            for (const pct of [10, 45, 80]) {
+                chrome.runtime.sendMessage({ action: 'mtbEvent', type: 'runtimeProgress', file: 'ort-wasm-simd-threaded.asyncify.wasm', label: 'ORT WASM 后端（asyncify）', index: 0, total: 1, loaded: Math.round(size * pct / 100), size, phase: 'download', speed: 4.2e6 });
+                await new Promise((r) => setTimeout(r, 120));
+            }
+            return { ok: true, status: rtStatus(true), installed: [{ name: 'ort-wasm-simd-threaded.asyncify.wasm', bytes: size, ms: 1234 }], errors: [] };
+        }
+        if (msg.type === 'clearRuntime') return { ok: true, cleared: { ok: true, cacheName: 'mtb-runtime-v1' } };
+        if (msg.type === 'script') return { ok: true, result: { toast: 'stub 脚本返回 ok' } };
+        return { ok: true, result: {} };
+    },
+    proxyFetch: () => ({ ok: true, data: { system: { os: 'Windows', python_version: '3.12' }, comfyui: { version: '0.3.40' } } }),
+});
+window.confirm = () => true;
+window.alert = () => {};
+
+try {
+    // ---- 1) 搬 DOM（去掉 script，避免重复 boot）
+    const raw = await (await fetch('/options.html')).text();
+    const parsed = new DOMParser().parseFromString(raw, 'text/html');
+    parsed.querySelectorAll('script,link,style').forEach((s) => s.remove());
+    document.body.append(...parsed.body.childNodes);
+    step('options.html 结构可用（按钮与容器都在）', !!$('#btnRuntime') && !!$('#scriptList') && !!$('#fileImport') && !!$('#tabs'),
+        { runtime: !!$('#btnRuntime'), scriptList: !!$('#scriptList'), fileImport: !!$('#fileImport'), tabs: !!$('#tabs') });
+
+    // ---- 2) boot 设置页模块（顶层 IIFE 会自动跑）
+    const m = await import('/src/options/options.mjs');
+    window.__S = m.S;
+    const ready = await until(() => m.S && m.S.settings, 12000);
+    step('设置页 boot 完成（S.settings 就绪）', ready, { version: ready && m.S.settings.version, tools: ready && Object.keys(m.S.settings.tools || {}).length });
+
+    // ---- 3) 每个标签页都点开一次，触发各自的 render*
+    for (const b of $$('#tabs button')) {
+        const t = b.dataset && b.dataset.tab;
+        if (!t) continue;
+        const before = window.__errs.length;
+        b.click();
+        await wait(200);
+        const bad = window.__errs.slice(before).filter(anyBug);
+        step('标签页 ' + t + ' 渲染不抛代码错误', bad.length === 0, { errs: bad.slice(0, 2) });
+    }
+
+    // ---- 4) AI 面板里的按钮（S_ 那个 bug 就藏在这里）
+    clickIf('#btnRuntime', '检测运行时');
+    await until(() => /宿主模式|探测失败/.test(txt('#runtimeOut')));
+    step('检测运行时：结果写进 #runtimeOut 且不是 ReferenceError', !anyBug(txt('#runtimeOut')) && /宿主模式/.test(txt('#runtimeOut')), { out: txt('#runtimeOut').slice(0, 170) });
+
+    clickIf('#btnCache').click();
+    await until(() => /缓存 \d+ 项|失败/.test(txt('#runtimeOut')));
+    step('模型占用统计：拿到桩缓存清单', !anyBug(txt('#runtimeOut')) && /缓存 1 项/.test(txt('#runtimeOut')), { out: txt('#runtimeOut').slice(0, 140) });
+
+    clickIf('#btnClearCache') && $('#btnClearCache').click();
+    await wait(500);
+    clickIf('#btnComfyTest') && $('#btnComfyTest').click();
+    await until(() => !/探测中/.test(txt('#comfyTestOut')));
+    step('测试连接（走后台代理桩）', !anyBug(txt('#comfyTestOut')) && /OK ·/.test(txt('#comfyTestOut')), { out: txt('#comfyTestOut').slice(0, 140) });
+
+    clickIf('#btnAiSelfTest') && $('#btnAiSelfTest').click();
+    await until(() => /识别结果|自检失败|被预算|需要提高预算/.test(txt('#aiTestOut')));
+    step('看图说话自检（宿主返回 stub 文本）', !anyBug(txt('#aiTestOut')) && /识别结果/.test(txt('#aiTestOut')), { out: txt('#aiTestOut').slice(0, 140), hint: txt('#selfTestHint') });
+
+    // ---- 4b) 运行时安装卡片：状态、文件清单、安装按钮、进度条、ModelScope 源
+    const hubSel2 = $('#aiHub');
+    step('模型源含 ModelScope', !!hubSel2 && [...hubSel2.options].some((o) => o.value === 'modelscope'), {
+        opts: hubSel2 ? [...hubSel2.options].map((o) => o.value) : [] });
+    await until(() => $$('#runtimeFiles .f').length >= 3, 8000);
+    step('运行时卡片显示文件清单与缺失状态', $$('#runtimeFiles .f').length >= 4 && /缺必需文件|还需下载/.test(txt('#runtimeState')),
+        { rows: $$('#runtimeFiles .f').length, state: txt('#runtimeState').slice(0, 90) });
+    // 进度是靠宿主事件经后台转发回来的，这里数一下事件到没到（以前后台压根没有 mtbEvent 转发）
+    window.__prog = 0;
+    const progListener = (m) => { if (m?.action === 'mtbHostEvent' && m.type === 'runtimeProgress') window.__prog++; };
+    chrome.runtime.onMessage.addListener(progListener);
+    clickIf('#btnRuntimeInstall');
+    await until(() => /已就绪/.test(txt('#runtimeState')), 8000);
+    step('点「安装运行时」：进度事件到达、进度条走动、状态转为已就绪',
+        /已就绪/.test(txt('#runtimeState')) && $$('#runtimeFiles .ok').length >= 1 && window.__prog >= 3 && ($('#runtimeBar') || {}).style?.width !== '0%',
+        { events: window.__prog, relay: window.__mtbStubRelay, relayErr: window.__mtbStubRelayErr || null, emitted: !!window.__mtbStubHandlers.mtbHost, state: txt('#runtimeState').slice(0, 80), ok: $$('#runtimeFiles .ok').length, bar: ($('#runtimeBar') || {}).style?.width, speed: txt('#runtimeSpeed').slice(0, 90) });
+    chrome.runtime.onMessage.removeListener(progListener);
+    clickIf('#btnRuntimeCheck');
+    await wait(600);
+
+    // ---- 5) 自定义功能：切到面板 → 新建脚本 → 语法检查 → 用示例图试跑
+    const customTab = $$('#tabs button').find((x) => x.dataset.tab === 'custom');
+    customTab && customTab.click();
+    await wait(300);
+    const { BUILTIN_SCRIPTS, BUILTIN_LINKS } = await import('/src/common/builtin-scripts.js');
+    // 实时预览与脚本编辑器：这两处是设置页的招牌功能，也是「只有点开才炸/根本不渲染」的高发区
+    // 预览工具栏在 #toolbarSlot 里的 shadow root 内，普通选择器穿不过去
+    const previewBtns = () => { const h = $('#toolbarSlot #mtb-root'); return h && h.shadowRoot ? h.shadowRoot.querySelectorAll('.wrap button.btn').length : -1; };
+    const previewed = await until(() => previewBtns() > 0, 9000);
+    step('外观页实时预览渲染出工具栏按钮', previewed, { n: previewBtns(), sampleW: ($('#sampleImg') || {}).naturalWidth || 0 });
+    // 行内是「显示/隐藏」勾选框，常驻/折叠改到该行的 ⚙ 设置面板里
+    const row0 = $('#toolList .item');
+    const id0 = row0 && row0.dataset.id;
+    const cb0 = row0 && row0.querySelector('input[type=checkbox]');
+    let foldInfo = { hasRow: !!row0, hasCheckbox: !!cb0, checked: !!(cb0 && cb0.checked) };
+    const cfgBtn = row0 && row0.querySelector('.cfg');
+    cfgBtn && cfgBtn.click();
+    await until(() => $('#paramEditor select'), 4000);
+    const visSel = $('#paramEditor select');
+    foldInfo.visInParamEditor = !!visSel;
+    if (visSel) {
+        visSel.value = 'menu';
+        visSel.dispatchEvent(new Event('change'));
+        await wait(400);
+        const st = (window.__S.settings.tools[id0] || {});
+        foldInfo = {
+            ...foldInfo, id: id0, enabled: st.enabled === true, collapsed: st.collapsed === true,
+            badge: /折叠/.test((($(`#toolList .item[data-id="${id0}"]`) || {}).textContent) || ''),
+            moreInPreview: (() => { const h = $('#toolbarSlot #mtb-root'); return !!(h && h.shadowRoot && h.shadowRoot.querySelector('.wrap.show button.btn.more')); })(),
+        };
+        // 改回常驻，别影响后面的步骤
+        visSel.value = 'pin'; visSel.dispatchEvent(new Event('change')); await wait(300);
+        foldInfo.unfolded = window.__S.settings.tools[id0].collapsed === false;
+    }
+    step('行内勾选框 + ⚙ 面板里的「显示位置」能折叠/展开且预览同步',
+        foldInfo.hasCheckbox && foldInfo.visInParamEditor && foldInfo.enabled && foldInfo.collapsed && foldInfo.badge && foldInfo.moreInPreview && foldInfo.unfolded, foldInfo);
+
+    const firstItem = $('#scriptList .item');
+    firstItem && firstItem.click();
+    await until(() => $('#scriptEditor textarea'), 6000);
+    const tas = $$('#scriptEditor textarea').length;
+    const dbg = (() => {
+        const S2 = window.__S || {};
+        const cur = (S2.settings && S2.settings.customScripts) || [];
+        return { selScript: S2.selScript, ids: cur.map((x) => x.id).slice(0, 5), boxChildren: ($('#scriptEditor') || {}).childElementCount, boxHtmlLen: ($('#scriptEditor') || {}).innerHTML?.length || 0, errs: window.__errs.slice(-2) };
+    })();
+    const codeArea = [...$$('#scriptEditor textarea')].sort((x, y) => (y.value || '').length - (x.value || '').length)[0];
+    const nInputs = $$('#scriptEditor input').length;
+    step('脚本编辑器字段齐全（名称/图标等输入框 + 代码 textarea 带内容）',
+        tas >= 2 && nInputs >= 3 && !!codeArea && (codeArea.value || '').length > 60,
+        { textareas: tas, inputs: nInputs, codeLen: codeArea ? codeArea.value.length : 0, ...dbg });
+
+    step('内置自定义功能已进列表（新装用户也能看到示例）',
+        $$('#scriptList .item').length === BUILTIN_SCRIPTS.length && $$('#linkList .item').length === BUILTIN_LINKS.length,
+        { scripts: $$('#scriptList .item').length, wantScripts: BUILTIN_SCRIPTS.length, links: $$('#linkList .item').length, wantLinks: BUILTIN_LINKS.length });
+    clickIf('#btnNewScript') && $('#btnNewScript').click();
+    await wait(400);
+    const edBtns = () => $$('#scriptEditor button');
+    const valBtn = edBtns().find((b) => /语法检查/.test(b.textContent));
+    const runBtn = edBtns().find((b) => /试跑/.test(b.textContent));
+    step('新建脚本后编辑器出现（语法检查 / 试跑按钮）', !!valBtn && !!runBtn, { n: edBtns().length });
+    if (valBtn) {
+        valBtn.click();
+        await until(() => /语法通过|语法错误|无法检查/.test(txt('#scriptEditor pre.out')));
+        step('语法检查（经宿主 QuickJS）', !anyBug(txt('#scriptEditor pre.out')) && /语法通过/.test(txt('#scriptEditor pre.out')), { out: txt('#scriptEditor pre.out').slice(0, 140) });
+    }
+    if (runBtn) {
+        runBtn.click();
+        await until(() => /返回:|失败:/.test(txt('#scriptEditor pre.out')));
+        step('用示例图试跑脚本（宿主 script 通道）', !anyBug(txt('#scriptEditor pre.out')) && /返回:/.test(txt('#scriptEditor pre.out')), { out: txt('#scriptEditor pre.out').slice(0, 170) });
+    }
+    // 选中内置示例：应给出「恢复此示例原始代码」，且 ctx API 文档非空
+    const builtinRow = $$('#scriptList .item').find((r) => /内置示例/.test(r.textContent));
+    builtinRow && builtinRow.click();
+    await wait(300);
+    step('选中内置示例后编辑器仍完整（恢复按钮在）', !builtinRow || edBtns().some((b) => /恢复此示例/.test(b.textContent)), { rows: $$('#scriptList .item').length });
+    step('ctx API 参考已填充', ($('#apiDoc pre') || {}).textContent ? $('#apiDoc pre').textContent.length > 400 : false, { len: ($('#apiDoc pre') || {}).textContent?.length || 0 });
+
+    // ---- 6) 链接工具与站点面板
+    clickIf('#btnNewLink') && $('#btnNewLink').click();
+    await wait(300);
+    step('链接型工具编辑器字段齐全（URL 模板等输入框出得来）',
+        $$('#scriptEditor input').length >= 3 && $$('#scriptEditor textarea').length >= 1 && !anyBug(window.__errs.filter(anyBug).join(' ')),
+        { inputs: $$('#scriptEditor input').length, textareas: $$('#scriptEditor textarea').length, links: $$('#linkList .item').length });
+    const sitesTab = $$('#tabs button').find((x) => x.dataset.tab === 'sites');
+    sitesTab && sitesTab.click();
+    await wait(250);
+    clickIf('#btnCurrentSite') && $('#btnCurrentSite').click();
+    await wait(200);
+
+    // ---- 7) 收尾：任何输出块里都不许残留代码级错误
+    const texts = $$('pre.out, .hint, #toast, #siteHint, #runtimeOut, #comfyTestOut, #aiTestOut').map((el) => el.textContent);
+    const leaked = texts.filter(anyBug);
+    step('全部输出块里没有未定义标识符/类型错误', leaked.length === 0, { leaked: leaked.slice(0, 3).map((t) => String(t).slice(0, 140)) });
+    const pageBugs = window.__errs.filter(anyBug);
+    step('点击全过程无未捕获代码错误', pageBugs.length === 0, { errs: pageBugs.slice(0, 4) });
+} catch (e) {
+    step('设置页阶段无致命异常', false, { err: String(e && (e.stack || e.message) || e).slice(0, 400), errs: window.__errs.filter(anyBug).slice(0, 4) });
+}
+
+window.__optDone = out;
+window.__optFinished = true;
+log('\n完成');
+</script>
+</body>
+</html>

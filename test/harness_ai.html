@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>mtb AI 宿主页面级验证</title></head>
+<body style="background:#151519;color:#cfd6dd;font:12px ui-monospace,monospace;padding:12px">
+<h3>vendor / transformers.js / 小模型真实推理</h3>
+<pre id="log">运行中…</pre>
+<canvas id="cv" width="256" height="128" style="border:1px solid #444"></canvas>
+<script type="module">
+const log = (t) => { document.getElementById('log').textContent += '\n' + t; };
+const out = { steps: [] };
+function step(name, ok, data) { out.steps.push({ name, ok: !!ok, ...data }); log(`${ok ? 'OK ' : 'FAIL'} ${name} ${JSON.stringify(data).slice(0, 300)}`); }
+window.__aiDone = null; window.__aiFinished = false;
+
+// 造一张有硬边 + 绿色圆形的测试图（供超分/分割/人脸共用）
+const cv = document.getElementById('cv');
+const g = cv.getContext('2d', { willReadFrequently: true });
+g.fillStyle = '#fff'; g.fillRect(0, 0, 128, 128);
+g.fillStyle = '#000'; g.fillRect(128, 0, 128, 128);
+g.fillStyle = '#0f0'; g.beginPath(); g.arc(64, 64, 30, 0, 7); g.fill();
+const id = g.getImageData(0, 0, 256, 128);
+const px = { width: 256, height: 128, data: new Uint8ClampedArray(id.data) };
+window.__mtbPx = px;
+
+const base = location.origin + '/';
+(async () => {
+    const { findCft } = {};
+    let tf;
+    try {
+        tf = await import('/vendor/transformers.web.min.mjs');
+        step('vendor transformers.js 载入', true, { exports: Object.keys(tf).length, pipeline: !!tf.pipeline, SamModel: !!tf.SamModel, Qwen3VL: !!tf.Qwen3VLForConditionalGeneration, Qwen2VL: !!tf.Qwen2VLForConditionalGeneration, version: tf.__version__ || '?' });
+    } catch (e) { step('vendor transformers.js 载入', false, { err: String(e.message || e).slice(0, 300) }); window.__aiDone = out; return; }
+
+    const { env } = tf;
+    env.allowLocalModels = false;
+    env.useBrowserCache = true;
+    env.backends.onnx.wasm.wasmPaths = '/vendor/';
+    env.remoteHost = location.origin + '/proxy/hf';   // web 页面直连会被 CORS 挡，测试服务器代取权重
+    env.remotePathTemplate = '{model}/resolve/{revision}/';
+
+    const webgpu = !!navigator.gpu;
+    let device = 'wasm';
+    if (webgpu) { const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); if (a) device = 'webgpu'; }
+    step('设备探测', true, { webgpu, device, adapter: device === 'webgpu' ? (await (await navigator.gpu.requestAdapter()).requestAdapterInfo?.()) || null : null });
+
+    window.__mtbEnv = { tf, env, device };
+
+    // 让各 AI 模块共用同一份 env：宿主里靠 globalThis 拿 ort
+    try { globalThis.ort = tf.ort; } catch (e) { /* ignore */ }
+
+    const { SrRunner } = await import('/src/common/ai/sr.js');
+    const { SamRunner } = await import('/src/common/ai/sam.js');
+    const { loadOrtSession } = await import('/src/common/ai/ort-load.js');
+    const { detectFaces } = await import('/src/common/ai/face.js');
+
+    const only = new URLSearchParams(location.search).get('only');
+
+    if (!only || only === 'sr') {
+        const t0 = Date.now();
+        try {
+            const s = new SrRunner({ tf, device: 'wasm', dtype: 'q4' });
+            const r = await s.runTj(px, 'Xenova/swin2SR-lightweight-x2-64');
+            step('swin2SR 真实超分 x2', r.image.width === 512 && r.image.height === 256, { to: r.image.width + 'x' + r.image.height, scale: r.scale, ms: Date.now() - t0 });
+        } catch (e) { step('swin2SR 真实超分 x2', false, { err: String(e.message || e).slice(0, 400), ms: Date.now() - t0 }); }
+    }
+
+    if (!only || only === 'sam') {
+        const t0 = Date.now();
+        try {
+            const sm = new SamRunner({ tf, device: 'wasm', dtype: 'quantized', modelId: 'Xenova/slimsam-77-uniform' });
+            const r = await sm.segmentPoints(px, [[64, 64]], [1], {});
+            const m = r.masks[0];
+            let on = 0;
+            for (const v of m.data) if (v > 127) on++;
+            const coverage = on / (m.width * m.height);
+            // 绿圆半径 30 → 面积比 ~ πr²/(256*128) ≈ 0.086；允许宽松区间
+            step('slimSAM 点选分割真实推理', m.width === 256 && m.height === 128 && coverage > 0.02 && coverage < 0.6, { mask: m.width + 'x' + m.height, coverage: +coverage.toFixed(3), ms: Date.now() - t0 });
+        } catch (e) { step('slimSAM 点选分割真实推理', false, { err: String(e.message || e).slice(0, 460), ms: Date.now() - t0 }); }
+    }
+
+    if (!only || only === 'face') {
+        const t0 = Date.now();
+        try {
+            // 逐个试已核实的人脸源（web 页面直连可能被 CORS 挡，扩展里由 host_permissions 免掉）
+            const { resolveFaceModel } = await import('/src/common/ai/face.js');
+            const picked = resolveFaceModel({});
+            const tried = [];
+            let sess = null;
+            const proxied = picked.urls.map((u) => (/^https:\/\/github|raw.githubusercontent/i.test(u) ? location.origin + '/proxy/get/' + u : u));
+            // 本地缓存优先：模型只有 232KB，走网络代理偶发 502 不该让这条测试变红
+            for (const src of ['/test/media/yunet.onnx'].concat(proxied)) {
+                try { sess = await loadOrtSession({ url: src, ai: { hub: 'hf-mirror' }, device: 'wasm', vendorBase: location.origin + '/vendor' }); break; }
+                catch (e) { tried.push(String(src).slice(-46) + ' → ' + String(e.message || e).slice(0, 80)); }
+            }
+            if (!sess) throw new Error('全部人脸源失败: ' + (tried.join(' ; ') || '无可用 URL'));
+            window.__sessInfo = { keys: Object.keys(sess).slice(0, 40), inputNames: sess.inputNames, outputNames: sess.outputNames, inputDims: sess.inputDims, meta: (() => { try { return sess.inputMetadata } catch (e) { return 'ERR ' + e.message } })(), impl: (() => { try { return Object.keys(sess.inputMetadataImpl || {}) } catch (e) { return 'na' } })() };
+            const f = await detectFaces(sess, px, { confThreshold: 0.3 });
+            step('YuNet 人脸模型可推理（合成图无人脸属正常）', typeof f.faces.length === 'number', { faces: f.faces.length, shape: f.outputShape, ms: Date.now() - t0 });
+            // 再拿一张真有人脸的图验证检出。照片不入库（第三方版权图），本地没有就走 /proxy/get/ 现取；
+            // 两条路都不通才算跳过。
+            let img = null;
+            for (const photo of ['/test/media/face_lena.jpg', location.origin + '/proxy/get/https://raw.githubusercontent.com/opencv/opencv/master/samples/data/lena.jpg']) {
+                const el = new Image();
+                el.crossOrigin = 'anonymous';
+                el.src = photo;
+                try { await el.decode(); img = el; break; } catch (ePhoto) { /* 换下一个源 */ }
+            }
+            if (!img) { step('YuNet 真实人脸检出（照片源不可用，本项跳过）', true, { note: '本地与远端照片都取不到' }); throw { __skip: true }; }
+            const c2 = document.createElement('canvas');
+            c2.width = img.naturalWidth; c2.height = img.naturalHeight;
+            c2.getContext('2d').drawImage(img, 0, 0);
+            const id2 = c2.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, c2.width, c2.height);
+            const px2 = { width: id2.width, height: id2.height, data: new Uint8ClampedArray(id2.data) };
+            const f2 = await detectFaces(sess, px2, { confThreshold: 0.5 });
+            const b = f2.faces[0] || null;
+            // 光「检出一个框」不够——anchor 约定错的时候框又窄又长、五点挤在鼻梁上，
+            // 所以必须核几何：长宽比、框占比、五官点是否落在框内。
+            const aspect = b ? b.width / b.height : 0;
+            const cover = b ? (b.width * b.height) / (px2.width * px2.height) : 0;
+            const lmIn = b ? Object.values(b.landmarks || {}).every(([lx, ly]) => lx > b.x - b.width * 0.3 && lx < b.x + b.width * 1.3 && ly > b.y - b.height * 0.3 && ly < b.y + b.height * 1.3) : false;
+            const eyeSpan = b && b.landmarks && b.landmarks.rightEye && b.landmarks.leftEye ? Math.hypot(b.landmarks.rightEye[0] - b.landmarks.leftEye[0], b.landmarks.rightEye[1] - b.landmarks.leftEye[1]) / b.width : 0;
+            step('YuNet 在真实人脸上能检出且几何合理（长宽比/占比/五点在框内）',
+                !!(b && b.score >= 0.5 && aspect > 0.5 && aspect < 1.6 && cover > 0.01 && cover < 0.7 && lmIn && eyeSpan > 0.25),
+                { faces: f2.faces.length, box: b ? `${Math.round(b.x)},${Math.round(b.y)},${Math.round(b.width)}x${Math.round(b.height)}` : null, score: b ? +b.score.toFixed(3) : null, aspect: +aspect.toFixed(2), cover: +cover.toFixed(3), eyeSpan: +eyeSpan.toFixed(2), lmIn });
+        } catch (e) { if (e && e.__skip) { /* 照片源缺失，已单独记为跳过 */ } else step('YuNet 人脸模型可推理', false, { err: String(e.message || e).slice(0, 400), sess: window.__sessInfo || null, ms: Date.now() - t0 }); }
+    }
+
+    if (only === 'vlm') {
+        const { VlmRunner } = await import('/src/common/ai/vlm.js');
+        const cv2 = document.createElement('canvas'); cv2.width = 320; cv2.height = 200;
+        const gg = cv2.getContext('2d');
+        gg.fillStyle = '#123'; gg.fillRect(0, 0, 320, 200);
+        gg.fillStyle = '#e8b04b'; gg.beginPath(); gg.arc(90, 70, 34, 0, 7); gg.fill();
+        gg.fillStyle = '#4ec97e'; gg.fillRect(150, 90, 120, 70);
+        gg.fillStyle = '#fff'; gg.font = '15px sans-serif'; gg.fillText('YELLOW CIRCLE GREEN RECT', 12, 186);
+        const id3 = gg.getImageData(0, 0, 320, 200);
+        const px3 = { width: 320, height: 200, data: new Uint8ClampedArray(id3.data) };
+        for (const [model, dtype] of [['HuggingFaceTB/SmolVLM2-500M-Video-Instruct', 'q4'], ['onnx-community/Qwen3-VL-2B-Instruct-ONNX', 'q4']]) {
+            const t0 = Date.now();
+            const evts = [];
+            try {
+                const r = new VlmRunner({ tf, device: 'wasm', dtype, modelId: model, progress: () => {}, onEvent: (k, d) => evts.push(k + ':' + JSON.stringify(d).slice(0, 110)) });
+                const a = await r.describe(px3, { maxNewTokens: 40 });
+                step('VLM 看图说话 ' + model, true, { text: (a.text || '').slice(0, 220), ms: Date.now() - t0, engine: a.engine, evts: evts.slice(0, 5) });
+                break;
+            } catch (e) {
+                step('VLM 看图说话 ' + model, false, { err: String(e.message || e).slice(0, 460), ms: Date.now() - t0, evts: evts.slice(0, 8) });
+            }
+        }
+    }
+
+    if (only === 'script') {
+        const { runUserScript, compileUserScript, loadQuickJs } = await import('/src/common/script-vm.js');
+        const vendorBase = location.origin + '/vendor';
+        const t0 = Date.now();
+        try {
+            await loadQuickJs(vendorBase);
+            step('QuickJS 引擎加载（无 sandbox / 无 unsafe-eval）', true, { ms: Date.now() - t0 });
+        } catch (e) { step('QuickJS 引擎加载（无 sandbox / 无 unsafe-eval）', false, { err: String(e.message || e).slice(0, 300) }); }
+
+        const services = async (name, payload) => {
+            if (name === 'fetch') return { ok: true, status: 200, data: 'ECHO:' + (payload && payload.url) };
+            if (name === 'ops') return { ok: true, dataUrl: 'data:image/png;base64,AAA', width: 7, height: 3 };
+            if (name === 'download') return { ok: true, id: 42 };
+            throw new Error('未知服务 ' + name);
+        };
+        try {
+            const r = await runUserScript({
+                vendorBase, services, timeoutMs: 20000,
+                ctxData: { media: { kind: 'image', src: 'http://x/y.png', width: 600, height: 400 }, params: { n: 3 }, util: {}, storage: {} },
+                code: `
+                    const f = await ctx.fetch({ url: ctx.media.src, as: 'json' });
+                    const o = await ctx.host({ chain: [{ op: 'invert' }] });
+                    ctx.toast('已处理 ' + ctx.params.n);
+                    return { toast: 'ok', echo: f.data, n: ctx.params.n * 2, dims: ctx.media.width + 'x' + ctx.media.height, ops: o.width + 'x' + o.height };
+                `,
+            });
+            step('用户脚本异步执行 + 服务桥接', !!(r.ok && r.result && r.result.echo === 'ECHO:http://x/y.png' && r.result.n === 6 && r.result.ops === '7x3'), { r, ms: Date.now() - t0 });
+        } catch (e) { step('用户脚本异步执行 + 服务桥接', false, { err: String(e.message || e).slice(0, 300) }); }
+
+        const bad = await runUserScript({ vendorBase, services, ctxData: { params: {} }, code: 'return ( 未闭合' });
+        step('语法错误被捕获（不是崩引擎）', bad.ok === false && /语法/.test(bad.error || ''), { err: (bad.error || '').slice(0, 160) });
+        const thrown = await runUserScript({ vendorBase, services, ctxData: {}, code: 'throw new Error("boom")' });
+        step('运行时异常回传', thrown.ok === false && /boom/.test(thrown.error || ''), { err: (thrown.error || '').slice(0, 160) });
+        const mod = await runUserScript({ vendorBase, services, ctxData: {}, code: 'module.exports = async (ctx) => ({ toast: "exports 形式可用", v: 1 });' });
+        step('module.exports 形式', !!(mod.ok && mod.result && mod.result.toast), { r: mod });
+        const slow = await runUserScript({ vendorBase, timeoutMs: 1500, ctxData: {}, services, code: 'while(true){}' });
+        step('死循环被中断（内存上限/超时）', slow.ok === false, { err: (slow.error || '').slice(0, 120) });
+        const c = await compileUserScript({ vendorBase, code: 'return { a: 1 }' });
+        const c2 = await compileUserScript({ vendorBase, code: 'return ((((' });
+        step('语法检查（供设置页用）', !!(c.ok && c2.ok === false), { c, c2 });
+    }
+
+    window.__aiDone = out;
+    window.__aiFinished = true;
+    log('\n完成');
+})();
+</script>
+</body>
+</html>

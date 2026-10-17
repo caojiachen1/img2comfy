@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Media Hover Toolbar 设置</title>
+<link rel="stylesheet" href="src/options/options.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">▤</span> Media Hover Toolbar <small>v2.0 · 网页图片/视频悬浮工具栏</small></div>
+  <div class="hdr-actions">
+    <button id="btnSave" class="primary">保存</button>
+    <button id="btnExport">导出配置</button>
+    <label class="filebtn">导入配置<input type="file" id="fileImport" accept="application/json" hidden></label>
+    <button id="btnReset" class="danger">恢复默认</button>
+  </div>
+</header>
+
+<nav id="tabs">
+  <button data-tab="toolbar" class="active">工具栏外观</button>
+  <button data-tab="buttons">按钮管理</button>
+  <button data-tab="output">输出与视频</button>
+  <button data-tab="ai">AI 与模型</button>
+  <button data-tab="custom">自定义功能</button>
+  <button data-tab="sites">站点</button>
+  <button data-tab="help">说明</button>
+</nav>
+
+<main>
+  <!-- ============ 工具栏外观 + 实时预览 ============ -->
+  <section data-panel="toolbar" class="active">
+    <div class="cols">
+      <div class="col form">
+        <h3>显示与布局</h3>
+        <div class="grid2">
+          <label>显示时机
+            <select id="showOn">
+              <option value="hover">悬停媒体时</option>
+              <option value="always">在媒体上常显</option>
+              <option value="hover-key">按住修饰键 + 悬停</option>
+            </select>
+          </label>
+          <label>修饰键
+            <select id="showKey"><option>Alt</option><option>Ctrl</option><option>Shift</option></select>
+          </label>
+          <label>排列
+            <select id="layout"><option value="horizontal">横向</option><option value="vertical">纵向</option><option value="grid">网格</option></select>
+          </label>
+          <label>按钮内容
+            <select id="iconMode"><option value="both">图标 + 文字</option><option value="icon">仅图标</option><option value="text">仅文字</option></select>
+          </label>
+          <label>主题
+            <select id="theme"><option value="dark">深色玻璃</option><option value="light">浅色</option><option value="glass">透玻璃</option><option value="neon">霓虹</option></select>
+          </label>
+          <label>缩放 <span class="val" id="scaleV"></span>
+            <input type="range" id="scale" min="0.7" max="1.8" step="0.05">
+          </label>
+          <label>不透明度 <span class="val" id="opacityV"></span>
+            <input type="range" id="opacity" min="0.4" max="1" step="0.02">
+          </label>
+          <label>间距 <span class="val" id="gapV"></span><input type="range" id="gap" min="0" max="14" step="1">
+          </label>
+          <label>圆角 <span class="val" id="radiusV"></span><input type="range" id="radius" min="0" max="20" step="1">
+          </label>
+          <label>最多直显按钮数 <input type="number" id="maxTools" min="0" max="30"></label>
+          <label>最小媒体尺寸(px) <input type="number" id="minImgSize" min="0" max="4000"></label>
+          <label>悬停隐藏延迟(ms) <input type="number" id="hideDelay" min="0" max="2000" step="50"></label>
+        </div>
+
+        <h3>位置</h3>
+        <div class="grid2">
+          <label>基础锚点
+            <select id="anchor">
+              <option value="top-right">右上（默认）</option><option value="top-left">左上</option>
+              <option value="bottom-right">右下</option><option value="bottom-left">左下</option>
+              <option value="top-edge">上边居中</option><option value="bottom-edge">下边居中</option>
+              <option value="left-edge">左边居中</option><option value="right-edge">右边居中</option>
+              <option value="center">正中</option>
+            </select>
+          </label>
+          <div class="anchorpad" id="anchorPad">
+            <button data-a="top-left">◤</button><button data-a="top-edge">▲</button><button data-a="top-right">◥</button>
+            <button data-a="left-edge">◀</button><button data-a="center">◎</button><button data-a="right-edge">▶</button>
+            <button data-a="bottom-left">◣</button><button data-a="bottom-edge">▼</button><button data-a="bottom-right">◢</button>
+          </div>
+          <label>X 偏移 <input type="number" id="offsetX" step="1"></label>
+          <label>Y 偏移 <input type="number" id="offsetY" step="1"></label>
+        </div>
+        <p class="note">提示：可以直接在右侧预览里<b>拖动工具栏左侧的 ⠿ 手柄</b>摆放位置，松手即写入偏移量。锚点决定它跟随图片的哪一角，偏移在此基础上叠加，滚动/缩放时一起跟随。</p>
+        <div class="row">
+          <button id="btnRecenter">清除自定义偏移</button>
+          <span class="hint" id="posHint"></span>
+        </div>
+      </div>
+
+      <div class="col preview">
+        <h3>实时预览 <small>改动立即生效，与真实网页一致</small></h3>
+        <div class="stage" id="stage">
+          <div class="stagebar">
+            <button class="mt active" data-media="image">图片示例</button>
+            <button class="mt" data-media="video">视频示例</button>
+            <span class="sp"></span>
+            <button class="mt" id="btnScrollDemo">滚动跟随</button>
+            <button class="mt" id="btnHideAll">隐藏工具栏</button>
+          </div>
+          <div class="scroller" id="scroller">
+            <div class="mediawrap" id="mediaWrap">
+              <img id="sampleImg" alt="示例图片">
+              <video id="sampleVideo" muted loop playsinline></video>
+              <div class="toolbarSlot" id="toolbarSlot"></div>
+            </div>
+          </div>
+          <div class="stagelog" id="stageLog"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 按钮管理 ============ -->
+  <section data-panel="buttons">
+    <div class="cols">
+      <div class="col">
+        <h3>工具栏按钮 <small>勾选显示 · 拖 ⠿ 排序 · ✎ 改名换图标 · ⚙ 配参数</small></h3>
+        <div class="filterbar">
+          <input type="search" id="toolSearch" placeholder="搜索按钮/算子…">
+          <select id="toolGroup"><option value="">全部分组</option></select>
+          <button id="btnEnableAll">全部常驻</button>
+          <button id="btnDisableAll">全部不显示</button>
+          <button id="btnCollapseExtra">折叠第 7 个之后</button>
+        </div>
+        <div id="toolList" class="list"></div>
+      </div>
+      <div class="col narrow">
+        <h3>参数编辑</h3>
+        <div id="paramEditor" class="param-editor"><p class="hint">点某个按钮右侧的 ⚙  here 编辑它的默认参数。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 输出与视频 ============ -->
+  <section data-panel="output">
+    <div class="cols">
+      <div class="col form">
+        <h3>结果输出</h3>
+        <div class="grid2">
+          <label>默认格式
+            <select id="outFormat"><option value="png">PNG（无损）</option><option value="jpg">JPEG</option><option value="webp">WebP</option></select>
+          </label>
+          <label>质量 <span class="val" id="outQualityV"></span><input type="range" id="outQuality" min="0.5" max="1" step="0.01"></label>
+          <label class="chk"><input type="checkbox" id="autoDownload">处理完自动下载</label>
+          <label class="chk"><input type="checkbox" id="copyAfterOp">处理完自动复制图片</label>
+          <label class="chk"><input type="checkbox" id="showResult">显示结果面板</label>
+          <label class="chk"><input type="checkbox" id="keepName">文件名保留原始名</label>
+        </div>
+        <label>文件名模板 <input type="text" id="filenamePattern"></label>
+        <p class="note">可用占位符：<code>{base} {op} {w} {h} {t} {ts} {ext}</code></p>
+      </div>
+      <div class="col form">
+        <h3>视频取帧</h3>
+        <div class="grid2">
+          <label class="chk"><input type="checkbox" id="trimLetterbox">自动裁黑边</label>
+          <label>帧格式 <select id="frameFormat"><option value="png">PNG</option><option value="jpg">JPEG</option></select></label>
+          <label>帧最长边(0=原始) <input type="number" id="frameMaxSide" min="0" max="7680"></label>
+          <label>缺省帧率(fps) <input type="number" id="fpsFallback" min="1" max="240"></label>
+          <label>拼图列数 <input type="number" id="sheetColumns" min="1" max="12"></label>
+          <label>拼图单元宽 <input type="number" id="sheetCellWidth" min="80" max="1200"></label>
+        </div>
+        <p class="note">取帧沿用四级降级：画布直取 → CORS 克隆（免整包下载）→ 整包重建 → 标签页截图裁剪。黑边裁切带三重防误裁。</p>
+        <h3>ComfyUI</h3>
+        <div class="grid2">
+          <label>服务地址 <input type="text" id="comfyServer"></label>
+          <label>模式 <select id="comfyMode"><option value="frontend">前端注入（需开标签）</option><option value="api">后台 API（静默）</option></select></label>
+          <label>节点标题/类型 <input type="text" id="comfyNodeType" placeholder="留空自动找选中节点"></label>
+          <label>API 模式节点 ID <input type="text" id="comfyNodeId"></label>
+          <label class="chk"><input type="checkbox" id="comfyAutoQueue">默认发送即排队</label>
+          <label>上传目录 <select id="comfyFolders"><option value="both">input + output</option><option value="input">仅 input</option><option value="output">仅 output</option></select></label>
+        </div>
+        <label>工作流 API JSON（API 模式）<textarea id="comfyWorkflow" rows="5" spellcheck="false"></textarea></label>
+        <div class="row"><button id="btnComfyTest">测试连接</button><span class="hint" id="comfyTestOut"></span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ AI ============ -->
+  <section data-panel="ai">
+    <div class="cols">
+      <div class="col form">
+        <h3>运行时</h3>
+        <div class="grid2">
+          <label class="chk"><input type="checkbox" id="aiEnabled">启用 AI 按钮</label>
+          <label>设备
+            <select id="aiDevice"><option value="auto">自动（有 WebGPU 用 GPU）</option><option value="webgpu">强制 GPU (WebGPU)</option><option value="wasm">强制 CPU (WASM)</option></select>
+          </label>
+          <label>权重精度
+            <select id="aiDtype"><option value="q4">q4（最小）</option><option value="q4f16">q4f16</option><option value="int8">int8</option><option value="fp16">fp16（GPU 推荐）</option></select>
+          </label>
+          <label>推理前最长边 <input type="number" id="aiMaxDim" min="256" max="4096" step="64"></label>
+          <label>模型源
+            <select id="aiHub"><option value="hf-mirror">hf-mirror.com（国内）</option><option value="modelscope">ModelScope 魔搭（国内快，需已被镜像）</option><option value="huggingface">huggingface.co</option><option value="custom">自定义</option></select>
+          </label>
+          <label>自定义源 <input type="text" id="aiHubCustom" placeholder="https://…"></label>
+          <label>下载预算(MB) <input type="number" id="aiBudget" min="0" max="65536" step="256"></label>
+          <label>空闲卸载(秒, 0=常驻) <input type="number" id="aiUnload" min="0" max="3600" step="30"></label>
+        </div>
+        <div class="row">
+          <button id="btnRuntime" class="primary">检测运行时 / 预热</button>
+          <button id="btnCache">模型占用统计</button>
+          <button id="btnClearCache" class="danger">清除模型缓存</button>
+        </div>
+        <pre id="runtimeOut" class="out"></pre>
+        <div class="rtcard">
+          <div class="row"><strong>AI 运行时文件</strong><span class="rthint" id="runtimeState">未探测</span></div>
+          <div class="row">
+            <button id="btnRuntimeCheck">重新检测</button>
+            <button id="btnRuntimeInstall" class="primary">安装运行时（约 27MB）</button>
+            <button id="btnRuntimeAll">安装全部三份</button>
+            <button id="btnRuntimeClear" class="danger">清除已装</button>
+          </div>
+          <div class="rtbar"><i id="runtimeBar"></i></div>
+          <div class="rthint" id="runtimeSpeed">进度显示在这里；装完 AI 按钮就能直接用，不必再跑 node 脚本</div>
+          <div id="runtimeFiles" class="rtfiles"></div>
+        </div>
+      </div>
+      <div class="col form">
+        <h3>模型选择</h3>
+        <div id="modelSelects"></div>
+        <h3>提示词</h3>
+        <label>看图说话 <textarea id="vlmPrompt" rows="3"></textarea></label>
+        <label>提问模板 <input type="text" id="askPrompt"></label>
+        <h3>功能参数</h3>
+        <div class="grid2">
+          <label>人脸置信度 <span class="val" id="faceConfV"></span><input type="range" id="faceConfidence" min="0.2" max="0.95" step="0.05"></label>
+          <label>超分分块(0=整图) <input type="number" id="srTile" min="0" max="1024" step="64"></label>
+          <label>SAM 自动网格 <input type="number" id="samGrid" min="1" max="4"></label>
+        </div>
+        <div class="row"><button id="btnAiSelfTest">跑一次自检（描述测试图）</button><span class="hint" id="selfTestHint"></span></div>
+        <pre id="aiTestOut" class="out"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 自定义功能 ============ -->
+  <section data-panel="custom">
+    <div class="cols">
+      <div class="col">
+        <h3>脚本型功能 <small>ctx.* API，在宿主页的 QuickJS(wasm) 里隔离运行</small></h3>
+        <div id="scriptList" class="list"></div>
+        <div class="row">
+          <button id="btnNewScript" class="primary">＋ 新建脚本功能</button>
+          <button id="btnDupScript">复制所选</button>
+          <button id="btnDelScript" class="danger">删除所选</button>
+        </div>
+        <h3>链接型功能 <small>不写代码，URL 模板 + 占位符</small></h3>
+        <div id="linkList" class="list"></div>
+        <div class="row"><button id="btnNewLink" class="primary">＋ 新建链接工具</button><button id="btnDelLink" class="danger">删除所选</button></div>
+      </div>
+      <div class="col narrow">
+        <h3>编辑器</h3>
+        <div id="scriptEditor" class="editor"></div>
+        <details class="apidoc" id="apiDoc"><summary>ctx API 与占位符参考</summary><pre></pre></details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 站点 ============ -->
+  <section data-panel="sites">
+    <div class="cols"><div class="col form">
+      <h3>站点开关</h3>
+      <div class="row"><button id="btnCurrentSite">切换当前网站</button><span class="hint" id="siteHint"></span></div>
+      <div id="siteList" class="list"></div>
+      <h3>其它</h3>
+      <label class="chk"><input type="checkbox" id="includeFrame">允许注入到 iframe（默认开）</label>
+      <p class="note">ComfyUI 页面本身（含 127.0.0.1 / localhost 与配置里的服务器地址）永不注入工具栏，以免干扰画布拖拽。</p>
+    </div></div>
+  </section>
+
+  <!-- ============ 说明 ============ -->
+  <section data-panel="help">
+    <div class="cols"><div class="col form doc">
+      <h3>怎么装 AI 运行时</h3>
+      <p><strong>不用装任何东西也能用 AI</strong>：到「AI 与模型 → AI 运行时文件」点「安装运行时」，
+      扩展会把 ORT 的 wasm 后端（约 26MB）从 CDN 下到本地缓存里，进度与状态都在那一块显示；
+      下回来的字节数会和扩展内的 glue 版本核对，不匹配就换源重试。</p>
+      <p>想离线预置（或 CDN 全不通）时，在扩展目录跑一次 <code>node scripts/setup-vendor.mjs</code>，
+      它把 <code>transformers.web.min.mjs</code>、<code>*.wasm</code>、QuickJS 拷进 <code>vendor/</code>；
+      包里有文件时扩展不会重复下载。</p>
+      <h3>快捷键</h3>
+      <ul>
+        <li><code>Alt</code> + 悬停：修饰键模式下的显示开关</li>
+        <li><code>Esc</code>：退出取点模式 / 关闭结果面板</li>
+        <li>结果面板标题栏可拖动</li>
+      </ul>
+      <h3>已知边界</h3>
+      <ul>
+        <li>视频取帧在跨域 iframe 且画布受保护时只能走标签页截图（带播放器 UI）</li>
+        <li>用户脚本不能直接碰 DOM 与 chrome API，必须走 ctx 提供的服务</li>
+        <li>WebGL/复杂画布合成的站点，工具栏拿到的是 <code>&lt;canvas&gt;</code> 之外的最终 img/video</li>
+      </ul>
+    </div></div>
+  </section>
+</main>
+
+<div id="toast" class="toast"></div>
+<script type="module" src="src/options/options.mjs"></script>
+</body>
+</html>
