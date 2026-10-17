@@ -47,6 +47,23 @@ button.btn.text .ic { display: none; }
 .menu .mi.busy { opacity: .5; pointer-events: none; }
 .menu .hint { padding: 4px 9px 6px; font-size: 10.5px; color: #8ea3b5; }
 .btn.more .caret { opacity: .65; margin-left: 2px; }
+.logbox {
+  position: fixed; z-index: 2147483647; right: 16px; top: 96px; display: none; pointer-events: auto;
+  width: min(340px, 40vw); max-height: 46vh; overflow: hidden; color: #dbe6ef;
+  background: rgba(18,20,24,.93); border: 1px solid rgba(255,255,255,.16); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.4); backdrop-filter: blur(14px) saturate(160%); -webkit-backdrop-filter: blur(14px) saturate(160%);
+}
+.logbox.show { display: block; }
+.logbox header { display:flex; align-items:center; gap:8px; padding:6px 9px; border-bottom:1px solid rgba(255,255,255,.12); font-weight:600; font-size:12px; cursor:move; }
+.logbox header .sp { flex:1; }
+.logbox header .act { cursor:pointer; opacity:.7; font-size:11.5px; } .logbox header .act:hover { opacity:1; }
+.logbox .lines { max-height: calc(46vh - 32px); overflow:auto; padding:6px 9px 8px; font-family: ui-monospace,Consolas,monospace; font-size:11.5px; line-height:1.5; }
+.logbox .ln { display:flex; gap:7px; white-space:pre-wrap; word-break:break-word; }
+.logbox .ln .ts { color:#6f8497; flex:none; }
+.logbox .ln.err { color:#ff8a8a; }
+.logbox .ln.busy { color:#9fe8c8; }
+.logbox .ln.busy .tx::before { content:''; display:inline-block; width:7px; height:7px; margin-right:6px; border-radius:50%; background:#5ce08a; animation: mtb-pulse 1s infinite ease-in-out; }
+@keyframes mtb-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
 .panel {
   position: absolute; z-index: 2147483647; display: none; max-width: min(560px, 92vw); pointer-events: auto;
   background: rgba(22,22,24,.94); backdrop-filter: blur(16px) saturate(180%); -webkit-backdrop-filter: blur(16px) saturate(180%);
@@ -238,7 +255,7 @@ export class Toolbar {
     placeMenu() {
         const m = this.menu;
         if (!m) return;
-        m.style.bottom = 'auto'; m.style.top = 'auto';
+        m.style.bottom = 'auto'; m.style.top = 'auto'; m.style.left = 'auto'; m.style.right = 'auto';
         const r = this.wrap.getBoundingClientRect();
         const h = m.offsetHeight;
         if (r.bottom + h + 10 > window.innerHeight && r.top - h - 10 > 0) {
@@ -248,6 +265,14 @@ export class Toolbar {
             m.style.top = '100%';
             m.style.marginTop = '4px';
         }
+        // 菜单跟着「⋯ 更多」按钮走：CSS 里 .menu 是 left:0，会贴到整条工具栏的左端，
+        // 按钮在右边时看着就像"菜单飘在别处"。这里按按钮对齐，并保证不出视口。
+        const btn = (this.moreBtn ? this.moreBtn.getBoundingClientRect() : r);
+        const w = m.offsetWidth || 168;
+        let x = btn.left;
+        if (x + w > window.innerWidth - 4) x = btn.right - w;
+        x = Math.max(4, Math.min(x, window.innerWidth - w - 4));
+        m.style.left = `${Math.round(x - r.left)}px`;
     }
 
     openMenu() {
@@ -279,22 +304,16 @@ export class Toolbar {
 
     setBusy(id, text) {
         const b = this.buttons.get(id);
-        if (!b) return;
-        if (text) {
-            const span = b.querySelector('.tx');
-            if (span) span.textContent = text;
-        }
+        if (!b) { this.onLog?.(text || ''); return; }   // '__progress' 这类没有对应按钮的，交给日志窗
         b.disabled = !!text;
         b.classList.toggle('busy', !!text);
+        if (text) this.onLog?.(text);
     }
 
     resetBusy() {
-        for (const [id, b] of this.buttons) {
+        for (const b of this.buttons.values()) {
             b.disabled = false;
             b.classList.remove('busy');
-            const it = this.items.find((x) => x.id === id);
-            const span = b.querySelector('.tx');
-            if (it && span) span.textContent = it.label;
         }
     }
 
@@ -305,29 +324,33 @@ export class Toolbar {
             e.preventDefault(); e.stopPropagation();
             this.dragging = true;
             this.wrap.classList.add('dragging');
-            start = { x: e.clientX, y: e.clientY, rect: this.anchorRect ? { ...this.anchorRect } : null, off: { ...this.settings.toolbar } };
+            // 拖动基准是「当前已经落位的屏幕坐标」：位置是锁住的，不能从媒体矩形重算
+            start = {
+                x: e.clientX, y: e.clientY,
+                placed: { ...(this.placed || this.lock || { x: 0, y: 0 }) },
+                off: { ...this.settings.toolbar },
+            };
             window.addEventListener('pointermove', onMove, true);
             window.addEventListener('pointerup', onUp, true);
         };
         const onMove = (e) => {
             if (!this.dragging) return;
             e.preventDefault();
-            const dx = e.clientX - start.x, dy = e.clientY - start.y;
-            this.dragOffset = { x: start.off.offsetX + dx, y: start.off.offsetY + dy };
-            this.position(this.currentTarget, true);
+            this.lock = { x: start.placed.x + (e.clientX - start.x), y: start.placed.y + (e.clientY - start.y) };
+            this.placeAt(this.lock.x, this.lock.y);
         };
-        const onUp = async (e) => {
+        const onUp = async () => {
             if (!this.dragging) return;
             this.dragging = false;
             this.wrap.classList.remove('dragging');
             window.removeEventListener('pointermove', onMove, true);
             window.removeEventListener('pointerup', onUp, true);
-            const dx = e.clientX - start.x, dy = e.clientY - start.y;
-            // 拖过之后不再叠加原偏移：offsetX/Y 直接改成新的净值
-            const next = { ...this.settings.toolbar, offsetX: start.off.offsetX + dx, offsetY: start.off.offsetY + dy, anchorOffset: 'custom', dragMoved: true };
+            // 只累加「真正移动了多少」：拖到屏幕边上被夹住时不会把偏移量算多，
+            // 下次重新锚定（换图后首次弹出）才能落在拖过的位置
+            const dx = Math.round((this.placed?.x ?? 0) - start.placed.x);
+            const dy = Math.round((this.placed?.y ?? 0) - start.placed.y);
+            const next = { ...this.settings.toolbar, offsetX: Math.round((start.off.offsetX || 0) + dx), offsetY: Math.round((start.off.offsetY || 0) + dy), anchorOffset: 'custom', dragMoved: true };
             this.settings.toolbar = next;
-            this.dragOffset = null;
-            this.position(this.currentTarget, true);
             await this.onDragEnd?.(next);
         };
         this.wrap.addEventListener('pointerdown', onDown, true);
@@ -343,15 +366,10 @@ export class Toolbar {
         window.addEventListener('blur', abort, true);
     }
 
-    // rect = 媒体元素在视口中的矩形；anchor+offset 决定贴靠
-    position(rect, force = false) {
-        if (!rect) return;
-        this.currentTarget = rect;
+    // 按 anchor+offset 算出工具栏应落在的屏幕坐标（视口系）
+    anchorPoint(rect) {
         const t = this.settings.toolbar;
-        const off = this.dragOffset || { x: t.offsetX, y: t.offsetY };
         const w = this.wrap.offsetWidth, h = this.wrap.offsetHeight;
-        const inFullscreen = document.fullscreenElement && document.fullscreenElement.contains(this.wrap.getRootNode().host);
-        const sx = inFullscreen ? 0 : window.scrollX, sy = inFullscreen ? 0 : window.scrollY;
         const m = 8;
         let top, left;
         switch (t.anchor) {
@@ -365,22 +383,39 @@ export class Toolbar {
             case 'right-edge': top = rect.top + (rect.height - h) / 2; left = rect.right - w - m; break;
             default: top = rect.top + m; left = rect.right - w - m;
         }
-        // 视口夹住：媒体部分滚出屏幕时工具栏仍可用。
-        // 对「最终屏幕坐标」夹取，下界固定为 4——按钮多到比视口还宽时 vw-w-4 本身就是负数，
-        // 不兜底就会把整条推出屏幕，表现为「点了没反应」。拖拽中也照夹：拖到边上停住比拖丢更合理，
-        // 而且 pointerup 丢一次（在窗口外松手）就会让 dragging 卡在 true，旧写法从此不再夹住。
-        left += off.x; top += off.y;
-        let fx = left + sx, fy = top + sy;
-        fx = Math.max(4, Math.min(fx, Math.max(4, window.innerWidth - w - 4)));
-        fy = Math.max(4, Math.min(fy, Math.max(4, window.innerHeight - h - 4)));
-        this.wrap.style.left = fx + 'px';
-        this.wrap.style.top = fy + 'px';
-        this.maskBoxRect = rect;
+        return { x: left + (t.offsetX || 0), y: top + (t.offsetY || 0) };
+    }
+
+    // 视口夹取：按钮多到比视口还宽时 Math.max 兜底的下界优先，保证不会被推出屏幕
+    placeAt(x, y) {
+        const host = this.wrap.getRootNode().host;
+        const hr = host ? host.getBoundingClientRect() : null;
+        const ox = hr ? hr.left : 0, oy = hr ? hr.top : 0;
+        const vw = hr && hr.width ? hr.width : window.innerWidth;
+        const vh = hr && hr.height ? hr.height : window.innerHeight;
+        const w = this.wrap.offsetWidth, h = this.wrap.offsetHeight;
+        // 宿主是铺满视口的 fixed 层，绝对定位的坐标原点就是宿主左上角。
+        // 旧写法额外加 window.scrollX/Y，页面一滚动工具栏就跟着往下飞
+        const cx = Math.max(4, Math.min(x - ox, Math.max(4, vw - w - 4)));
+        const cy = Math.max(4, Math.min(y - oy, Math.max(4, vh - h - 4)));
+        this.wrap.style.left = cx + 'px';
+        this.wrap.style.top = cy + 'px';
+        this.placed = { x: cx + ox, y: cy + oy };
+    }
+
+    // rect = 媒体元素在视口中的矩形。位置只在「首次显示」与「手动拖拽」时定，
+    // 已经显示着的时候换图、滚动、探测刷新都不会让它自己挪。
+    position(rect, force = false) {
+        if (!rect) return;
+        this.currentTarget = rect;
+        if (force || !this.lock) this.lock = this.anchorPoint(rect);
+        this.placeAt(this.lock.x, this.lock.y);
         if (this.menuOpen) this.placeMenu();
         if (this.onMoved) this.onMoved(rect);
     }
 
     show(rect) {
+        if (!this.wrap.classList.contains('show')) this.lock = null;   // 重新弹出才按当前媒体锚定
         this.wrap.classList.add('show');
         this.position(rect);
     }
@@ -388,11 +423,14 @@ export class Toolbar {
     hide() {
         this.wrap.classList.remove('show');
         this.currentTarget = null;
+        this.lock = null;
+        this.placed = null;
     }
 }
 
 export class ResultPanel {
     constructor({ shadow, settings }) {
+        this.shadow = shadow;
         this.el = document.createElement('div');
         this.el.className = 'panel';
         this.el.innerHTML = `<header><span class="tt">结果</span><span class="sp"></span><span class="act export">导出</span><span class="act copy">复制</span><span class="close">✕</span></header><div class="body"></div>`;
@@ -448,8 +486,11 @@ export class ResultPanel {
 
     place(near) {
         const w = this.el.offsetWidth, h = this.el.offsetHeight;
-        let left = near ? near.right + 12 : innerWidth - w - 20;
-        if (left + w > innerWidth - 8 || !near) left = Math.max(8, innerWidth - w - 16);
+        // 日志窗占着右边，结果面板别再压上去
+        const dock = this.shadow && this.shadow.querySelector('.logbox.show');
+        const reserve = dock ? dock.offsetWidth + 28 : 16;
+        let left = near ? near.right + 12 : innerWidth - w - reserve;
+        if (left + w > innerWidth - reserve || !near) left = Math.max(8, innerWidth - w - reserve);
         const top = near ? Math.max(8, Math.min(near.top, innerHeight - h - 12)) : 40;
         this.el.style.left = left + 'px';
         this.el.style.top = top + 'px';
@@ -458,6 +499,107 @@ export class ResultPanel {
 
     hide() { this.el.classList.remove('show'); }
     get visible() { return this.el.classList.contains('show'); }
+}
+
+/** 右侧悬浮日志窗：推理中/取帧/失败这类过程信息都进这里，不再挤在工具栏按钮旁边 */
+export class LogDock {
+    constructor({ shadow, autoHideMs = 10000, max = 120 }) {
+        const el = document.createElement('div');
+        el.className = 'logbox';
+        el.innerHTML = `<header><span class="tt">日志</span><span class="sp"></span><span class="act clear">清空</span><span class="act close">✕</span></header><div class="lines"></div>`;
+        shadow.appendChild(el);
+        this.el = el;
+        this.lines = el.querySelector('.lines');
+        this.max = max;
+        this.autoHideMs = autoHideMs;
+        this.busy = null;
+        this.timer = 0;
+        el.querySelector('.close').onclick = () => this.hide();
+        el.querySelector('.clear').onclick = () => { this.lines.innerHTML = ''; this.busy = null; this.hide(); };
+        this.bindDrag();
+        el.__log = (text, err) => this.line(text, { err });
+    }
+
+    line(text, { err = false } = {}) {
+        const t = String(text || '').trim();
+        if (!t) return null;
+        this.endBusy();
+        const row = this.append(t, { err });
+        this.open();
+        this.scheduleHide();
+        return row;
+    }
+
+    // 进行中的任务原地刷同一行（准备模型… → 推理中…），传空串表示结束并补上耗时
+    status(text) {
+        const t = String(text || '').trim();
+        if (!t) { this.endBusy(); this.scheduleHide(); return; }
+        const err = /失败|错误|异常/.test(t);
+        if (this.busy) {
+            if (this.busy.text !== t) { this.busy.text = t; this.busy.row.querySelector('.tx').textContent = t; }
+            this.busy.row.classList.toggle('err', err);
+            clearTimeout(this.timer);
+        } else {
+            this.busy = { row: this.append(t, { err, busy: true }), text: t, at: Date.now() };
+            this.open();
+        }
+        return this;
+    }
+
+    endBusy() {
+        if (!this.busy) return;
+        const { row, at, text } = this.busy;
+        const secs = (Date.now() - at) / 1000;
+        row.querySelector('.tx').textContent = `${text} · ${secs >= 1 ? secs.toFixed(1) + 's' : Math.round(secs * 1000) + 'ms'}`;
+        row.classList.remove('busy');
+        this.busy = null;
+    }
+
+    append(text, { err = false, busy = false } = {}) {
+        const row = document.createElement('div');
+        row.className = 'ln' + (err ? ' err' : '') + (busy ? ' busy' : '');
+        const ts = document.createElement('span');
+        ts.className = 'ts';
+        ts.textContent = clockTime();
+        const tx = document.createElement('span');
+        tx.className = 'tx';
+        tx.textContent = text;
+        row.append(ts, tx);
+        this.lines.appendChild(row);
+        while (this.lines.children.length > this.max) this.lines.removeChild(this.lines.firstChild);
+        this.lines.scrollTop = this.lines.scrollHeight;
+        return row;
+    }
+
+    open() { this.el.classList.add('show'); }
+    hide() { this.endBusy(); this.el.classList.remove('show'); }
+    get visible() { return this.el.classList.contains('show'); }
+    scheduleHide() { clearTimeout(this.timer); this.timer = setTimeout(() => this.hide(), this.autoHideMs); }
+
+    bindDrag() {
+        const header = this.el.querySelector('header');
+        let s = null;
+        header.addEventListener('pointerdown', (e) => {
+            if (e.target.closest('.act')) return;
+            const r = this.el.getBoundingClientRect();
+            s = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };
+            header.setPointerCapture(e.pointerId);
+        });
+        header.addEventListener('pointermove', (e) => {
+            if (!s) return;
+            this.el.style.right = 'auto';
+            this.el.style.left = Math.max(4, s.left + e.clientX - s.x) + 'px';
+            this.el.style.top = Math.max(4, Math.min(s.top + e.clientY - s.y, innerHeight - 40)) + 'px';
+        });
+        header.addEventListener('pointerup', () => { s = null; });
+        header.addEventListener('pointercancel', () => { s = null; });
+    }
+}
+
+function clockTime() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 export class Picker {
@@ -571,6 +713,8 @@ export function toast(shadow, text, ms = 2600, isError = false) {
     el.classList.add('show');
     clearTimeout(el._t);
     el._t = setTimeout(() => el.classList.remove('show'), ms);
+    const dock = shadow.querySelector('.logbox');
+    if (dock && dock.__log) dock.__log(text, !!isError);   // 一闪而过的提示在日志窗里留个底
     return el;
 }
 

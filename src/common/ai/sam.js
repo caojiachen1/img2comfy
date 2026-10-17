@@ -7,17 +7,18 @@
 
 import { clamp } from '../util.js';
 import { canvasInput } from './input.js';
+import { modelIdFor } from './sources.js';
 
+// MobileSAM（onnx-community/mobilesam-1.0.0-hf）与 SAM2-small 两个仓库在 HF 上已 401（下架/需授权），
+// ModelScope 上的 sam2 同步只有 .pt/safetensors，transformers.js 用不了，所以不再列这些预设。
 export const SAM_PRESETS = [
-    { id: 'slimsam', name: 'slimSAM（最快，约 13MB）', model: 'Xenova/slimsam-77-uniform', dtype: 'quantized' },
-    { id: 'mobilesam', name: 'MobileSAM（约 40MB）', model: 'onnx-community/mobilesam-1.0.0-hf', dtype: 'q4' },
-    { id: 'sam-vit-b', name: 'SAM ViT-B（精度优先，约 400MB+）', model: 'Xenova/sam-vit-base', dtype: 'quantized' },
-    { id: 'sam2-small', name: 'SAM 2 Small（单帧提示）', model: 'onnx-community/sam2-hiera-small', dtype: 'q4' },
+    { id: 'slimsam', name: 'slimSAM（最快，约 13MB）', model: 'Xenova/slimsam-77-uniform', ms: 'cjc1887415157/slimsam-77-uniform', dtype: 'quantized' },
+    { id: 'sam-vit-b', name: 'SAM ViT-B（精度优先，约 400MB+）', model: 'Xenova/sam-vit-base', ms: 'cjc1887415157/sam-vit-base', dtype: 'quantized' },
 ];
 
 export function resolveSam(ai = {}) {
     const p = SAM_PRESETS.find((x) => x.id === (ai.samPreset || 'slimsam')) || SAM_PRESETS[0];
-    return { model: ai.samModel || p.model, dtype: ai.samDtype || p.dtype, preset: p };
+    return { model: ai.samModel || modelIdFor(ai, p), dtype: ai.samDtype || p.dtype, preset: p };
 }
 
 export class SamRunner {

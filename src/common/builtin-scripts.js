@@ -5,7 +5,7 @@ export const CONTEXT_API_DOC = `可用 API（ctx.*）：
   ctx.media            {kind:'image'|'video'|'bg', src, width, height, displayWidth, displayHeight, time, duration, mime, isFrame, via}
   ctx.dataUrl          当前媒体的 dataURL（视频=当前帧）；ctx.width/ctx.height 同义
   ctx.params           该按钮在设置里配置的参数对象
-  ctx.settings         {comfy, output, video, ai:{device,models}}
+  ctx.settings         {comfy, output, video, ai:{device,hub}}
   ctx.lastFaces/ctx.lastMasks  上一次 AI 识别结果
   ctx.fetch({url, method, headers, body, form, json, as:'text'|'json'|'dataUrl'})   走后台，绕过 CORS 与防盗链
   ctx.host({chain:[{op,params}], format, quality})      跑像素算子链，返回 {dataUrl,width,height,reports}

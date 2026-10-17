@@ -4,18 +4,19 @@
 import { clamp, toNum } from '../util.js';
 import { mkPx } from '../imgops/geometry.js';
 import { canvasInput } from './input.js';
+import { modelIdFor } from './sources.js';
 
 export const SR_PRESETS = [
-    { id: 'swin2sr-x2', name: 'Swin2SR 经典 x2（约 8MB，干净放大）', model: 'Xenova/swin2SR-classical-sr-x2-64', scale: 2, via: 'tj' },
-    { id: 'swin2sr-light-x2', name: 'Swin2SR 轻量 x2（约 5MB，最快）', model: 'Xenova/swin2SR-lightweight-x2-64', scale: 2, via: 'tj' },
-    { id: 'swin2sr-x4', name: 'Swin2SR 经典 x4（约 10MB）', model: 'Xenova/swin2SR-classical-sr-x4-64', scale: 4, via: 'tj' },
-    { id: 'swin2sr-real-x4', name: 'Swin2SR 真实退化 x4（压图/噪声友好）', model: 'Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr', scale: 4, via: 'tj' },
+    { id: 'swin2sr-x2', name: 'Swin2SR 经典 x2（约 8MB，干净放大）', model: 'Xenova/swin2SR-classical-sr-x2-64', ms: 'cjc1887415157/swin2SR-classical-sr-x2-64', scale: 2, via: 'tj' },
+    { id: 'swin2sr-light-x2', name: 'Swin2SR 轻量 x2（约 5MB，最快）', model: 'Xenova/swin2SR-lightweight-x2-64', ms: 'cjc1887415157/swin2SR-lightweight-x2-64', scale: 2, via: 'tj' },
+    { id: 'swin2sr-x4', name: 'Swin2SR 经典 x4（约 10MB）', model: 'Xenova/swin2SR-classical-sr-x4-64', ms: 'cjc1887415157/swin2SR-classical-sr-x4-64', scale: 4, via: 'tj' },
+    { id: 'swin2sr-real-x4', name: 'Swin2SR 真实退化 x4（压图/噪声友好）', model: 'Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr', ms: 'cjc1887415157/swin2SR-realworld-sr-x4-64-bsrgan-psnr', scale: 4, via: 'tj' },
     { id: 'esrgan-x4', name: 'Real-ESRGAN x4plus（用户自备 ONNX URL）', model: '', scale: 4, via: 'ort' },
 ];
 
 export function resolveSr(ai = {}) {
     const p = SR_PRESETS.find((x) => x.id === (ai.srPreset || 'swin2sr-x2')) || SR_PRESETS[0];
-    return { preset: p, model: ai.srModel || p.model, scale: toNum(ai.srScale, p.scale), via: ai.srModelUrl ? 'ort' : p.via };
+    return { preset: p, model: ai.srModel || modelIdFor(ai, p), scale: toNum(ai.srScale, p.scale), via: ai.srModelUrl ? 'ort' : p.via };
 }
 
 function toCHW(px) {

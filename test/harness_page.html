@@ -52,6 +52,16 @@ window.__mtbReady = true;
 <div style="height:160px"></div>
 <img id="big" width="600" height="400" alt="t" src="/test/make/edge.png">
 <div id="bgbox" style="width:600px;height:400px;background-image:url('/test/make/edge.png');background-size:cover;margin-top:12px"></div>
+<!-- 图层深浅用例：上面那张压在下面那张上，只应该命中最上层；pointer-events:none 的那张在命中栈里会缺席 -->
+<div style="position:relative;width:600px;height:400px;margin-top:12px">
+    <img id="under" width="600" height="400" alt="u" src="/test/make/edge.png" style="position:absolute;left:0;top:0">
+    <img id="over" width="300" height="220" alt="o" src="/test/make/edge.png" style="position:absolute;left:60px;top:60px">
+</div>
+<div style="position:relative;width:600px;height:400px;margin-top:12px">
+    <img id="under2" width="600" height="400" alt="u2" src="/test/make/edge.png">
+    <img id="toppe" width="300" height="220" alt="p" src="/test/make/edge.png"
+         style="position:absolute;left:60px;top:60px;pointer-events:none">
+</div>
 <video id="vid" width="480" height="300" src="/test/make/sample.mp4" muted preload="auto" style="margin-top:12px"></video>
 <div id="out" style="color:#9aa;font:12px ui-monospace,monospace;padding:10px"></div>
 </body>

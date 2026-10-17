@@ -1,11 +1,14 @@
 // ORT 会话装载：wasm 文件在扩展 vendor 目录，权重从镜像源下载并进 Cache API。
 // 同时把 globalThis.ort 备好，供各 AI 模块直接 new ort.Tensor(...)。
 
-import { openCache, noteDownload, makeProgressFetch } from '../ai-io.js';
+import { openCache, noteDownload, makeProgressFetch, readIndex, dropCached } from '../ai-io.js';
 import { modelUrlFor } from '../ai-env.js';
 import { applyWasmPaths } from '../runtime-install.js';
 
 let ortPromise = null;
+
+// 断流写坏的模型在 ORT 里会以这些形态冒出来（不是「下载失败」），见到就当损坏处理
+const CORRUPT_RE = /protobuf parsing failed|memory access out of bounds|Aborted\(|Invalid tensor|unexpected end|cannot allocate|Failed to create session|ERROR_CODE: 7/i;
 
 export async function ensureOrt(vendorBase) {
     const base = vendorBase || globalThis.__MTB_VENDOR || new URL('../../../vendor', import.meta.url).toString().replace(/\/$/, '');
@@ -33,20 +36,28 @@ export async function ensureOrt(vendorBase) {
     return mod;
 }
 
-export async function fetchModelBytes({ url, ai, progress, fileName }) {
+export async function fetchModelBytes({ url, ai, progress, fileName, force = false }) {
     const cache = await openCache();
-    if (cache) {
+    if (cache && !force) {
         const hit = await cache.match(url);
         if (hit) {
             progress && progress('cache', 1, 1, url);
             const blob = await hit.blob();
-            return new Uint8Array(await blob.arrayBuffer());
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            const known = readIndex()[url]?.bytes || 0;
+            if (known && bytes.byteLength !== known) {
+                // 索引里记的字节数和实际不符 = 这份是坏的（多半是断流时写进去的半截文件）
+                await dropCached(url);
+            } else return bytes;
         }
     }
     const res = await fetch(url, { cache: 'force-cache' });
     if (!res.ok) throw new Error(`模型下载失败 HTTP ${res.status} (${url})`);
     const total = Number(res.headers.get('content-length') || 0);
     const buf = await res.arrayBuffer();
+    // 连接被中途掐断时 fetch 不报错，只给半截字节；直接喂给 ORT 会得到
+    // 「protobuf parsing failed」这种看不出根因的错误，所以这里按 content-length 卡死。
+    if (total && buf.byteLength !== total) throw new Error(`模型下载不完整：${buf.byteLength}/${total} 字节，请重试 (${url})`);
     noteDownload(url, buf.byteLength, fileName || url);
     if (cache && res.ok) { try { await cache.put(url, new Response(buf.slice(0), { headers: { 'Content-Type': 'application/octet-stream' } })); } catch (e) { /* 配额满：内存里仍能跑 */ } }
     progress && progress('download', buf.byteLength, total || buf.byteLength, url);
@@ -77,14 +88,33 @@ export async function loadOrtSession({ url, ai = {}, fileName, dtype = 'q4', pro
             await ort.env?.wasm?.init?.({});
         } catch (e) { /* 已经初始化 */ }
     }
+    const makeSession = (buf, list) => ort.InferenceSession.create(buf, { ...opts, executionProviders: list });
+    // 断流写坏的半截文件不会以「下载失败」出现，而是在建会话时炸成 protobuf/内存错误：
+    // 见到就丢缓存重下一次，比让用户去猜「是不是该清缓存」强。
+    const retryIfCorrupt = async (err, extra) => {
+        const m = String(err && err.message || err) + ' ' + String(extra || '');
+        if (!CORRUPT_RE.test(m)) throw err;
+        console.warn('[mtb] 模型疑似损坏，丢弃缓存重下：', source);
+        await dropCached(source);
+        const fresh = await fetchModelBytes({ url: source, ai, progress, fileName, force: true });
+        const s = await makeSession(fresh, ['wasm']);
+        s.__repairedFromCache = true;
+        return s;
+    };
     let session;
-    try {
-        session = await ort.InferenceSession.create(bytes, { ...opts, executionProviders: providers });
-    } catch (e) {
-        if (providers.length > 1) {
-            session = await ort.InferenceSession.create(bytes, { ...opts, executionProviders: ['wasm'] });
-            session.__fellBackFromWebGpu = true;
-        } else throw e;
+    if (providers.length > 1) {
+        try {
+            session = await makeSession(bytes, providers);
+        } catch (e) {
+            try {
+                session = await makeSession(bytes, ['wasm']);
+                session.__fellBackFromWebGpu = true;
+            } catch (e2) { session = await retryIfCorrupt(e2, e && e.message); }
+        }
+    } else {
+        try {
+            session = await makeSession(bytes, ['wasm']);
+        } catch (e) { session = await retryIfCorrupt(e); }
     }
     session.__source = source;
     return session;

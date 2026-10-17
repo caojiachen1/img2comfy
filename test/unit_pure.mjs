@@ -6,7 +6,7 @@ import * as F from '../src/common/imgops/filter.js';
 import * as E from '../src/common/imgops/edge.js';
 import * as CV from '../src/common/cv.js';
 import { STEPS, runChain } from '../src/common/steps.js';
-import { buildToolbar, migrateSettings, DEFAULT_SETTINGS, TOOLS } from '../src/common/registry.js';
+import { buildToolbar, migrateSettings, DEFAULT_SETTINGS, TOOLS, DEFAULT_COLLAPSED } from '../src/common/registry.js';
 import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.js';
 import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64 } from '../src/common/util.js';
 
@@ -370,7 +370,7 @@ console.log('== registry / settings ==');
     ok('可覆盖 label/icon', items3[0].label === '反相！' && items3[0].icon === 'Z');
     s.tools['invert'].collapsed = true;
     const items4 = buildToolbar(s, 'image', false);
-    ok('collapsed 透传到工具栏项', items4[0].id === 'invert' && items4[0].collapsed === true);    ok('未设置的项默认常驻', items4.filter((i) => i.id !== 'invert').every((i) => i.collapsed === false));
+    ok('collapsed 透传到工具栏项', items4[0].id === 'invert' && items4[0].collapsed === true);    ok('未设置的项按 DEFAULT_COLLAPSED 决定常驻/折叠', items4.filter((i) => i.id !== 'invert').every((i) => i.collapsed === DEFAULT_COLLAPSED.includes(i.id)), items4.filter((i) => i.collapsed).map((i) => i.id).join(','));
     s.customScripts.push({ id: 'sc1', label: '脚本', code: 'return {}', enabled: true, media: ['image'], collapsed: true });
     s.linkTools.push({ id: 'lk1', label: '链接', template: 'x?u={src}', enabled: true, media: ['image'] });
     const items5 = buildToolbar(s, 'image', false);
@@ -383,6 +383,17 @@ console.log('== registry / settings ==');
     ok('视频态既有取帧也有播放控制，且带折叠标记', vItems.some((i) => i.id === 'v-frame') && vItems.some((i) => i.id === 'v-speed') && vItems.filter((i) => i.collapsed).length >= 5,
         { n: vItems.length, folded: vItems.filter((i) => i.collapsed).map((i) => i.id).join(',') });
     delete s.tools['invert'].collapsed;
+    // 老设置里每个按钮都写死了 collapsed:false，会把新的折叠默认值盖掉（用户报「折叠没生效」的真因）
+    const legacy = migrateSettings(DEFAULT_SETTINGS);
+    ok('老设置补种折叠默认值', legacy.tools['v-mute'].collapsed === true && legacy.tools['v-speed'].collapsed === false && legacy.collapseSeed === 2,
+        { mute: legacy.tools['v-mute'].collapsed, speed: legacy.tools['v-speed'].collapsed });
+    const kept = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+    kept.tools['v-mute'].collapsed = false; kept.tools['v-mute'].label = '我就要平铺';
+    const keptOut = migrateSettings(kept);
+    ok('用户改过的按钮不被覆盖', keptOut.tools['v-mute'].collapsed === false && keptOut.tools['v-mute'].label === '我就要平铺');
+    const twice = migrateSettings(legacy);
+    ok('重复迁移幂等', twice.tools['v-mute'].collapsed === true);
+
     const mig = migrateSettings({ comfyConfig: { serverAddress: 'http://192.168.1.5:8188/', buttonPosition: 'bottom-left', offsetX: 12, offsetY: -8, minImgSize: 300, alwaysShow: true, disabledHosts: ['example.com'], profiles: { p1: { name: 'x', mode: 'api', targetNodeId: '9', workflowJson: '{}', targetNodeType: 'LoadImage' } }, activeProfileId: 'p1' } });
     ok('旧配置迁移 server', mig.comfy.server === 'http://192.168.1.5:8188');
     ok('旧配置迁移 mode/nodeId', mig.comfy.mode === 'api' && mig.comfy.targetNodeId === '9');
@@ -419,6 +430,7 @@ console.log('== runtime-install（自动装运行时）==');
                 return { arrayBuffer: async () => b, headers: { get: (n) => (n === 'x-size' ? String(b.byteLength) : null) } };
             },
             put: async (k, res) => { store.set(k, await res.arrayBuffer()); },
+            delete: async (k) => store.delete(String(k)),
         }),
         delete: async () => true,
     };
@@ -429,8 +441,8 @@ console.log('== runtime-install（自动装运行时）==');
         calls.push(u);
         const signal = opt && opt.signal;
         if (u.includes('no-vendor')) return { ok: false, status: 404, headers: { get: () => null } };
-        if (u.includes('cdn.jsdelivr.net')) {
-            // 先给两个 chunk 再断流：模拟「连上了但不动」的源
+        if (u.includes('mtb-ort-wasm')) {
+            // 首选源先给两个 chunk 再断流：模拟「连上了但不动」的源
             let n = 0;
             return {
                 ok: true, headers: { get: (k) => (k === 'content-length' ? String(WANT) : null) },
@@ -444,19 +456,27 @@ console.log('== runtime-install（自动装运行时）==');
                 },
             };
         }
-        if (u.includes('fastly')) return { ok: true, headers: { get: (k) => (k === 'content-length' ? '16' : null) }, arrayBuffer: async () => new Uint8Array(16).buffer };
+        if (u.includes('cdn.jsdelivr.net')) return { ok: true, headers: { get: (k) => (k === 'content-length' ? '16' : null) }, arrayBuffer: async () => new Uint8Array(16).buffer };
         return { ok: true, headers: { get: (k) => (k === 'content-length' ? String(WANT) : null) }, arrayBuffer: async () => new Uint8Array(WANT).buffer };
     };
     const r = await ri.installRuntime({ vendorBase: 'http://x/no-vendor', onlyRequired: true, stallMs: 150, onProgress: () => {} });
     const cdn = calls.filter((u) => u.startsWith('https://'));
     const srcOf = (i) => String(cdn[i] || '').split('/')[2];
-    ok('卡住的源被掐掉后自动换下一个源', cdn.length >= 3 && srcOf(0).includes('jsdelivr') && srcOf(1).includes('fastly') && srcOf(2).includes('gcore'),
+    ok('卡住的源被掐掉后自动换下一个源', cdn.length >= 3 && srcOf(0).includes('modelscope') && srcOf(1).includes('jsdelivr') && srcOf(2).includes('fastly'),
         { n: cdn.length, hosts: cdn.map(srcOf), errs: r.errors.map((e) => e.slice(0, 40)) });
     ok('字节数不匹配的源被拒收', r.errors.some((e) => e.includes('字节数')), { errs: r.errors.map((e) => e.slice(0, 52)) });
     ok('最终装成功并写入 Cache', !!r.ok && !!(r.status && r.status.ready) && store.size === 1, { ok: r.ok, ready: r.status && r.status.ready, stored: store.size });
     const st = await ri.runtimeStatus({ vendorBase: 'http://x/no-vendor' });
     ok('状态查询把已下载的算作就绪（source=cache）', st.ready && st.files[0].source === 'cache' && st.files[0].have === WANT,
         { src: st.files[0].source, have: st.files[0].have, requiredBytes: st.requiredBytes });
+    // 断流写进 Cache 的半截 wasm 会让 ORT 抛 "memory access out of bounds"，必须在这里就拦住并删掉
+    const key0 = ri.cacheKey(ri.RUNTIME_FILES[0].name);
+    store.set(key0, new Uint8Array(1024).buffer);
+    const ortStub = { env: { wasm: { wasmPaths: null } } };
+    let corrupt = null;
+    try { await ri.applyWasmPaths(ortStub, 'http://x/no-vendor'); } catch (e) { corrupt = e; }
+    ok('Cache 里字节数不符的 wasm 被判损坏：报 RUNTIME_CORRUPT 并删除该条', !!corrupt && corrupt.code === 'RUNTIME_CORRUPT' && !store.has(key0),
+        JSON.stringify({ code: corrupt && corrupt.code, stillStored: store.has(key0), msg: corrupt && String(corrupt.message).slice(0, 40) }));
     globalThis.fetch = savedFetch; globalThis.caches = savedCaches;
 }
 
@@ -470,6 +490,8 @@ console.log('== ext-state（上下文失效翻译）==');
         ['Could not establish connection. Receiving end does not exist.', 'message port closed', 'This extension context has been invalidated']
             .every((m) => es.friendlyText(m) === es.DEAD_TEXT));
     ok('普通错误原样透出', es.friendlyText('站点禁用了剪贴板') === '站点禁用了剪贴板');
+    ok('wasm 内存崩溃翻成「换小模型/档位」而不是甩栈', ['memory access out of bounds', 'RuntimeError: memory access out of bounds', 'Aborted(native code called abort())']
+        .every((m) => es.friendlyText(m) === es.MEMORY_TEXT) && es.friendlyError(new Error('memory access out of bounds')).memory === true);
     const saved = globalThis.chrome;
     globalThis.chrome = { runtime: { id: 'abc' } };
     const alive = es.extAlive();
@@ -479,6 +501,64 @@ console.log('== ext-state（上下文失效翻译）==');
     const noChrome = es.extAlive();
     globalThis.chrome = saved;
     ok('extAlive 按 chrome.runtime.id 判断', alive === true && dead === false && noChrome === false, { alive, dead, noChrome });
+}
+
+console.log('== face（识别数学）==');
+{
+    const fc = await import('../src/common/ai/face.js');
+    // 相似变换：拿 insightface 的模板点当已知答案，λ 必须还原出我们构造的缩放+旋转
+    const tmpl = fc.ARCFACE_TEMPLATE;
+    const th = 0.35, sc = 1.7, tx = 12, ty = -8;
+    const rot = [[Math.cos(th), -Math.sin(th)], [Math.sin(th), Math.cos(th)]];
+    const src = tmpl.map(([x, y]) => {
+        const rx = (x - 56) * rot[0][0] + (y - 56) * rot[1][0];
+        const ry = (x - 56) * rot[0][1] + (y - 56) * rot[1][1];
+        return [rx / sc + tx, ry / sc + ty];
+    });
+    const m = fc.similarityTransform(src, tmpl);
+    const mapped = src.map(([x, y]) => [m.a * x - m.b * y + m.tx, m.b * x + m.a * y + m.ty]);
+    const err = Math.max(...mapped.flatMap((p, i) => [Math.abs(p[0] - tmpl[i][0]), Math.abs(p[1] - tmpl[i][1])]));
+    ok('5 点相似变换能还原构造好的缩放+旋转+平移（对齐用）', err < 1e-3, { maxErrPx: +err.toFixed(6), scale: +Math.hypot(m.a, m.b).toFixed(4) });
+    const v = new Float32Array(512); v[0] = 0.6; v[7] = -0.8;
+    const back = fc.unpackVector(fc.packVector(v));
+    ok('人脸向量 base64 往返无损（存进设置再读出来比对要用）', back.length === 512 && back.every((x, i) => x === v[i]), { len: back.length });
+    ok('余弦判定：同人过阈值、异人算陌生、同名条目覆盖式命中', (() => {
+        const a = fc.l2normalize(new Float32Array([1, 1, 0]));
+        const b = fc.l2normalize(new Float32Array([0.98, 1.02, 0.05]));
+        const c = fc.l2normalize(new Float32Array([0, 0, 1]));
+        const gallery = [{ id: '1', name: '甲', vector: fc.packVector(a) }, { id: '2', name: '乙', vector: fc.packVector(c) }];
+        const near = fc.matchGallery(b, gallery, 0.4);
+        const far = fc.matchGallery(fc.l2normalize(new Float32Array([1, -1, 0.02])), gallery, 0.4);
+        return near.match?.name === '甲' && !far.match && fc.cosineSim(a, b) > 0.99 && fc.cosineSim(a, c) < 1e-6;
+    })());
+    ok('SCRFD 预设首选自己的 ModelScope 镜像、alt 留 HF 兜底', (() => {
+        const det = fc.FACE_MODEL_PRESETS.find((p) => p.id === 'scrfd-500m');
+        const rec = fc.FACE_EMBED_PRESETS.find((p) => p.id === 'w600k-mbf');
+        return !!(det && det.bytes > 1e6 && /modelscope\.cn\/models\/cjc1887415157\/mtb-face/.test(det.url) && /huggingface|hf-mirror/.test(det.alt))
+            && !!(rec && rec.bytes > 1e7 && /modelscope\.cn/.test(rec.url) && /hf-mirror/.test(rec.alt));
+    })(), { det: fc.FACE_MODEL_PRESETS.find((p) => p.id === 'scrfd-500m').url, rec: fc.FACE_EMBED_PRESETS[0].url });
+    ok('默认人脸栈切到 SCRFD+embedding（digiKam 同款路线）',
+        DEFAULT_SETTINGS.ai.faceModel === 'scrfd-500m' && DEFAULT_SETTINGS.ai.faceEmbedModel === 'w600k-mbf' && Array.isArray(DEFAULT_SETTINGS.faceGallery)
+        && fc.resolveFaceModel(DEFAULT_SETTINGS.ai).url.includes('det_500m.onnx') && fc.resolveEmbedModel(DEFAULT_SETTINGS.ai).url.includes('w600k_mbf.onnx'),
+        { det: fc.resolveFaceModel(DEFAULT_SETTINGS.ai).url, rec: fc.resolveEmbedModel(DEFAULT_SETTINGS.ai).url });
+    ok('模型源按 hub 切换：modelscope 用自建镜像，切回 hf-mirror 用原仓库', await (async () => {
+        const p = (await import('../src/common/ai/sam.js')).SAM_PRESETS[0];
+        const src = await import('../src/common/ai/sources.js');
+        return src.modelIdFor({ hub: 'modelscope' }, p) === p.ms && src.modelIdFor({ hub: 'hf-mirror' }, p) === p.model
+            && src.modelIdFor({}, p) === p.model && DEFAULT_SETTINGS.ai.hub === 'modelscope';
+    })(), { ms: (await import('../src/common/ai/sam.js')).SAM_PRESETS[0].ms });
+    ok('WebGPU 的默认档位跟着源走：自建镜像取 q4f16、HF 源才取 fp16（否则必然 404）', await (async () => {
+        const { resolveVlm } = await import('../src/common/ai/vlm.js');
+        return resolveVlm({ hub: 'modelscope', device: 'webgpu' }).dtype === 'q4f16'
+            && resolveVlm({ hub: 'hf-mirror', device: 'webgpu' }).dtype === 'fp16'
+            && resolveVlm({ hub: 'modelscope', device: 'wasm' }).dtype === 'q4';
+    })(), { ms: (await import('../src/common/ai/vlm.js')).resolveVlm({ hub: 'modelscope', device: 'webgpu' }).dtype });
+    ok('分类/零样本结果归一化：单图扁平数组不再被误当批量', await (async () => {
+        const { listOf } = await import('../src/common/ai/vision.js');
+        const flat = [{ label: 'cat', score: 0.9 }, { label: 'dog', score: 0.1 }];
+        return listOf(flat) === flat && JSON.stringify(listOf([flat])) === JSON.stringify(flat)
+            && listOf({ labels: flat }) === flat && listOf(null).length === 0;
+    })());
 }
 
 __summary();

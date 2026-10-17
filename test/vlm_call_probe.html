@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>vlm call probe</title></head>
+<body style="background:#151519;color:#cfd6dd;font:12px ui-monospace,monospace;padding:12px">
+<pre id="out">running…</pre>
+<script type="module">
+// 这版 vendor 没有 image-text-to-text 管线，只能手工装配。那就要问清楚：
+// 它的 Processor 到底怎么调、tokenizer 有没有 apply_chat_template、generate 吃什么。
+const mod = await import('/vendor/transformers.web.min.mjs');
+const { AutoProcessor, AutoTokenizer, AutoModelForImageTextToText, AutoModelForVision2Seq, RawImage, env } = mod;
+const log = [];
+const say = (o) => { log.push(o); document.getElementById('out').textContent = JSON.stringify(log, null, 1); };
+window.__probe = () => log;
+
+const MODEL = new URLSearchParams(location.search).get('m') || 'cjc1887415157/SmolVLM2-256M-Video-Instruct';
+env.allowLocalModels = false;
+env.backends.onnx.wasm.wasmPaths = '/vendor/';
+env.remoteHost = 'https://www.modelscope.cn';
+env.remotePathTemplate = '{model}/resolve/master/';
+
+const cv = document.createElement('canvas');
+cv.width = 128; cv.height = 96;
+const g = cv.getContext('2d');
+g.fillStyle = '#fff'; g.fillRect(0, 0, 128, 96);
+g.fillStyle = '#e33'; g.beginPath(); g.arc(40, 48, 26, 0, 7); g.fill();
+g.fillStyle = '#0a0'; g.fillRect(80, 30, 34, 40);
+const id = cv.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, 128, 96);
+const img = new RawImage(new Uint8ClampedArray(id.data), 128, 96, 4);
+
+say({ hasProcessor: !!AutoProcessor, hasTok: !!AutoTokenizer, hasIt2t: !!AutoModelForImageTextToText, hasV2s: !!AutoModelForVision2Seq });
+
+// 不下载权重也能问清 AutoModel 认哪些 model_type：映射就是类上的静态 Map 列表
+if (new URLSearchParams(location.search).get('only') === 'types') {
+    const maps = AutoModelForImageTextToText?.MODEL_CLASS_MAPPINGS || [];
+    const all = new Set();
+    for (const m of maps) for (const k of m.keys()) all.add(k);
+    const want = ['qwen3_vl', 'qwen2_vl', 'qwen2_5_vl', 'idefics3', 'smolvlm', 'paligemma', 'gemma3', 'llava', 'florence2', 'moondream1', 'minicpmv', 'pixtral'];
+    say({ maps: maps.length, total: all.size, wanted: want.map((t) => t + '=' + (all.has(t) ? 'Y' : 'n')), sample: [...all].slice(0, 40) });
+    window.__done = true;
+    document.getElementById('out').textContent = JSON.stringify(log, null, 1);
+    throw new Error('__stop__');
+}
+
+const opts = { device: 'wasm', dtype: 'q4' };
+let proc, tok, model;
+try {
+    proc = await AutoProcessor.from_pretrained(MODEL, opts);
+    tok = await AutoTokenizer.from_pretrained(MODEL, opts);
+    model = await (AutoModelForImageTextToText || AutoModelForVision2Seq).from_pretrained(MODEL, opts);
+    say({ loaded: true, procClass: proc.constructor.name, modelClass: model.constructor.name, hasChatTemplate: typeof tok.apply_chat_template });
+} catch (e) { say({ loadErr: String(e.message || e).slice(0, 200) }); window.__done = true; throw e; }
+
+// 复刻 src/common/ai/vlm.js 的 feed()，把每一步的实际类型打出来（产品代码里看不到这些）
+if (new URLSearchParams(location.search).get('only') === 'feed') {
+    const messages = [
+        { role: 'system', content: [{ type: 'text', text: '你是图像助手' }] },
+        { role: 'user', content: [{ type: 'image', image: img }, { type: 'text', text: '描述这张图' }] },
+    ];
+    const images = [];
+    for (const m of messages) for (const c of m.content || []) if (c.type === 'image' && c.image) images.push(c.image);
+    let texts = null;
+    try {
+        const t = proc.tokenizer.apply_chat_template(messages, { add_generation_prompt: true, tokenize: false });
+        texts = Array.isArray(t) ? t : [String(t)];
+        say({ tplType: Object.prototype.toString.call(t), isArray: Array.isArray(t), textsTypes: texts.map((x) => typeof x), lens: texts.map((x) => String(x).length), head: String(texts[0]).slice(0, 80) });
+    } catch (e) { say({ tplErr: String(e.message || e).slice(0, 160) }); }
+    if (!texts) texts = messages.map((m) => (m.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n'));
+    say({ imagesCtor: images.map((x) => x && x.constructor && x.constructor.name), textsLen: texts.length });
+    try {
+        const inputs = await proc._call(texts, images, { padding: true });
+        say({ feedOk: true, keys: Object.keys(inputs), shape: inputs.input_ids && inputs.input_ids.dims.join('x') });
+    } catch (e) { say({ feedOk: false, err: String(e.message || e).slice(0, 160), stack: String(e.stack || '').split('\n').slice(0, 5) }); }
+    window.__done = true;
+    document.getElementById('out').textContent = JSON.stringify(log, null, 1);
+    throw new Error('__stop__');
+}
+
+const conv = [{ role: 'user', content: [{ type: 'image', image: img }, { type: 'text', text: 'Describe this image in one short Chinese sentence.' }] }];
+
+say({
+    proto: Object.getOwnPropertyNames(Object.getPrototypeOf(proc)),
+    parentProto: Object.getOwnPropertyNames(Object.getPrototypeOf(Object.getPrototypeOf(proc))),
+    baseCall: String(Object.getPrototypeOf(Object.getPrototypeOf(proc)).__call__ || '').slice(0, 300),
+    ownCall: String(proc._call || '').slice(0, 300),
+    hasImageProcessor: !!proc.image_processor, hasTokenizer: !!proc.tokenizer,
+    chatTpl: typeof tok.apply_chat_template === 'function' ? String(tok.apply_chat_template).slice(0, 200) : null,
+});
+
+const tries = {
+    'proc([img], {text: conv})': async () => proc([img], { text: conv }),
+    'proc([img], {text: conv, add_generation_prompt:true})': async () => proc([img], { text: conv, add_generation_prompt: true }),
+    'proc(conv, [img])': async () => proc(conv, [img]),
+    'proc(null, {text: conv})': async () => proc(null, { text: conv }),
+    'apply_chat_template → proc([img], {text: prompt})': async () => {
+        const prompt = tok.apply_chat_template(conv, { add_generation_prompt: true });
+        return proc([img], { text: [prompt], padding: true });
+    },
+    'image_processor + tokenizer 手拼': async () => {
+        const prompt = tok.apply_chat_template(conv, { add_generation_prompt: true });
+        const pv = await proc.image_processor([img]);
+        const tx = tok([prompt], { padding: true, return_tensor: true });
+        return { ...pv, ...tx };
+    },
+    '手拼（chat 模板要 tokenize:false 才是字符串）': async () => {
+        const prompt = tok.apply_chat_template(conv, { add_generation_prompt: true, tokenize: false });
+        const pv = await proc.image_processor([img]);
+        const tx = tok([prompt], { padding: true, return_tensor: true });
+        return { ...pv, ...tx };
+    },
+    'proc._call([img],[prompt])': async () => proc._call([img], [tok.apply_chat_template(conv, { add_generation_prompt: true, tokenize: false })], { padding: true }),
+    'proc([prompt], [img])（文本在前、图像在后）': async () => proc([tok.apply_chat_template(conv, { add_generation_prompt: true, tokenize: false })], [img], { padding: true }),
+    'proc._call([prompt], [img])': async () => proc._call([tok.apply_chat_template(conv, { add_generation_prompt: true, tokenize: false })], [img], { padding: true }),
+};
+let good = null;
+for (const [name, fn] of Object.entries(tries)) {
+    try {
+        const inputs = await fn();
+        const keys = Object.keys(inputs || {});
+        say({ try: name, ok: true, keys: keys.slice(0, 12), shapes: keys.filter((k) => inputs[k] && inputs[k].dims).map((k) => k + '=' + inputs[k].dims.join('x')) });
+        if ((inputs.input_ids?.dims?.[1] || 0) > 0 && inputs.pixel_values) good = { name, inputs };
+    } catch (e) { say({ try: name, ok: false, err: String(e.message || e).slice(0, 150) }); }
+}
+
+if (good) {
+    const t0 = Date.now();
+    const attempts = [
+        ['generate(inputs, {max_new_tokens})', () => model.generate(good.inputs, { max_new_tokens: 24 })],
+        ['generate({...inputs, max_new_tokens})', () => model.generate({ ...good.inputs, max_new_tokens: 24 })],
+    ];
+    for (const [name, fn] of attempts) {
+        try {
+            const ids = await fn();
+            const plen = good.inputs.input_ids?.dims?.[1] || 0;
+            const d = ids.dims || [];
+            const flat = Array.from(ids.data, Number);
+            const tail = d.length === 2 && d[1] > plen ? flat.slice(plen) : flat;
+            const rows = d.length === 2 ? Array.from({ length: d[0] }, (_, r) => tail.slice(r * d[1], (r + 1) * d[1])) : [tail];
+            say({ generated: true, via: name, ms: Date.now() - t0, dims: d.join('x'), text: tok.batch_decode(rows, { skip_special_tokens: true })[0]?.slice(0, 120) });
+            break;
+        } catch (e) { say({ generated: false, via: name, err: String(e.message || e).slice(0, 160) }); }
+    }
+}
+window.__done = true;
+document.getElementById('out').textContent = JSON.stringify(log, null, 1);
+</script>
+</body></html>

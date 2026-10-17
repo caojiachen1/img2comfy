@@ -32,7 +32,13 @@
                     // 与 background.js 的 mtbEvent 转发同形：扩展页收 target:'ext' 的那一份
                     window.__mtbStubRelay = (window.__mtbStubRelay || 0) + 1;
                     const { action: _drop, ...rest } = msg;
-                        for (const fn of listeners.slice()) { if (typeof fn !== 'function') continue; try { fn({ action: 'mtbHostEvent', target: 'ext', ...rest }, {}, () => {}); } catch (e) { window.__mtbStubRelayErr = String(e && e.message || e); } }
+                        // 真后台是两条都发（内容脚本收 page、扩展页收 ext），桩照做才能测出接收方的 target 过滤
+                    for (const target of ['page', 'ext']) {
+                        for (const fn of listeners.slice()) {
+                            if (typeof fn !== 'function') continue;
+                            try { fn({ action: 'mtbHostEvent', target, ...rest }, {}, () => {}); } catch (e) { window.__mtbStubRelayErr = String(e && e.message || e); }
+                        }
+                    }
                     finish({ ok: true, type: msg.type });
                 }
                 else if (msg && msg.action === 'openOptions') finish({ ok: true });

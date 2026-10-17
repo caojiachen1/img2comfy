@@ -7,7 +7,12 @@
 
 export const DEAD_TEXT = '扩展已更新，本页面里的旧脚本已失效：请按 F5 刷新页面后再用';
 
+// wasm 是 32 位地址空间，浏览器里一份 1.3GB 的权重 + 激活值就会越界，
+// ORT 崩出来只有一句 "memory access out of bounds"，用户看不出跟模型大小有关。
+export const MEMORY_TEXT = '浏览器内存放不下这个模型（wasm 只有 4GB 地址空间）：请在设置里换小一点的模型/档位（如 SmolVLM2-256M/500M、q4），或改用 WebGPU 设备';
+
 const DEAD_RE = /Extension context invalidated|extension context has been invalidated|Could not establish connection\. Receiving end does not exist|message port closed|Cannot access a chrome-extension: URL of a different extension/i;
+const MEMORY_RE = /memory access out of bounds|out of memory|Aborted\(|RuntimeError: memory|Cannot allocate memory|too many bytes/i;
 
 export function extAlive() {
     try { return !!(globalThis.chrome && globalThis.chrome.runtime && globalThis.chrome.runtime.id); } catch (e) { return false; }
@@ -16,11 +21,12 @@ export function extAlive() {
 /** @returns {{dead:boolean, text:string}} */
 export function friendlyError(e) {
     const msg = String((e && e.message) || e || '未知错误');
-    return DEAD_RE.test(msg) ? { dead: true, text: DEAD_TEXT } : { dead: false, text: msg };
+    if (DEAD_RE.test(msg)) return { dead: true, text: DEAD_TEXT };
+    if (MEMORY_RE.test(msg)) return { dead: false, text: MEMORY_TEXT, memory: true };
+    return { dead: false, text: msg };
 }
 
 /** 给「已经拿到手的错误字符串」用（bgSend 返回的是 {ok:false,error}，不是异常） */
 export function friendlyText(msg) {
-    const f = friendlyError({ message: String(msg || '') });
-    return f.dead ? DEAD_TEXT : String(msg || '未知错误');
+    return friendlyError({ message: String(msg || '') }).text;
 }

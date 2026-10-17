@@ -33,6 +33,11 @@ async function emit(type, data = {}) {
     await sendBg({ action: 'mtbEvent', type, ...data });
 }
 
+// 模型/wasm 下载进度只发给设置页和控制台，推理状态才发到工具栏旁边
+function routeProgress(p) {
+    emit(p && (p.download || p.phase === 'download') ? 'modelProgress' : 'aiProgress', p || {});
+}
+
 // ---------------------------------------------------------------- 编解码
 
 async function decodeBytes(bytes) {
@@ -137,7 +142,7 @@ async function runOpTask(req) {
 }
 
 async function runAiTask(task, req) {
-    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: (p) => emit('aiProgress', p) });
+    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: routeProgress });
     if (req.ai) { aiSettings = req.ai; await engine.prepare(req.ai); }
     if (req.confirmBudget) engine.confirmBudget(req.confirmBudget);
     const acquired = req.dataUrl || req.bytesB64 || req.url ? await acquireImage(req) : null;
@@ -236,7 +241,7 @@ const HANDLERS = {
 };
 
 async function ensureEngine(ai) {
-    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: (p) => emit('aiProgress', p) });
+    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: routeProgress });
     if (ai && ai !== aiSettings) { aiSettings = ai; await engine.prepare(ai); }
     return engine;
 }

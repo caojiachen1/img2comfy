@@ -29,7 +29,7 @@ for (let i = 0; i < 90; i++) { await wait(300); try { cdp = await Cdp.connect(PO
 if (!cdp) { console.log('CDP 不可达'); process.exit(1); }
 
 const PAGE = process.env.PAGE || 'face_probe.html';
-const sess = await cdp.open(`http://127.0.0.1:${PORT}/test/${PAGE}?img=${IMG}`);
+const sess = await cdp.open(`http://127.0.0.1:${PORT}/test/${PAGE}?img=${IMG}${process.env.EXTRA ? '&' + process.env.EXTRA : ''}`);
 let done = false;
 for (let i = 0; i < 160; i++) {
     await wait(1000);
@@ -41,6 +41,13 @@ const annot = await cdp.ev(sess, `window.__annot || null`);
 if (annot && annot.startsWith('data:image/png;base64,')) {
     fs.writeFileSync(path.join(ROOT, 'test/out_face_' + IMG.replace(/\..*/, '') + '.png'), Buffer.from(annot.split(',')[1], 'base64'));
     console.log('已写注记图: test/out_face_' + IMG.replace(/\..*/, '') + '.png');
+}
+const extras = await cdp.ev(sess, `window.__extras || []`);
+for (const e of extras || []) {
+    if (!e || !e.dataUrl || !e.dataUrl.startsWith('data:image/png;base64,')) continue;
+    const file = 'test/out_' + (e.name || 'extra.png');
+    fs.writeFileSync(path.join(ROOT, file), Buffer.from(e.dataUrl.split(',')[1], 'base64'));
+    console.log('已写: ' + file);
 }
 console.log('==== ' + IMG + ' (' + (done ? '完成' : '超时') + ') ====');
 console.log(JSON.stringify(out, null, 1));

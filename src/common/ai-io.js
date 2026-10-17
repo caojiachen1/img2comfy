@@ -109,6 +109,19 @@ export async function clearCache(modelUrlPrefix = '') {
     return { cleared };
 }
 
+/** 只丢一个 URL 的缓存（会话创建失败时判定为坏文件，用来自愈重下） */
+export async function dropCached(url) {
+    const cache = await openCache();
+    let deleted = false;
+    if (cache) {
+        const reqs = await cache.keys();
+        for (const r of reqs) if (r.url === url && await cache.delete(r)) deleted = true;
+    }
+    const idx = readIndex();
+    if (idx[url]) { delete idx[url]; writeIndex(idx); }
+    return deleted;
+}
+
 // 下载预算闸门：超出 ai.downloadBudgetMB 时要求用户确认，避免偷偷拉 GB 级权重
 export async function guardBudget(bytesNeeded, budgetMB, confirmed) {
     if (!bytesNeeded || !budgetMB) return { ok: true };

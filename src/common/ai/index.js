@@ -9,7 +9,8 @@ import { VlmRunner, resolveVlm } from './vlm.js';
 import { SamRunner, resolveSam } from './sam.js';
 import { SrRunner, resolveSr } from './sr.js';
 import { VisionRunner, TAG_PRESETS, DEPTH_PRESETS } from './vision.js';
-import { detectFaces, resolveFaceModel, faceCropRect } from './face.js';
+import { modelIdFor } from './sources.js';
+import { detectFaces, resolveFaceModel, resolveEmbedModel, faceCropRect, hasLandmarks, alignFace, alignByBox, embedFace, matchGallery, packVector } from './face.js';
 import { loadOrtSession, ensureOrt, fetchModelBytes } from './ort-load.js';
 import { cacheSummary, clearCache, makeProgressFetch, guardBudget } from '../ai-io.js';
 
@@ -22,7 +23,10 @@ export class AiEngine {
         this.tf = null;
         this.vlm = null; this.sam = null; this.sr = null; this.vision = null;
         this.faceSession = null;
+        this.embedSession = null;
         this.busy = null;
+        this.taskKind = null;
+        this.warmFor = null;   // 进度事件要能归到具体模型，设置页才知道刷哪一行
         this.lastUse = 0;
     }
 
@@ -38,7 +42,31 @@ export class AiEngine {
     }
 
     progress(phase, loaded = 0, total = 0, extra = '') {
-        this.onProgress({ phase, loaded, total, text: total ? `${phase} ${formatBytes(loaded)}/${formatBytes(total)}` : phase, extra });
+        // 模型下载进度只进设置页和控制台；其它阶段（推理中/完成）才显示在工具栏旁边。
+        const download = phase === 'download' || /^下载/.test(String(phase));
+        this.onProgress({ phase, download, loaded, total, kind: this.taskKind, warmFor: this.warmFor, extra, text: total ? `${phase} ${formatBytes(loaded)}/${formatBytes(total)}` : phase });
+    }
+
+    // 只为「把模型下下来并加载一次」而跑的任务：用一张极小的假图触发下载与建会话。
+    // 假图当然认不出东西，所以只有「下载类」错误算失败，推理跑挂只当警告。
+    async warm(payload = {}) {
+        const kind = payload.kind || 'face';
+        const map = { vlm: 'describe', sam: 'samPick', sr: 'superResolve', face: 'face', embed: 'recognize', tags: 'tags', depth: 'depth' };
+        const task = map[kind] || kind;
+        const side = 64;
+        const px = mkPx(side, side);
+        const t0 = Date.now();
+        this.warmFor = kind;
+        try {
+            await this.task(task, { ...payload, px, points: [[side / 2, side / 2]], labels: [1], question: 'ok' });
+            return { ok: true, kind, task, ms: Date.now() - t0, ran: true };
+        } catch (e) {
+            const msg = String((e && e.message) || e);
+            const downloadFailed = /HTTP|Failed to fetch|fetch|network|预算|budget|404|下载/i.test(msg);
+            return { ok: !downloadFailed, kind, task, ms: Date.now() - t0, ran: false, warn: msg.slice(0, 200) };
+        } finally {
+            this.warmFor = null;
+        }
     }
 
     // 大图先夹到 ai.maxDim 再进模型，回来后按原比例还原遮罩尺寸
@@ -53,9 +81,11 @@ export class AiEngine {
     async task(name, payload = {}) {
         if (!this.tf) await this.prepare(this.ai || payload.ai || {});
         this.lastUse = Date.now();
+        this.taskKind = name;
         const px = payload.px;
         switch (name) {
             case 'runtime': return this.runtime || await this.prepare(payload.ai || {});
+            case 'warm': return this.warm(payload);
             case 'describe': return this.runDescribe(px, payload);
             case 'ask': return this.runAsk(px, payload);
             case 'ocr': return this.runOcr(px, payload);
@@ -66,6 +96,8 @@ export class AiEngine {
             case 'samAuto': return this.runSamAuto(px, payload);
             case 'face': return this.runFace(px, payload);
             case 'faceBlur': return this.runFaceBlur(px, payload);
+            case 'recognize': return this.runRecognize(px, payload);
+            case 'faceRegister': return this.runFaceRegister(px, payload);
             case 'superResolve': return this.runSr(px, payload);
             case 'depth': return this.runDepth(px, payload);
             case 'cacheSummary': return cacheSummary();
@@ -87,12 +119,17 @@ export class AiEngine {
 
     async checkBudget(bytes, modelId) {
         const budgetMB = toInt(this.ai?.downloadBudgetMB || 0, 0);
-        const g = await guardBudget(bytes, budgetMB, this.confirmed?.[modelId]);
+        const g = await guardBudget(bytes, budgetMB, this.confirmedAll || this.confirmed?.[modelId]);
         if (!g.ok) this.onEvent('budget-blocked', { modelId, bytes, ...g });
         return g;
     }
 
-    confirmBudget(modelId) { this.confirmed = this.confirmed || {}; this.confirmed[modelId] = true; }
+    // confirmBudget(true) = 用户在设置页点了「下载」，视为对全部模型的预算确认
+    confirmBudget(modelId) {
+        if (modelId === true) { this.confirmedAll = true; return; }
+        this.confirmed = this.confirmed || {};
+        this.confirmed[modelId] = true;
+    }
 
     async runDescribe(px, payload) {
         const e = await this.ensureVlm();
@@ -130,12 +167,13 @@ export class AiEngine {
         if (!this.vision) this.vision = new VisionRunner({ tf: this.tf, device: this.device, dtype: this.ai?.tagsDtype || preset.dtype, vendorBase: this.vendorBase, progress: (p) => this.progress('下载标签模型', p?.loaded, p?.total, p?.url) });
         const { px: mpx } = this.normalizeForModel(px);
         this.progress('标签推理');
+        const tagModel = modelIdFor(this.ai, preset);
         if (preset.id === 'clip-zero-shot') {
             const labels = (payload.candidateLabels || DEFAULT_CANDIDATES).slice(0, 60);
-            const r = await this.vision.zeroShot(mpx, { model: preset.model, candidateLabels: labels });
+            const r = await this.vision.zeroShot(mpx, { model: tagModel, candidateLabels: labels });
             return { labels: r.labels, preset: preset.id };
         }
-        const r = await this.vision.classify(mpx, { model: preset.model, topK: toInt(payload.topK || 8, 8) });
+        const r = await this.vision.classify(mpx, { model: tagModel, topK: toInt(payload.topK || 8, 8) });
         return { ...r, preset: preset.id };
     }
 
@@ -184,12 +222,19 @@ export class AiEngine {
 
     async ensureFace() {
         if (this.faceSession) return this.faceSession;
-        const { url } = resolveFaceModel(this.ai);
-        this.progress('下载人脸模型', 0, 0, url);
-        const ort = await ensureOrt(this.vendorBase);
-        const session = await loadOrtSession({ url, ai: this.ai, progress: (p, l, t) => this.progress('下载人脸模型', l, t, p), device: this.device, vendorBase: this.vendorBase });
-        this.faceSession = session;
-        return session;
+        this.faceSession = await this.loadFirstWorking(resolveFaceModel(this.ai).urls, '下载人脸模型');
+        return this.faceSession;
+    }
+
+    // 逐个试 URL：首选自己的 ModelScope 镜像，失败再退到原始出处
+    async loadFirstWorking(urls, label) {
+        const tried = [];
+        for (const url of urls.filter(Boolean)) {
+            try {
+                return await loadOrtSession({ url, ai: this.ai, progress: (p, l, t) => this.progress(label, l, t, p), device: this.device, vendorBase: this.vendorBase });
+            } catch (e) { tried.push(String((e && e.message) || e).slice(0, 120)); }
+        }
+        throw new Error('人脸模型所有源都取不到：' + (tried.join(' ; ') || '没有可用 URL'));
     }
 
     async runFace(px, payload) {
@@ -208,6 +253,63 @@ export class AiEngine {
         const rects = f.faces.map((x) => faceCropRect(x, { pad: 0.35, square: true }));
         const image = applyToRects(px, (src) => (mode === 'mosaic' ? tileMosaic(src, strength) : gaussianBlur(src, strength)), rects, { feather: 6 });
         return { image, faces: f.faces, count: f.count, overlay: f.overlay };
+    }
+
+    async ensureEmbed() {
+        if (this.embedSession) return this.embedSession;
+        this.embedSession = await this.loadFirstWorking(resolveEmbedModel(this.ai).urls, '下载识别模型');
+        return this.embedSession;
+    }
+
+    // 每张脸：5 点对齐成 112×112 → 识别向量 → 与本地人脸库比余弦
+    async runRecognize(px, payload) {
+        const session = await this.ensureFace();
+        const embed = await this.ensureEmbed();
+        const { px: mpx, scale } = this.normalizeForModel(px);
+        this.progress('识别中');
+        const r = await detectFaces(session, mpx, { confThreshold: toNum(this.ai?.faceConfidence || 0.6, 0.6), topK: toInt(payload.topK || 30, 30) });
+        const gallery = payload.gallery || [];
+        const threshold = toNum(this.ai?.faceMatchThreshold ?? 0.4, 0.4);
+        const faces = [];
+        for (const f of r.faces) {
+            const out = { ...rescaleFace(f, 1 / scale), name: null, sim: null };
+            try {
+                const aligned = hasLandmarks(f) ? alignFace(mpx, f.landmarks) : alignByBox(mpx, f);
+                const vector = await embedFace(embed, aligned, { std: 127.5 });
+                const m = matchGallery(vector, gallery, threshold);
+                if (m.best) out.sim = +m.best.sim.toFixed(3);
+                if (m.match) out.name = m.match.name;
+            } catch (e) { out.error = String(e && e.message || e).slice(0, 80); }
+            faces.push(out);
+        }
+        return {
+            faces,
+            count: faces.length,
+            named: faces.filter((f) => f.name).length,
+            gallery: gallery.length,
+            threshold,
+            backend: r.backend,
+            overlay: faces.map((f) => ({ type: 'box', ...faceBoxToOverlay(f), label: f.name || (f.sim != null ? '陌生 ' + Math.round(f.sim * 100) + '%' : '人脸') })),
+        };
+    }
+
+    async runFaceRegister(px, payload) {
+        const session = await this.ensureFace();
+        const embed = await this.ensureEmbed();
+        const { px: mpx, scale } = this.normalizeForModel(px);
+        this.progress('提取人脸特征');
+        const r = await detectFaces(session, mpx, { confThreshold: toNum(this.ai?.faceConfidence || 0.6, 0.6), topK: 30 });
+        if (!r.faces.length) throw new Error('这张图里没检出人脸，换一张正脸清晰点的');
+        const f = r.faces.slice().sort((a, b) => b.width * b.height - a.width * a.height)[0];
+        const aligned = hasLandmarks(f) ? alignFace(mpx, f.landmarks) : alignByBox(mpx, f);
+        const vector = await embedFace(embed, aligned, { std: 127.5 });
+        return {
+            dim: vector.length,
+            vector: packVector(vector),
+            box: rescaleFace(f, 1 / scale),
+            faces: r.faces.length,
+            aligned: payload.wantAligned ? { width: aligned.width, height: aligned.height, data: Array.from(aligned.data) } : undefined,
+        };
     }
 
     async runSr(px, payload) {
@@ -232,7 +334,7 @@ export class AiEngine {
         if (!this.vision) this.vision = new VisionRunner({ tf: this.tf, device: this.device, dtype: this.ai?.depthDtype || preset.dtype, vendorBase: this.vendorBase, progress: (p) => this.progress('下载深度模型', p?.loaded, p?.total, p?.url) });
         const { px: mpx } = this.normalizeForModel(px);
         this.progress('深度推理');
-        const r = await this.vision.depth(mpx, { model: preset.model, colormap: payload.colormap || 'viridis' });
+        const r = await this.vision.depth(mpx, { model: modelIdFor(this.ai, preset), colormap: payload.colormap || 'viridis' });
         return { image: pxFromGray(r.color), depthGray: r.gray, model: preset.model };
     }
 
@@ -242,6 +344,7 @@ export class AiEngine {
         if (!keep.includes('sr')) this.sr = null;
         if (!keep.includes('vision')) this.vision = null;
         if (!keep.includes('face')) this.faceSession = null;
+        if (!keep.includes('embed')) this.embedSession = null;
         this.onEvent('unload', { keep });
         return { ok: true };
     }

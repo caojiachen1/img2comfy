@@ -22,3 +22,6 @@ test/hf_probe.mjs
 test/hf_search.mjs
 
 .DS_Store
+
+# ModelScope 镜像搬运的中间产物（大文件，绝不入库）
+ms-mirror/

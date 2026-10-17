@@ -3,12 +3,13 @@
 import { S, toast, markDirty, save } from './options.mjs';
 import { DEFAULT_SETTINGS, migrateSettings, TOOL_GROUPS } from '../common/registry.js';
 import { uid, formatBytes, escapeHtml as _esc } from '../common/util.js';
+import { friendlyText } from '../common/ext-state.js';
 import { STEPS } from '../common/steps.js';
 import { CONTEXT_API_DOC, BUILTIN_SCRIPTS, BUILTIN_LINKS } from '../common/builtin-scripts.js';
 import { VLM_PRESETS, resolveVlm } from '../common/ai/vlm.js';
 import { SAM_PRESETS, resolveSam } from '../common/ai/sam.js';
 import { SR_PRESETS, resolveSr } from '../common/ai/sr.js';
-import { FACE_MODEL_PRESETS } from '../common/ai/face.js';
+import { FACE_MODEL_PRESETS, FACE_EMBED_PRESETS, resolveFaceModel, resolveEmbedModel, unpackVector, cosineSim } from '../common/ai/face.js';
 import { TAG_PRESETS, DEPTH_PRESETS } from '../common/ai/vision.js';
 
 const $ = (s, r = document) => (r || document).querySelector(s);
@@ -246,6 +247,167 @@ function presetRow(label, presets, current, onChange, extraNote) {
     return { wrap, sel, model, info };
 }
 
+// ---------------------------------------------------------------- 模型逐个下载
+// 每个模型一行，可单独下载；下载进度只写在这里和控制台，不再挤到工具栏按钮旁边。
+const MODEL_KINDS = [
+    { kind: 'vlm', label: '多模态 · 看图说话/提问', pick: (ai) => resolveVlm(ai) },
+    { kind: 'sam', label: 'SAM · 点选抠图', pick: (ai) => resolveSam(ai) },
+    { kind: 'face', label: '人脸检测', pick: (ai) => resolveFaceModel(ai) },
+    { kind: 'embed', label: '人脸识别（认出是谁）', pick: (ai) => resolveEmbedModel(ai) },
+    { kind: 'sr', label: 'AI 超分', pick: (ai) => resolveSr(ai) },
+    { kind: 'tags', label: '标签 / 分类', pick: (ai) => ({ model: (TAG_PRESETS.find((p) => p.id === (ai.tagsPreset || 'clip-zero-shot')) || TAG_PRESETS[0]).model }) },
+    { kind: 'depth', label: '深度图', pick: (ai) => ({ model: (DEPTH_PRESETS.find((p) => p.id === (ai.depthPreset || 'depth-anything-small')) || DEPTH_PRESETS[0]).model }) },
+];
+
+function needleOf(id) {
+    let t = String(id || '');
+    const proto = t.indexOf('://');
+    if (proto >= 0) { const slash = t.indexOf('/', proto + 3); t = slash >= 0 ? t.slice(slash + 1) : ''; }
+    const res = t.indexOf('/resolve/');
+    if (res >= 0) t = t.slice(0, res);
+    return t;
+}
+
+function cachedBytes(entries, needle) {
+    if (!needle) return 0;
+    const tail = needle.split('/').pop();
+    let b = 0;
+    for (const e of entries || []) {
+        const u = String(e.model || e.url || '');
+        if (u.includes(needle) || (tail && u.includes(tail))) b += e.bytes || 0;
+    }
+    return b;
+}
+
+let modelProgBound = false;
+function bindModelProgress() {
+    if (modelProgBound) return;
+    modelProgBound = true;
+    chrome.runtime.onMessage.addListener((m) => {
+        if (m?.action === 'mtbHostEvent' && m.type === 'modelProgress') {
+            console.log('[mtb] 模型下载', m.warmFor || m.kind || '', m.text || (m.loaded + '/' + m.total));
+            const row = m.warmFor && document.querySelector('#modelList .m[data-kind="' + m.warmFor + '"]');
+            if (!row) return false;
+            const pct = m.total ? Math.round((m.loaded / m.total) * 100) : 0;
+            const bar = row.querySelector('.mbar i');
+            if (bar) bar.style.width = Math.max(3, pct) + '%';
+            const st = row.querySelector('.st');
+            if (st && m.total) st.textContent = '下载中 ' + fmtMB(m.loaded) + ' / ' + fmtMB(m.total);
+        }
+        return false;
+    });
+}
+
+async function refreshModelCache(ai) {
+    try {
+        const r = await hostCall('ai', { task: 'cacheSummary', ai }, 30000);
+        const entries = (r.entries || r.result?.entries || []);
+        for (const row of $$('#modelList .m')) {
+            const k = MODEL_KINDS.find((x) => x.kind === row.dataset.kind);
+            if (!k) continue;
+            const picked = k.pick(ai) || {};
+            const bytes = cachedBytes(entries, needleOf(picked.model || picked.url));
+            const st = row.querySelector('.st');
+            if (st) st.textContent = bytes > 0 ? '已缓存 ' + fmtMB(bytes) : '未下载';
+            const bar = row.querySelector('.mbar i');
+            if (bar && bytes > 0) bar.style.width = '100%';
+        }
+    } catch (e) { /* 宿主没起来就不刷，别把面板写坏 */ }
+}
+
+function renderModelDownloads(S_) {
+    const box = $('#modelList');
+    if (!box) return;
+    const ai = S_.settings.ai;
+    box.innerHTML = MODEL_KINDS.map((k) => {
+        const picked = k.pick(ai) || {};
+        const id = picked.model || picked.url || '(未填)';
+        return `<div class="m" data-kind="${k.kind}">
+          <div><span class="nm">${esc(k.label)}</span> <code class="mid" title="${esc(id)}">${esc(id)}</code></div>
+          <div><span class="st">查询中…</span><button class="mini dl">下载</button></div>
+          <div class="mbar"><i></i></div>
+        </div>`;
+    }).join('');
+    bindModelProgress();
+    for (const row of $$('#modelList .m')) {
+        const kind = row.dataset.kind;
+        row.querySelector('.dl').onclick = async () => {
+            const st = row.querySelector('.st'), bar = row.querySelector('.mbar i');
+            st.textContent = '连接宿主…';
+            bar.style.width = '2%';
+            try {
+                const r = await hostCall('ai', { task: 'warm', kind, ai, confirmBudget: true }, 30 * 60 * 1000);
+                const res = r.result || r;
+                if (res.ok) { st.textContent = (res.ran ? '已下载并加载 ' : '已下载（试跑提示见控制台）') + Math.round((res.ms || 0) / 1000) + 's'; bar.style.width = '100%'; }
+                else { st.textContent = '下载失败: ' + friendlyText(res.warn || r.error || '').slice(0, 120); }
+                if (res.warn) console.warn('[mtb] 模型预热', kind, res.warn);
+            } catch (e) { st.textContent = '失败: ' + (e.message || e); }
+        };
+    }
+    refreshModelCache(ai);
+}
+
+function renderFaceGallery(S_) {
+    const box = $('#faceGallery');
+    if (!box) return;
+    const ai = S_.settings.ai;
+    const gallery = Array.isArray(S_.settings.faceGallery) ? S_.settings.faceGallery : [];
+    const threshold = Number(ai.faceMatchThreshold ?? 0.4);
+    box.innerHTML = '';
+
+    const tip = document.createElement('p');
+    tip.className = 'note';
+    tip.textContent = gallery.length
+        ? `本地存了 ${gallery.length} 张人脸特征（只存 512 维向量，不存图、不上传）。「认出是谁」时与这里比对。`
+        : '还没有登记过人脸。在网页图片上点工具栏的「登记人脸」，起个名字存进这里；之后「认出是谁」会把名字标在框上。';
+    box.appendChild(tip);
+
+    const thr = document.createElement('label');
+    thr.className = 'gthr';
+    thr.innerHTML = `判定阈值 <input type="number" min="0.05" max="0.95" step="0.05" value="${threshold}"> <span class="hint">相似度高于此值才算同一个人（同人约 0.7+，不同人约 0.1）</span>`;
+    const inp = thr.querySelector('input');
+    inp.onchange = () => { ai.faceMatchThreshold = Math.max(0.05, Math.min(0.95, Number(inp.value) || 0.4)); markDirty(); renderFaceGallery(S_); };
+    box.appendChild(thr);
+
+    if (!gallery.length) return;
+    const list = document.createElement('div');
+    list.className = 'faces';
+    for (const f of gallery) {
+        const row = document.createElement('div');
+        row.className = 'f';
+        row.innerHTML = `<span class="nm">${esc(f.name || '(未命名)')}</span><span class="hint">${f.dim || '?'} 维 · ${new Date(f.createdAt || 0).toLocaleString()}</span>`;
+        const del = document.createElement('button');
+        del.className = 'mini';
+        del.textContent = '删除';
+        del.onclick = () => {
+            S_.settings.faceGallery = gallery.filter((x) => x.id !== f.id);
+            markDirty();
+            renderFaceGallery(S_);
+        };
+        row.appendChild(del);
+        list.appendChild(row);
+    }
+    box.appendChild(list);
+
+    // 库里两个人太像，识别时就会互相认错，提前提示
+    let worst = null;
+    for (let i = 0; i < gallery.length; i++) {
+        for (let j = i + 1; j < gallery.length; j++) {
+            const a = gallery[i], b = gallery[j];
+            if (!a.vector || !b.vector) continue;
+            let sim = 0;
+            try { sim = cosineSim(unpackVector(a.vector), unpackVector(b.vector)); } catch (e) { continue; }
+            if (!worst || sim > worst.sim) worst = { a: a.name, b: b.name, sim };
+        }
+    }
+    if (worst && worst.sim >= threshold) {
+        const warn = document.createElement('p');
+        warn.className = 'note';
+        warn.textContent = `「${worst.a}」与「${worst.b}」的相似度 ${worst.sim.toFixed(2)} 已达判定阈值，识别时容易互相认错：要么把阈值调高，要么删掉其中一个。`;
+        box.appendChild(warn);
+    }
+}
+
 function renderModelSelects(S_) {
     const box = $('#modelSelects');
     if (!box) return;
@@ -261,9 +423,15 @@ function renderModelSelects(S_) {
     sam.model.value = ai.samModel || ''; sam.model.onchange = () => { ai.samModel = sam.model.value.trim() || undefined; markDirty(); };
     box.appendChild(sam.wrap);
 
-    const face = presetRow('人脸检测模型', FACE_MODEL_PRESETS, ai.faceModel || 'yunet-2023mar', (v) => { ai.faceModel = v; markDirty(); });
-    face.model.value = ai.faceModelUrl || ''; face.model.onchange = () => { ai.faceModelUrl = face.model.value.trim() || undefined; markDirty(); };
+    const face = presetRow('人脸检测模型', FACE_MODEL_PRESETS, ai.faceModel || 'scrfd-500m', (v) => { ai.faceModel = v; markDirty(); });
+    face.model.placeholder = '覆盖 ONNX URL';
+    face.model.value = ai.faceModelUrl || ''; face.model.onchange = () => { ai.faceModelUrl = face.model.value.trim() || ''; markDirty(); };
     box.appendChild(face.wrap);
+
+    const emb = presetRow('人脸识别模型（认出是谁）', FACE_EMBED_PRESETS, ai.faceEmbedModel || 'w600k-mbf', (v) => { ai.faceEmbedModel = v; markDirty(); });
+    emb.model.placeholder = '覆盖 ONNX URL';
+    emb.model.value = ai.faceEmbedUrl || ''; emb.model.onchange = () => { ai.faceEmbedUrl = emb.model.value.trim() || ''; markDirty(); };
+    box.appendChild(emb.wrap);
 
     const sr = presetRow('超分模型', SR_PRESETS, ai.srPreset || 'swin2sr-x2', (v) => { ai.srPreset = v; markDirty(); });
     sr.model.value = ai.srModelUrl || ''; sr.model.onchange = () => { ai.srModelUrl = sr.model.value.trim() || undefined; markDirty(); };
@@ -274,6 +442,8 @@ function renderModelSelects(S_) {
 
     const dep = presetRow('深度模型', DEPTH_PRESETS, ai.depthPreset || 'depth-anything-small', (v) => { ai.depthPreset = v; markDirty(); });
     box.appendChild(dep.wrap);
+    renderModelDownloads(S_);
+    renderFaceGallery(S_);
 
     const summary = document.createElement('p');
     summary.className = 'note';
@@ -350,7 +520,8 @@ async function doSelfTest() {
         else if (r?.ok === false) throw new Error(r.error + (r.stack ? '\n' + r.stack : ''));
         else { out.textContent = '识别结果:\n' + (r.text || JSON.stringify(r).slice(0, 400)); hint.textContent = `完成 (${Math.round((r.ms || 0) / 100) / 10}s)`; }
     } catch (e) {
-        out.textContent = '自检失败: ' + e.message + '\n\n' + (e.stack || '').split('\n').slice(0, 4).join('\n');
+        const friendly = friendlyText(e && e.message);
+        out.textContent = '自检失败: ' + friendly + (friendly === String(e && e.message) ? '\n\n' + (e.stack || '').split('\n').slice(0, 4).join('\n') : '');
         hint.textContent = '失败';
     } finally {
         chrome.runtime.onMessage.removeListener(onMsg);

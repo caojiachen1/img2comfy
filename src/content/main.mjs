@@ -1,7 +1,7 @@
 // 内容脚本入口：设置同步、媒体探测、工具栏显隐、宿主连接、键盘与全屏处理。
 
 import { makeProber } from './probe.js';
-import { ensureRoot, mountToolbar, Toolbar, ResultPanel, Picker, drawBoxes, drawMask, toast, attachToActiveLayer } from './ui.mjs';
+import { ensureRoot, mountToolbar, Toolbar, ResultPanel, LogDock, Picker, drawBoxes, drawMask, toast, attachToActiveLayer } from './ui.mjs';
 import { Runner, copyText } from './runner.mjs';
 import { buildToolbar, migrateSettings, DEFAULT_SETTINGS } from '../common/registry.js';
 import { ensureBuiltins } from '../common/builtin-scripts.js';
@@ -22,6 +22,7 @@ const STATE = {
 let prober = null;
 let toolbar = null;
 let panel = null;
+let logDock = null;
 let runner = null;
 let boxLayer = null;
 let maskLayer = null;
@@ -44,7 +45,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     STATE.settings = s;
     if (toolbar) toolbar.applySettings(s);
     if (runner) runner.ctx.settings = s;
-    refreshItems();
+    refresh(true);
 });
 
 // ComfyUI 自己的页面不注入工具栏，否则会干扰画布拖拽。
@@ -74,17 +75,19 @@ async function boot(s) {
     boxLayer = mounted.box;
 
     panel = new ResultPanel({ shadow, settings: s });
+    logDock = new LogDock({ shadow });
     STATE.picker = new Picker({ shadow, settings: s });
     toolbar = new Toolbar({ wrap, settings: s, onDragEnd: persistToolbarOffsets });
+    toolbar.onLog = (text) => logDock.status(text);
     toolbar.onOpenSettings = () => chrome.runtime.sendMessage({ action: 'openOptions' });
-    toolbar.itemBuilder = (s, mediaType) => buildToolbar(s, mediaType || 'image', STATE.media && STATE.media.kind === 'bg');
+    toolbar.itemBuilder = (s, mediaType) => buildToolbar(s, mediaType || 'image');
 
     runner = new Runner({
         settings: s,
         media: null,
         toolbar, panel, shadow,
         maskLayer, boxLayer,
-        setStatus: (text) => { toolbar.setStatus?.('__progress', text); if (!text) toolbar.resetBusy(); },
+        setStatus: (text) => { logDock.status(text); if (!text) toolbar.resetBusy(); },
         ensureHost: ensureHost,
         hostSend: (req) => new Promise((resolve) => {
             try {
@@ -95,6 +98,12 @@ async function boot(s) {
             } catch (e) { resolve({ ok: false, error: e.message }); }
         }),
         runToolById: (id, over) => { const it = toolbar.items.find((x) => x.id === id) || { id, label: id, action: { type: 'comfy', autoQueue: /run/.test(id) } }; runner.dispatch(it); },
+        patchSettings: async (patch) => {
+            const res = await chrome.runtime.sendMessage({ action: 'patchSettings', patch });
+            // storage.onChanged 会把新设置推回来，这里只兜住失败
+            if (res && res.ok === false) console.warn('[mtb] 写设置失败', res.error);
+            return res;
+        },
         replaceTemp: (spec) => { STATE.temp = spec; },
         startPick: (text, onPoint, onDone) => {
             STATE.pickActive = true;
@@ -121,7 +130,7 @@ async function boot(s) {
 
     setInterval(() => { if (!STATE.pickActive) refresh(false); }, 300);
 
-    window.__mtb = { state: STATE, toolbar, runner, panel, refresh: () => refresh(true) };
+    window.__mtb = { state: STATE, toolbar, runner, panel, logDock, refresh: () => refresh(true) };
     refresh(true);
 }
 
@@ -159,7 +168,7 @@ function wrapVisible() { return toolbar?.wrap.classList.contains('show'); }
 
 function probeAndShow(x, y) {
     const found = prober.findMediaAtPoint(x, y);
-    if (!found) { if (STATE.settings.toolbar.showOn !== 'always') hideToolbar(); return; }
+    if (!found) { if (STATE.settings.toolbar.showOn !== 'always' && !overToolbarChrome(x, y)) hideToolbar(); return; }
     STATE.media = { ...found, kind: found.kind };
     STATE.temp = null;
     showForMedia();
@@ -168,11 +177,36 @@ function probeAndShow(x, y) {
 function refresh(force) {
     if (!prober || !STATE.settings) return;
     const found = prober.findMediaAtPoint(STATE.lastMouse.x, STATE.lastMouse.y);
-    if (!found) { if (STATE.settings.toolbar.showOn !== 'always') hideToolbar(); return; }
+    if (!found) {
+        if (STATE.settings.toolbar.showOn !== 'always' && !overToolbarChrome(STATE.lastMouse.x, STATE.lastMouse.y)) hideToolbar();
+        return;
+    }
     const same = STATE.media && STATE.media.el === found.el && STATE.media.src === found.src;
     STATE.media = found;
+    if (!same) clearOverlays();   // 换了一张图，别把上一张的人脸框/掩码跟到新元素上
     if (!same && !force) showForMedia();
     else toolbar.position(found.displayRect);
+}
+
+// 指针已经移到工具栏本身（含它展开的 ▾ 菜单、结果面板、取点提示）上时不能收栏：
+// 宽工具栏配小图时，栏子会夹到视口右边、超出图片范围，用户伸手点右边的按钮
+// 途中指针离开图片，栏子就会在手底下消失。
+function overToolbarChrome(x, y) {
+    if (!toolbar?.wrap?.classList.contains('show')) return false;
+    const root = document.getElementById('mtb-root');
+    const shadow = root && root.shadowRoot;
+    const els = [toolbar.wrap, toolbar.menu];
+    if (shadow) for (const sel of ['.panel.show', '.prompt.show', '.pickhint.show', '.logbox.show']) {
+        const el = shadow.querySelector(sel);
+        if (el) els.push(el);
+    }
+    for (const el of els) {
+        if (!el) continue;
+        if (el === toolbar.menu && !el.classList.contains('show')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return true;
+    }
+    return false;
 }
 
 function showForMedia() {
@@ -180,7 +214,7 @@ function showForMedia() {
     if (!m) return hideToolbar();
     runner.ctx.media = m;
     const mediaType = m.kind === 'video' ? 'video' : 'image';
-    const items = buildToolbar(STATE.settings, mediaType, m.kind === 'bg');
+    const items = buildToolbar(STATE.settings, mediaType);
     if (!items.length) return hideToolbar();
     const sig = items.map((i) => i.id + (i.label || '') + (i.icon || '') + (i.collapsed ? 'v' : '-')).join('|') + '#' + STATE.settings.toolbar.theme + STATE.settings.toolbar.iconMode + STATE.settings.toolbar.layout + STATE.settings.toolbar.scale + STATE.settings.toolbar.maxTools;
     if (toolbar.signature !== sig) { toolbar.signature = sig; toolbar.render(items, mediaType); }
@@ -188,6 +222,12 @@ function showForMedia() {
     positionLayers();
     attachToActiveLayer(document.getElementById('mtb-root'));
     if (STATE.temp) { /* 上一步结果作为当前源 */ }
+}
+
+function clearOverlays() {
+    if (boxLayer) drawBoxes(boxLayer, [], null);
+    if (maskLayer) drawMask(maskLayer, [], null);
+    if (runner?.ctx) runner.ctx.facesKey = null;
 }
 
 function hideToolbar() {
@@ -241,8 +281,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return false;
     }
     if (msg?.action === 'mtbHostEvent' && msg.target === 'ext') return false;   // 发给扩展页的那份，内容脚本别接
+    if (msg?.action === 'mtbHostEvent' && msg.type === 'modelProgress') {
+        const line = msg.text || `${msg.loaded || 0}/${msg.total || 0}`;
+        // 模型下载进度：控制台 + 设置页 + 右侧日志窗，不碰工具栏
+        console.log('[mtb] 模型下载', msg.warmFor || msg.kind || '', line);
+        logDock.status(`下载 ${msg.warmFor || msg.kind || '模型'} ${line}`);
+        return false;
+    }
     if (msg?.action === 'mtbHostEvent' && msg.type === 'aiProgress') {
-        toolbar.setStatus?.('__progress', msg.text || '');
+        logDock.status(msg.text || '');
         return false;
     }
     if (msg?.action === 'mtbHostEvent' && msg.type === 'toolUi') {

@@ -8,6 +8,15 @@ __M["src/content/probe.js"] = (function(){
 function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
     const opts = { minImgSize };
 
+    // 尺寸闸门：细长横幅（只有一边够长）和「显示很小、源很大」的缩略图都算真媒体，
+    // 只有两边都小、源也小的图标才排除。
+    function sizeOk(w, h, nw, nh) {
+        const min = opts.minImgSize;
+        if (w >= min && h >= min) return true;
+        if (Math.min(w, h) >= min * 0.4 && w * h >= min * min) return true;
+        return nw >= min && nh >= min && Math.min(w, h) >= 64;
+    }
+
     function isBlurred(el) {
         let node = el, hops = 0;
         while (node && hops < 6) {
@@ -37,10 +46,13 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
         if (!el || !el.getBoundingClientRect) return false;
         const rect = el.getBoundingClientRect();
         if (rect.width < opts.minImgSize || rect.height < opts.minImgSize) return false;
+        // 可见性必须问在 IMG/VIDEO 之前：x.com 的照片是「background-image 容器 + 里面一张
+        // opacity:0 的占位 img」，占位 img 一旦被认成不透明遮挡物，它爹（真正那张图）
+        // 就会被剔除，整站再也弹不出工具栏。
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return false;
         if (el.tagName === 'VIDEO') return true;
         if (el.tagName === 'IMG' && (el.currentSrc || el.src)) return true;
-        const cs = getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return false;
         const bgc = cs.backgroundColor;
         if (bgc && bgc !== 'transparent') {
             const m = bgc.match(/rgba?\(([^)]+)\)/);
@@ -55,14 +67,29 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
         return false;
     }
 
+    const BG_URL_RE = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")]*))\s*\)/g;
+    const GRADIENT_RE = /(?:repeating-)?(?:linear|radial|conic)-gradient\((?:[^()]|\([^()]*\))*\)/gi;
+
     function bgImageOf(el) {
         const bgi = getComputedStyle(el).backgroundImage;
         if (!bgi || bgi === 'none') return null;
-        let m = bgi.match(/url\(["']?(https?:[^"')]+)["']?\)/);
-        if (m) return m[1];
-        // SVG data URI 背景里也可能藏着 raster data URL
-        m = bgi.match(/url\(["']?(data:image\/[a-z+]+;base64,[^"')]+)["']?\)/i);
-        return m ? m[1] : null;
+        // 渐变里嵌的 url() 不是这个容器的图片来源，整段去掉再找
+        const stripped = bgi.replace(GRADIENT_RE, '');
+        BG_URL_RE.lastIndex = 0;
+        let m;
+        while ((m = BG_URL_RE.exec(stripped))) {
+            const raw = (m[1] || m[2] || m[3] || '').trim();
+            if (!raw || raw === 'none' || /^blob:/i.test(raw)) continue;
+            if (/^data:/i.test(raw)) {
+                // 内联 SVG 当背景的多半是图标/纹理，交给宿主解码也拿不到有意义的内容
+                if (/^data:image\/(?:svg\+xml|vnd\.adobe\.illustrator\+svg)/i.test(raw)) continue;
+                if (/^data:image\//i.test(raw)) return raw;
+                continue;
+            }
+            if (/^https?:/i.test(raw)) return raw;
+            try { return new URL(raw, document.baseURI).href; } catch (e) { /* 解不了的相对路径就跳过 */ }
+        }
+        return null;
     }
 
     function findMediaAtPoint(x, y) {
@@ -76,7 +103,9 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
             if (!isElementVisible(media)) return;
             const rect = media.getBoundingClientRect();
             if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return;
-            if (rect.width < opts.minImgSize || rect.height < opts.minImgSize) return;
+            const nw = media.naturalWidth || media.videoWidth || 0;
+            const nh = media.naturalHeight || media.videoHeight || 0;
+            if (!sizeOk(rect.width, rect.height, nw, nh)) return;
             const src = media.currentSrc || media.src || media.getAttribute('src') || '';
             if (media.tagName === 'IMG' && !src) return;
             seen.add(media);
@@ -85,8 +114,7 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
                 kind: media.tagName === 'VIDEO' ? 2 : 0,
                 blurred: isBlurred(media),
                 dataSrc: media.tagName === 'IMG' && src.startsWith('data:'),
-                area: rect.width * rect.height,
-                natural: { width: media.naturalWidth || media.videoWidth || 0, height: media.naturalHeight || media.videoHeight || 0 },
+                natural: { width: nw, height: nh },
             });
         };
 
@@ -98,13 +126,12 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
             if (el.querySelectorAll) for (const m of el.querySelectorAll('img, video')) consider(m, stackIdx, hostEl);
             if (el instanceof HTMLElement) {
                 const rect = el.getBoundingClientRect();
-                if (rect.width >= opts.minImgSize && rect.height >= opts.minImgSize && isElementVisible(el)) {
+                if (sizeOk(rect.width, rect.height, 0, 0) && isElementVisible(el)) {
                     const url = bgImageOf(el);
                     if (url) {
                         candidates.push({
                             el, srcOverride: url, stackIdx, hostEl, kind: 1,
                             blurred: isBlurred(el), dataSrc: false,
-                            area: rect.width * rect.height,
                             natural: { width: rect.width, height: rect.height },
                         });
                     }
@@ -136,16 +163,24 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
         const visible = candidates.filter((c) => {
             const ref = c.hostEl || c.el;
             for (let j = 0; j < c.stackIdx; j++) {
-                if (occluderFlags[j] && !(stack[j].contains && stack[j].contains(ref))) return false;
+                if (!occluderFlags[j]) continue;
+                const occ = stack[j];
+                // 父遮挡物：它画在自己内部任何媒体之下；子遮挡物：父容器自己的 background-image
+                // 永远画在所有后代之下，两种都不能拿来剔除候选。
+                if (occ === ref || (occ.contains && (occ.contains(ref) || ref.contains(occ)))) continue;
+                // 命中栈下标只反映「谁在栈里出现得早」：pointer-events:none 的图片根本不在栈里，
+                // 它带着父容器的下标，于是压在它下面的那张图会被当成遮挡物把它剔除
+                if (paintAbove(ref, occ) >= 0) return false;
             }
             return true;
         });
-        if (!visible.length) return null;
+        // 一个都不剩时不再直接放弃（那是「有图却什么都不弹」的主要来源）：退回候选里最上层那个。
+        // 真有媒体盖在它上面时，那个媒体本身就在候选里，pickTopLayer 照样会选中它。
+        const pool = visible.length ? visible : candidates;
 
-        for (const c of visible) if (c.kind === undefined) c.kind = 0;
-        visible.sort((a, b) => (a.blurred - b.blurred) || (a.dataSrc - b.dataSrc) || (a.kind - b.kind)
-            || (a.stackIdx - b.stackIdx) || (b.area - a.area));
-        const best = visibleCandidatesPick(visible);
+        for (const c of pool) if (c.kind === undefined) c.kind = 0;
+        // 只认最上层那张：被压在下面的图片永远不该弹出工具栏
+        const best = pickTopLayer(pool);
         return {
             el: best.el,
             src: best.srcOverride,
@@ -155,12 +190,87 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
         };
     }
 
-    // 同分时偏向"真正在显示的那张"：视频 > 真实 <img> > 背景图容器
-    function visibleCandidatesPick(list) {
-        return list[0];
+    // CSS 绘制顺序近似比较：负数 = a 画在 b 上面（a 更靠近用户）。
+    // 只能靠 elementsFromPoint 下标判定图层深浅是不够的——命中栈会漏掉
+    // pointer-events:none 的元素，而兄弟层叠里「父容器在栈里的位置」比它自己的图片更深，
+    // 用父容器下标当图片下标就会把下面那张图当成最上层。
+    function paintAbove(a, b) {
+        if (!a || !b || a === b) return 0;
+        try {
+            if (a.contains(b)) return 1;                    // b 是 a 的后代，画在 a 之上
+            if (b.contains(a)) return -1;
+            const ca = treePath(a), cb = treePath(b);
+            let i = 0;
+            while (i < ca.length && i < cb.length && ca[i] === cb[i]) i++;
+            if (i === 0) return 0;                          // 不在同一棵树（跨 iframe），无从比较
+            const ka = layerKey(ca[i]), kb = layerKey(cb[i]);
+            if (ka.group !== kb.group) return kb.group - ka.group;
+            if (ka.z !== kb.z) return kb.z - ka.z;
+            return kb.order - ka.order;
+        } catch (e) { return 0; }
     }
 
-    return { findMediaAtPoint, isElementVisible, isOpaqueOccluder, isBlurred, opts };
+    function treePath(el) {
+        const chain = [];
+        let node = el;
+        while (node && node.nodeType === 1) {
+            chain.unshift(node);
+            if (node.parentElement) { node = node.parentElement; continue; }
+            const root = node.getRootNode ? node.getRootNode() : null;
+            node = root && root.host ? root.host : null;
+        }
+        return chain;
+    }
+
+    // 在同一父容器下，谁更靠上：定位元素（含负 z）> 常规流；同组内比 z-index，再比 DOM 顺序
+    function layerKey(el) {
+        const cs = getComputedStyle(el);
+        const z = parseInt(cs.zIndex, 10);
+        const positioned = cs.position !== 'static';
+        const zi = Number.isFinite(z) ? z : 0;
+        return {
+            group: positioned ? (zi < 0 ? -1 : 1) : 0,
+            z: positioned ? zi : 0,
+            order: orderInParent(el),
+        };
+    }
+
+    function orderInParent(el) {
+        const p = el.parentElement;
+        if (!p) return 0;
+        const kids = p.children;
+        for (let i = 0; i < kids.length; i++) if (kids[i] === el) return i;
+        return 0;
+    }
+
+    function overlaps(a, b) {
+        const x = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+        const y = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+        const inter = x * y;
+        const smaller = Math.min(a.width * a.height, b.width * b.height);
+        return smaller > 0 ? inter / smaller : 0;
+    }
+
+    // 同层重叠时（惰性加载常见：模糊缩略图盖在清晰原图上面）仍取清晰的那张
+    function upgradeFromPlaceholder(top, list) {
+        if (!top.blurred && !top.dataSrc) return top;
+        const rect = top.el.getBoundingClientRect();
+        let better = null;
+        for (const c of list) {
+            if (c === top || c.blurred || c.dataSrc) continue;
+            if (overlaps(rect, c.el.getBoundingClientRect()) < 0.8) continue;
+            if (!better || paintAbove(c.el, better.el) < 0) better = c;
+        }
+        return better || top;
+    }
+
+    function pickTopLayer(list) {
+        let top = list[0];
+        for (const c of list) if (paintAbove(c.el, top.el) < 0) top = c;
+        return upgradeFromPlaceholder(top, list);
+    }
+
+    return { findMediaAtPoint, isElementVisible, isOpaqueOccluder, isBlurred, paintAbove, opts };
 }
 
 function frameOffsetInTop() {
@@ -229,6 +339,23 @@ button.btn.text .ic { display: none; }
 .menu .mi.busy { opacity: .5; pointer-events: none; }
 .menu .hint { padding: 4px 9px 6px; font-size: 10.5px; color: #8ea3b5; }
 .btn.more .caret { opacity: .65; margin-left: 2px; }
+.logbox {
+  position: fixed; z-index: 2147483647; right: 16px; top: 96px; display: none; pointer-events: auto;
+  width: min(340px, 40vw); max-height: 46vh; overflow: hidden; color: #dbe6ef;
+  background: rgba(18,20,24,.93); border: 1px solid rgba(255,255,255,.16); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.4); backdrop-filter: blur(14px) saturate(160%); -webkit-backdrop-filter: blur(14px) saturate(160%);
+}
+.logbox.show { display: block; }
+.logbox header { display:flex; align-items:center; gap:8px; padding:6px 9px; border-bottom:1px solid rgba(255,255,255,.12); font-weight:600; font-size:12px; cursor:move; }
+.logbox header .sp { flex:1; }
+.logbox header .act { cursor:pointer; opacity:.7; font-size:11.5px; } .logbox header .act:hover { opacity:1; }
+.logbox .lines { max-height: calc(46vh - 32px); overflow:auto; padding:6px 9px 8px; font-family: ui-monospace,Consolas,monospace; font-size:11.5px; line-height:1.5; }
+.logbox .ln { display:flex; gap:7px; white-space:pre-wrap; word-break:break-word; }
+.logbox .ln .ts { color:#6f8497; flex:none; }
+.logbox .ln.err { color:#ff8a8a; }
+.logbox .ln.busy { color:#9fe8c8; }
+.logbox .ln.busy .tx::before { content:''; display:inline-block; width:7px; height:7px; margin-right:6px; border-radius:50%; background:#5ce08a; animation: mtb-pulse 1s infinite ease-in-out; }
+@keyframes mtb-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
 .panel {
   position: absolute; z-index: 2147483647; display: none; max-width: min(560px, 92vw); pointer-events: auto;
   background: rgba(22,22,24,.94); backdrop-filter: blur(16px) saturate(180%); -webkit-backdrop-filter: blur(16px) saturate(180%);
@@ -420,7 +547,7 @@ class Toolbar {
     placeMenu() {
         const m = this.menu;
         if (!m) return;
-        m.style.bottom = 'auto'; m.style.top = 'auto';
+        m.style.bottom = 'auto'; m.style.top = 'auto'; m.style.left = 'auto'; m.style.right = 'auto';
         const r = this.wrap.getBoundingClientRect();
         const h = m.offsetHeight;
         if (r.bottom + h + 10 > window.innerHeight && r.top - h - 10 > 0) {
@@ -430,6 +557,14 @@ class Toolbar {
             m.style.top = '100%';
             m.style.marginTop = '4px';
         }
+        // 菜单跟着「⋯ 更多」按钮走：CSS 里 .menu 是 left:0，会贴到整条工具栏的左端，
+        // 按钮在右边时看着就像"菜单飘在别处"。这里按按钮对齐，并保证不出视口。
+        const btn = (this.moreBtn ? this.moreBtn.getBoundingClientRect() : r);
+        const w = m.offsetWidth || 168;
+        let x = btn.left;
+        if (x + w > window.innerWidth - 4) x = btn.right - w;
+        x = Math.max(4, Math.min(x, window.innerWidth - w - 4));
+        m.style.left = `${Math.round(x - r.left)}px`;
     }
 
     openMenu() {
@@ -461,22 +596,16 @@ class Toolbar {
 
     setBusy(id, text) {
         const b = this.buttons.get(id);
-        if (!b) return;
-        if (text) {
-            const span = b.querySelector('.tx');
-            if (span) span.textContent = text;
-        }
+        if (!b) { this.onLog?.(text || ''); return; }   // '__progress' 这类没有对应按钮的，交给日志窗
         b.disabled = !!text;
         b.classList.toggle('busy', !!text);
+        if (text) this.onLog?.(text);
     }
 
     resetBusy() {
-        for (const [id, b] of this.buttons) {
+        for (const b of this.buttons.values()) {
             b.disabled = false;
             b.classList.remove('busy');
-            const it = this.items.find((x) => x.id === id);
-            const span = b.querySelector('.tx');
-            if (it && span) span.textContent = it.label;
         }
     }
 
@@ -487,29 +616,33 @@ class Toolbar {
             e.preventDefault(); e.stopPropagation();
             this.dragging = true;
             this.wrap.classList.add('dragging');
-            start = { x: e.clientX, y: e.clientY, rect: this.anchorRect ? { ...this.anchorRect } : null, off: { ...this.settings.toolbar } };
+            // 拖动基准是「当前已经落位的屏幕坐标」：位置是锁住的，不能从媒体矩形重算
+            start = {
+                x: e.clientX, y: e.clientY,
+                placed: { ...(this.placed || this.lock || { x: 0, y: 0 }) },
+                off: { ...this.settings.toolbar },
+            };
             window.addEventListener('pointermove', onMove, true);
             window.addEventListener('pointerup', onUp, true);
         };
         const onMove = (e) => {
             if (!this.dragging) return;
             e.preventDefault();
-            const dx = e.clientX - start.x, dy = e.clientY - start.y;
-            this.dragOffset = { x: start.off.offsetX + dx, y: start.off.offsetY + dy };
-            this.position(this.currentTarget, true);
+            this.lock = { x: start.placed.x + (e.clientX - start.x), y: start.placed.y + (e.clientY - start.y) };
+            this.placeAt(this.lock.x, this.lock.y);
         };
-        const onUp = async (e) => {
+        const onUp = async () => {
             if (!this.dragging) return;
             this.dragging = false;
             this.wrap.classList.remove('dragging');
             window.removeEventListener('pointermove', onMove, true);
             window.removeEventListener('pointerup', onUp, true);
-            const dx = e.clientX - start.x, dy = e.clientY - start.y;
-            // 拖过之后不再叠加原偏移：offsetX/Y 直接改成新的净值
-            const next = { ...this.settings.toolbar, offsetX: start.off.offsetX + dx, offsetY: start.off.offsetY + dy, anchorOffset: 'custom', dragMoved: true };
+            // 只累加「真正移动了多少」：拖到屏幕边上被夹住时不会把偏移量算多，
+            // 下次重新锚定（换图后首次弹出）才能落在拖过的位置
+            const dx = Math.round((this.placed?.x ?? 0) - start.placed.x);
+            const dy = Math.round((this.placed?.y ?? 0) - start.placed.y);
+            const next = { ...this.settings.toolbar, offsetX: Math.round((start.off.offsetX || 0) + dx), offsetY: Math.round((start.off.offsetY || 0) + dy), anchorOffset: 'custom', dragMoved: true };
             this.settings.toolbar = next;
-            this.dragOffset = null;
-            this.position(this.currentTarget, true);
             await this.onDragEnd?.(next);
         };
         this.wrap.addEventListener('pointerdown', onDown, true);
@@ -525,15 +658,10 @@ class Toolbar {
         window.addEventListener('blur', abort, true);
     }
 
-    // rect = 媒体元素在视口中的矩形；anchor+offset 决定贴靠
-    position(rect, force = false) {
-        if (!rect) return;
-        this.currentTarget = rect;
+    // 按 anchor+offset 算出工具栏应落在的屏幕坐标（视口系）
+    anchorPoint(rect) {
         const t = this.settings.toolbar;
-        const off = this.dragOffset || { x: t.offsetX, y: t.offsetY };
         const w = this.wrap.offsetWidth, h = this.wrap.offsetHeight;
-        const inFullscreen = document.fullscreenElement && document.fullscreenElement.contains(this.wrap.getRootNode().host);
-        const sx = inFullscreen ? 0 : window.scrollX, sy = inFullscreen ? 0 : window.scrollY;
         const m = 8;
         let top, left;
         switch (t.anchor) {
@@ -547,22 +675,39 @@ class Toolbar {
             case 'right-edge': top = rect.top + (rect.height - h) / 2; left = rect.right - w - m; break;
             default: top = rect.top + m; left = rect.right - w - m;
         }
-        // 视口夹住：媒体部分滚出屏幕时工具栏仍可用。
-        // 对「最终屏幕坐标」夹取，下界固定为 4——按钮多到比视口还宽时 vw-w-4 本身就是负数，
-        // 不兜底就会把整条推出屏幕，表现为「点了没反应」。拖拽中也照夹：拖到边上停住比拖丢更合理，
-        // 而且 pointerup 丢一次（在窗口外松手）就会让 dragging 卡在 true，旧写法从此不再夹住。
-        left += off.x; top += off.y;
-        let fx = left + sx, fy = top + sy;
-        fx = Math.max(4, Math.min(fx, Math.max(4, window.innerWidth - w - 4)));
-        fy = Math.max(4, Math.min(fy, Math.max(4, window.innerHeight - h - 4)));
-        this.wrap.style.left = fx + 'px';
-        this.wrap.style.top = fy + 'px';
-        this.maskBoxRect = rect;
+        return { x: left + (t.offsetX || 0), y: top + (t.offsetY || 0) };
+    }
+
+    // 视口夹取：按钮多到比视口还宽时 Math.max 兜底的下界优先，保证不会被推出屏幕
+    placeAt(x, y) {
+        const host = this.wrap.getRootNode().host;
+        const hr = host ? host.getBoundingClientRect() : null;
+        const ox = hr ? hr.left : 0, oy = hr ? hr.top : 0;
+        const vw = hr && hr.width ? hr.width : window.innerWidth;
+        const vh = hr && hr.height ? hr.height : window.innerHeight;
+        const w = this.wrap.offsetWidth, h = this.wrap.offsetHeight;
+        // 宿主是铺满视口的 fixed 层，绝对定位的坐标原点就是宿主左上角。
+        // 旧写法额外加 window.scrollX/Y，页面一滚动工具栏就跟着往下飞
+        const cx = Math.max(4, Math.min(x - ox, Math.max(4, vw - w - 4)));
+        const cy = Math.max(4, Math.min(y - oy, Math.max(4, vh - h - 4)));
+        this.wrap.style.left = cx + 'px';
+        this.wrap.style.top = cy + 'px';
+        this.placed = { x: cx + ox, y: cy + oy };
+    }
+
+    // rect = 媒体元素在视口中的矩形。位置只在「首次显示」与「手动拖拽」时定，
+    // 已经显示着的时候换图、滚动、探测刷新都不会让它自己挪。
+    position(rect, force = false) {
+        if (!rect) return;
+        this.currentTarget = rect;
+        if (force || !this.lock) this.lock = this.anchorPoint(rect);
+        this.placeAt(this.lock.x, this.lock.y);
         if (this.menuOpen) this.placeMenu();
         if (this.onMoved) this.onMoved(rect);
     }
 
     show(rect) {
+        if (!this.wrap.classList.contains('show')) this.lock = null;   // 重新弹出才按当前媒体锚定
         this.wrap.classList.add('show');
         this.position(rect);
     }
@@ -570,11 +715,14 @@ class Toolbar {
     hide() {
         this.wrap.classList.remove('show');
         this.currentTarget = null;
+        this.lock = null;
+        this.placed = null;
     }
 }
 
 class ResultPanel {
     constructor({ shadow, settings }) {
+        this.shadow = shadow;
         this.el = document.createElement('div');
         this.el.className = 'panel';
         this.el.innerHTML = `<header><span class="tt">结果</span><span class="sp"></span><span class="act export">导出</span><span class="act copy">复制</span><span class="close">✕</span></header><div class="body"></div>`;
@@ -630,8 +778,11 @@ class ResultPanel {
 
     place(near) {
         const w = this.el.offsetWidth, h = this.el.offsetHeight;
-        let left = near ? near.right + 12 : innerWidth - w - 20;
-        if (left + w > innerWidth - 8 || !near) left = Math.max(8, innerWidth - w - 16);
+        // 日志窗占着右边，结果面板别再压上去
+        const dock = this.shadow && this.shadow.querySelector('.logbox.show');
+        const reserve = dock ? dock.offsetWidth + 28 : 16;
+        let left = near ? near.right + 12 : innerWidth - w - reserve;
+        if (left + w > innerWidth - reserve || !near) left = Math.max(8, innerWidth - w - reserve);
         const top = near ? Math.max(8, Math.min(near.top, innerHeight - h - 12)) : 40;
         this.el.style.left = left + 'px';
         this.el.style.top = top + 'px';
@@ -640,6 +791,107 @@ class ResultPanel {
 
     hide() { this.el.classList.remove('show'); }
     get visible() { return this.el.classList.contains('show'); }
+}
+
+/** 右侧悬浮日志窗：推理中/取帧/失败这类过程信息都进这里，不再挤在工具栏按钮旁边 */
+class LogDock {
+    constructor({ shadow, autoHideMs = 10000, max = 120 }) {
+        const el = document.createElement('div');
+        el.className = 'logbox';
+        el.innerHTML = `<header><span class="tt">日志</span><span class="sp"></span><span class="act clear">清空</span><span class="act close">✕</span></header><div class="lines"></div>`;
+        shadow.appendChild(el);
+        this.el = el;
+        this.lines = el.querySelector('.lines');
+        this.max = max;
+        this.autoHideMs = autoHideMs;
+        this.busy = null;
+        this.timer = 0;
+        el.querySelector('.close').onclick = () => this.hide();
+        el.querySelector('.clear').onclick = () => { this.lines.innerHTML = ''; this.busy = null; this.hide(); };
+        this.bindDrag();
+        el.__log = (text, err) => this.line(text, { err });
+    }
+
+    line(text, { err = false } = {}) {
+        const t = String(text || '').trim();
+        if (!t) return null;
+        this.endBusy();
+        const row = this.append(t, { err });
+        this.open();
+        this.scheduleHide();
+        return row;
+    }
+
+    // 进行中的任务原地刷同一行（准备模型… → 推理中…），传空串表示结束并补上耗时
+    status(text) {
+        const t = String(text || '').trim();
+        if (!t) { this.endBusy(); this.scheduleHide(); return; }
+        const err = /失败|错误|异常/.test(t);
+        if (this.busy) {
+            if (this.busy.text !== t) { this.busy.text = t; this.busy.row.querySelector('.tx').textContent = t; }
+            this.busy.row.classList.toggle('err', err);
+            clearTimeout(this.timer);
+        } else {
+            this.busy = { row: this.append(t, { err, busy: true }), text: t, at: Date.now() };
+            this.open();
+        }
+        return this;
+    }
+
+    endBusy() {
+        if (!this.busy) return;
+        const { row, at, text } = this.busy;
+        const secs = (Date.now() - at) / 1000;
+        row.querySelector('.tx').textContent = `${text} · ${secs >= 1 ? secs.toFixed(1) + 's' : Math.round(secs * 1000) + 'ms'}`;
+        row.classList.remove('busy');
+        this.busy = null;
+    }
+
+    append(text, { err = false, busy = false } = {}) {
+        const row = document.createElement('div');
+        row.className = 'ln' + (err ? ' err' : '') + (busy ? ' busy' : '');
+        const ts = document.createElement('span');
+        ts.className = 'ts';
+        ts.textContent = clockTime();
+        const tx = document.createElement('span');
+        tx.className = 'tx';
+        tx.textContent = text;
+        row.append(ts, tx);
+        this.lines.appendChild(row);
+        while (this.lines.children.length > this.max) this.lines.removeChild(this.lines.firstChild);
+        this.lines.scrollTop = this.lines.scrollHeight;
+        return row;
+    }
+
+    open() { this.el.classList.add('show'); }
+    hide() { this.endBusy(); this.el.classList.remove('show'); }
+    get visible() { return this.el.classList.contains('show'); }
+    scheduleHide() { clearTimeout(this.timer); this.timer = setTimeout(() => this.hide(), this.autoHideMs); }
+
+    bindDrag() {
+        const header = this.el.querySelector('header');
+        let s = null;
+        header.addEventListener('pointerdown', (e) => {
+            if (e.target.closest('.act')) return;
+            const r = this.el.getBoundingClientRect();
+            s = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };
+            header.setPointerCapture(e.pointerId);
+        });
+        header.addEventListener('pointermove', (e) => {
+            if (!s) return;
+            this.el.style.right = 'auto';
+            this.el.style.left = Math.max(4, s.left + e.clientX - s.x) + 'px';
+            this.el.style.top = Math.max(4, Math.min(s.top + e.clientY - s.y, innerHeight - 40)) + 'px';
+        });
+        header.addEventListener('pointerup', () => { s = null; });
+        header.addEventListener('pointercancel', () => { s = null; });
+    }
+}
+
+function clockTime() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 class Picker {
@@ -753,6 +1005,8 @@ function toast(shadow, text, ms = 2600, isError = false) {
     el.classList.add('show');
     clearTimeout(el._t);
     el._t = setTimeout(() => el.classList.remove('show'), ms);
+    const dock = shadow.querySelector('.logbox');
+    if (dock && dock.__log) dock.__log(text, !!isError);   // 一闪而过的提示在日志窗里留个底
     return el;
 }
 
@@ -791,7 +1045,7 @@ function escapeHtml(s) {
 }
 
 
-return { "CSS": (typeof CSS === 'undefined' ? undefined : CSS), "ensureRoot": (typeof ensureRoot === 'undefined' ? undefined : ensureRoot), "mountToolbar": (typeof mountToolbar === 'undefined' ? undefined : mountToolbar), "Toolbar": (typeof Toolbar === 'undefined' ? undefined : Toolbar), "ResultPanel": (typeof ResultPanel === 'undefined' ? undefined : ResultPanel), "Picker": (typeof Picker === 'undefined' ? undefined : Picker), "drawBoxes": (typeof drawBoxes === 'undefined' ? undefined : drawBoxes), "drawMask": (typeof drawMask === 'undefined' ? undefined : drawMask), "toast": (typeof toast === 'undefined' ? undefined : toast), "promptFor": (typeof promptFor === 'undefined' ? undefined : promptFor), "attachToActiveLayer": (typeof attachToActiveLayer === 'undefined' ? undefined : attachToActiveLayer), "escapeHtml": (typeof escapeHtml === 'undefined' ? undefined : escapeHtml), "ROOT_ID": (typeof ROOT_ID === 'undefined' ? undefined : ROOT_ID) };
+return { "CSS": (typeof CSS === 'undefined' ? undefined : CSS), "ensureRoot": (typeof ensureRoot === 'undefined' ? undefined : ensureRoot), "mountToolbar": (typeof mountToolbar === 'undefined' ? undefined : mountToolbar), "Toolbar": (typeof Toolbar === 'undefined' ? undefined : Toolbar), "ResultPanel": (typeof ResultPanel === 'undefined' ? undefined : ResultPanel), "LogDock": (typeof LogDock === 'undefined' ? undefined : LogDock), "Picker": (typeof Picker === 'undefined' ? undefined : Picker), "drawBoxes": (typeof drawBoxes === 'undefined' ? undefined : drawBoxes), "drawMask": (typeof drawMask === 'undefined' ? undefined : drawMask), "toast": (typeof toast === 'undefined' ? undefined : toast), "promptFor": (typeof promptFor === 'undefined' ? undefined : promptFor), "attachToActiveLayer": (typeof attachToActiveLayer === 'undefined' ? undefined : attachToActiveLayer), "escapeHtml": (typeof escapeHtml === 'undefined' ? undefined : escapeHtml), "ROOT_ID": (typeof ROOT_ID === 'undefined' ? undefined : ROOT_ID) };
 })();
 __M["src/common/util.js"] = (function(){
 // 通用小工具：无 chrome / DOM 依赖，content、host、options 共用。
@@ -1421,7 +1675,12 @@ __M["src/common/ext-state.js"] = (function(){
 
 const DEAD_TEXT = '扩展已更新，本页面里的旧脚本已失效：请按 F5 刷新页面后再用';
 
+// wasm 是 32 位地址空间，浏览器里一份 1.3GB 的权重 + 激活值就会越界，
+// ORT 崩出来只有一句 "memory access out of bounds"，用户看不出跟模型大小有关。
+const MEMORY_TEXT = '浏览器内存放不下这个模型（wasm 只有 4GB 地址空间）：请在设置里换小一点的模型/档位（如 SmolVLM2-256M/500M、q4），或改用 WebGPU 设备';
+
 const DEAD_RE = /Extension context invalidated|extension context has been invalidated|Could not establish connection\. Receiving end does not exist|message port closed|Cannot access a chrome-extension: URL of a different extension/i;
+const MEMORY_RE = /memory access out of bounds|out of memory|Aborted\(|RuntimeError: memory|Cannot allocate memory|too many bytes/i;
 
 function extAlive() {
     try { return !!(globalThis.chrome && globalThis.chrome.runtime && globalThis.chrome.runtime.id); } catch (e) { return false; }
@@ -1430,16 +1689,17 @@ function extAlive() {
 /** @returns {{dead:boolean, text:string}} */
 function friendlyError(e) {
     const msg = String((e && e.message) || e || '未知错误');
-    return DEAD_RE.test(msg) ? { dead: true, text: DEAD_TEXT } : { dead: false, text: msg };
+    if (DEAD_RE.test(msg)) return { dead: true, text: DEAD_TEXT };
+    if (MEMORY_RE.test(msg)) return { dead: false, text: MEMORY_TEXT, memory: true };
+    return { dead: false, text: msg };
 }
 
 /** 给「已经拿到手的错误字符串」用（bgSend 返回的是 {ok:false,error}，不是异常） */
 function friendlyText(msg) {
-    const f = friendlyError({ message: String(msg || '') });
-    return f.dead ? DEAD_TEXT : String(msg || '未知错误');
+    return friendlyError({ message: String(msg || '') }).text;
 }
 
-return { "DEAD_TEXT": (typeof DEAD_TEXT === 'undefined' ? undefined : DEAD_TEXT), "extAlive": (typeof extAlive === 'undefined' ? undefined : extAlive), "friendlyError": (typeof friendlyError === 'undefined' ? undefined : friendlyError), "friendlyText": (typeof friendlyText === 'undefined' ? undefined : friendlyText) };
+return { "DEAD_TEXT": (typeof DEAD_TEXT === 'undefined' ? undefined : DEAD_TEXT), "MEMORY_TEXT": (typeof MEMORY_TEXT === 'undefined' ? undefined : MEMORY_TEXT), "extAlive": (typeof extAlive === 'undefined' ? undefined : extAlive), "friendlyError": (typeof friendlyError === 'undefined' ? undefined : friendlyError), "friendlyText": (typeof friendlyText === 'undefined' ? undefined : friendlyText) };
 })();
 __M["src/content/frame.js"] = (function(){
 // 视频取帧：4 级降级链，全部来自旧实现并经测试矩阵验证。
@@ -4450,8 +4710,21 @@ class Runner {
     }
 
     // —— AI ——
+    mediaKey() {
+        const m = this.ctx.media;
+        if (!m) return '';
+        return `${m.kind}|${m.src || (m.el && (m.el.currentSrc || m.el.src)) || ''}|${m.el && m.el.currentTime ? Math.round(m.el.currentTime * 10) : 0}`;
+    }
+
     async runAi(item) {
         const task = item.action.task;
+        // 同一张图上再点一次「人脸识别」就是收起人脸框 —— 不然框会一直糊在图上，得另找「清除」
+        if (task === 'face' && this.ctx.facesKey && this.ctx.facesKey === this.mediaKey() && this.ctx.boxLayer?.__boxes?.length) {
+            drawBoxes(this.ctx.boxLayer, [], null);
+            this.ctx.facesKey = null;
+            toast(this.ctx.shadow, '已收起人脸框（再点一次重新识别）', 1800);
+            return;
+        }
         try {
             this.ctx.setStatus?.('准备模型…');
             if (task === 'ask') {
@@ -4466,8 +4739,9 @@ class Runner {
             }
             if (task === 'samPick') { this.startSamPick(); return; }
             const src = await this.currentSource();
-            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : 'AI 推理中…');
-            const r = await this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, maxNewTokens: item.params?.maxNewTokens });
+            if (task === 'faceRegister') { await this.registerFace(src); return; }
+            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : task === 'recognize' ? '识别中…' : 'AI 推理中…');
+            const r = await this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, gallery: this.s.faceGallery || [], maxNewTokens: item.params?.maxNewTokens });
             this.ctx.setStatus?.('');
             if (r.blocked) {
                 this.ctx.panel.show({
@@ -4483,6 +4757,28 @@ class Runner {
             toast(this.ctx.shadow, errText('AI 失败: ', e), 5200, true);
             console.warn('[mtb] AI 失败', e);
         }
+    }
+
+    // 登记人脸：取图里最大的一张脸 → 提特征 → 起名 → 写进本地人脸库（同名覆盖）
+    async registerFace(src) {
+        const r = await this.sendToHost({ type: 'ai', task: 'faceRegister', ...src, ai: this.s.ai });
+        this.ctx.setStatus?.('');
+        if (r.blocked) {
+            this.ctx.panel.show({ title: '需要确认下载', text: r.blocked.reason, actions: [{ label: '确认登记', run: () => this.sendToHost({ type: 'ai', task: 'faceRegister', ...src, ai: this.s.ai, confirmBudget: true }).then((x) => this.saveFace(x)) }] });
+            return;
+        }
+        await this.saveFace(r);
+    }
+
+    async saveFace(r) {
+        if (!r || !r.vector) { toast(this.ctx.shadow, '没拿到人脸特征', 2600, true); return; }
+        const name = await promptFor(this.ctx.shadow, { title: `给这张脸起个名字（${r.faces > 1 ? '图里有 ' + r.faces + ' 张脸，取最大的' : '已取到人脸'}）`, placeholder: '例如：张三', near: this.ctx.toolbar?.currentTarget });
+        const clean = String(name || '').trim();
+        if (!clean) { toast(this.ctx.shadow, '已取消登记', 1600); return; }
+        const gallery = (this.s.faceGallery || []).filter((g) => g && g.name !== clean);
+        gallery.push({ id: 'f' + Date.now().toString(36), name: clean, vector: r.vector, dim: r.dim, createdAt: Date.now() });
+        await this.ctx.patchSettings?.({ faceGallery: gallery });
+        toast(this.ctx.shadow, `已登记「${clean}」，人脸库 ${gallery.length} 人`, 2600);
     }
 
     async applyAiResult(item, r, src) {
@@ -4512,8 +4808,19 @@ class Runner {
                 const ref = { refWidth: r.sourceWidth || near.width, refHeight: r.sourceHeight || near.height };
                 drawBoxes(this.ctx.boxLayer, boxes.map((b) => ({ ...b, ...ref })), near);
             }
-            if (r.faces) this.ctx.lastFaces = r.faces;
+            if (r.faces) { this.ctx.lastFaces = r.faces; this.ctx.facesKey = this.mediaKey(); }
+            if (r.faces && !r.faces.length) toast(this.ctx.shadow, '这张图没检出人脸（换个角度/光线更强的图试试，或在设置里换检测模型）', 3200, true);
             if (r.masks) this.ctx.lastMasks = r.masks;
+        }
+        if (r.faces && typeof r.named === 'number') {
+            const lines = r.faces.map((f, i) => `#${i + 1} ${f.name ? '「' + f.name + '」' : '陌生'}${f.sim != null ? ' 相似度 ' + Math.round(f.sim * 100) + '%' : ''}`);
+            this.ctx.panel.show({
+                title: `认出是谁 · 匹配 ${r.named}/${r.count}`,
+                text: (r.gallery ? `人脸库 ${r.gallery} 人，判定阈值 ${Math.round(r.threshold * 100)}%` : '人脸库还是空的：先用「登记人脸」把常看到的人存进来') + '\n' + lines.join('\n'),
+                near,
+                actions: [{ label: '复制', run: () => copyText(lines.join('\n')) }],
+            });
+            return;
         }
         if (r.count !== undefined && !r.text) toast(this.ctx.shadow, `${item.label}: ${r.count} 个目标`, 2000);
     }
@@ -4648,7 +4955,7 @@ class Runner {
 function r0(x) { return x; }
 
 function publicSettings(s) {
-    return { comfy: s.comfy, output: s.output, video: s.video, ai: { device: s.ai.device, models: s.ai.models } };
+    return { comfy: s.comfy, output: s.output, video: s.video, ai: { device: s.ai.device, hub: s.ai.hub } };
 }
 
 function fmt(r) {
@@ -4698,11 +5005,11 @@ const ICONS = {
 // 每个工具: action.type = step(像素算子链) | builtin(内容脚本能力) | ai(host 模型) | script(用户脚本) | link(链接模板)
 const TOOLS = [
     // —— 基础操作 ——
-    { id: 'copy-link', group: '基础', label: '复制链接', icon: ICONS.link, media: ['image', 'video', 'bg'], action: { type: 'builtin', fn: 'copyLink' }, hint: '复制图片/视频直链地址（自动去除临时签名参数可选）' },
+    { id: 'copy-link', group: '基础', label: '复制链接', icon: ICONS.link, media: ['image', 'video'], action: { type: 'builtin', fn: 'copyLink' }, hint: '复制图片/视频直链地址（自动去除临时签名参数可选）' },
     { id: 'copy-image', group: '基础', label: '复制图片', icon: ICONS.copy, media: ['image', 'video'], action: { type: 'builtin', fn: 'copyImage' }, hint: '把当前图（或视频当前帧）复制到剪贴板' },
     { id: 'download', group: '基础', label: '下载', icon: ICONS.download, media: ['image', 'video'], action: { type: 'builtin', fn: 'download' }, hint: '下载原图；视频则下载当前帧 PNG' },
-    { id: 'open-src', group: '基础', label: '新标签打开', icon: ICONS.open, media: ['image', 'video', 'bg'], action: { type: 'builtin', fn: 'openSrc' }, hint: '在新标签打开原始直链' },
-    { id: 'info', group: '基础', label: '详细信息', icon: ICONS.info, media: ['image', 'video', 'bg'], action: { type: 'builtin', fn: 'info' }, hint: '显示源地址、尺寸、大小、类型、编解码、时长等' },
+    { id: 'open-src', group: '基础', label: '新标签打开', icon: ICONS.open, media: ['image', 'video'], action: { type: 'builtin', fn: 'openSrc' }, hint: '在新标签打开原始直链' },
+    { id: 'info', group: '基础', label: '详细信息', icon: ICONS.info, media: ['image', 'video'], action: { type: 'builtin', fn: 'info' }, hint: '显示源地址、尺寸、大小、类型、编解码、时长等' },
     { id: 'view-full', group: '基础', label: '原图预览', icon: ICONS.eye, media: ['image'], action: { type: 'builtin', fn: 'viewFull' }, hint: '在页面内浮层查看真实分辨率原图' },
     { id: 'clean-url', group: '基础', label: '复制干净链接', icon: '🧼', media: ['image', 'video'], action: { type: 'builtin', fn: 'cleanLink' }, hint: '去掉签名/尺寸后缀等噪声参数后复制' },
 
@@ -4753,6 +5060,8 @@ const TOOLS = [
     { id: 'ai-sam-auto', group: 'AI', label: '自动分割', icon: '🪄', media: ['image'], ai: 'samauto', action: { type: 'ai', task: 'samAuto' }, needsHost: true },
     { id: 'ai-face', group: 'AI', label: '人脸识别', icon: ICONS.face, media: ['image', 'video'], ai: 'face', action: { type: 'ai', task: 'face' }, needsHost: true },
     { id: 'ai-face-blur', group: 'AI', label: '人脸打码', icon: '🕶', media: ['image', 'video'], ai: 'faceblur', action: { type: 'ai', task: 'faceBlur' }, needsHost: true },
+    { id: 'ai-face-rec', group: 'AI', label: '认出是谁', icon: '🪪', media: ['image', 'video'], ai: 'facerec', action: { type: 'ai', task: 'recognize' }, needsHost: true, hint: 'SCRFD 检测 + 5 点对齐 + 识别向量，与人脸库比对' },
+    { id: 'ai-face-reg', group: 'AI', label: '登记人脸', icon: '📛', media: ['image', 'video'], ai: 'facereg', action: { type: 'ai', task: 'faceRegister' }, needsHost: true, hint: '把图中最大的一张脸存进人脸库并起名字' },
     { id: 'ai-sr', group: 'AI', label: 'AI 超分', icon: '🔍', media: ['image', 'video'], ai: 'sr', action: { type: 'ai', task: 'superResolve' }, needsHost: true, hint: 'swin2SR / ESRGAN ONNX 模型放大' },
     { id: 'ai-depth', group: 'AI', label: '深度图', icon: '🌊', media: ['image'], ai: 'depth', action: { type: 'ai', task: 'depth' }, needsHost: true },
     { id: 'ai-clear', group: 'AI', label: '清除标注', icon: ICONS.x, media: ['image', 'video'], action: { type: 'builtin', fn: 'clearOverlay' } },
@@ -4778,10 +5087,10 @@ const DEFAULT_TOOLS = [
     'copy-link', 'copy-image', 'download', 'open-src', 'info',
     'v-frame', 'v-frame-save', 'v-play', 'v-speed', 'v-loop',
     'v-seek-in', 'v-seek-out', 'v-copy-time', 'v-frames-sheet', 'v-mute', 'v-piP',
-    'ai-describe', 'ai-sam', 'ai-face', 'upscale-lanczos', 'autotrim', 'gear',
+    'ai-describe', 'ai-sam', 'ai-face', 'ai-face-rec', 'ai-face-reg', 'upscale-lanczos', 'autotrim', 'gear',
 ];
 // 视频态本来按钮就多，长尾的默认收进 ▾ 菜单，免得把工具栏撑到屏幕外
-const DEFAULT_COLLAPSED = ['v-seek-in', 'v-seek-out', 'v-copy-time', 'v-frames-sheet', 'v-mute', 'v-piP'];
+const DEFAULT_COLLAPSED = ['v-seek-in', 'v-seek-out', 'v-copy-time', 'v-frames-sheet', 'v-mute', 'v-piP', 'ai-face-reg'];
 
 // 默认工具栏：图片/视频各自显示哪些（顺序即显示顺序）
 function defaultToolbarState() {
@@ -4840,27 +5149,30 @@ const DEFAULT_SETTINGS = {
         enabled: true,
         device: 'auto',              // auto | webgpu | wasm
         dtype: 'q4',                 // q4 | q4f16 | int8 | fp16
-        hub: 'hf-mirror',            // hf-mirror | huggingface | jsdelivr | custom
+        hub: 'modelscope',           // modelscope | hf-mirror | huggingface | jsdelivr | custom
         hubCustom: '',
         maxDim: 1024,
         keepAwake: true,
         downloadBudgetMB: 4096,
         autoUnloadAfter: 0,
-        models: {
-            vlm: 'onnx-community/Qwen3-VL-2B-Instruct-ONNX',
-            sam: 'Xenova/slimsam-77-uniform',
-            face: 'yunet-2023mar',
-            sr: 'Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr',
-            tags: 'Xenova/vit-gpt2-image-captioning',
-            depth: 'Xenova/depth-anything-small-hf',
-            ocr: 'sentence-transformers/all-MiniLM-L6-v2',
-        },
+        vlmPreset: 'qwen3vl-2b',
+        samPreset: 'slimsam',
+        srPreset: 'swin2sr-x2',
+        tagsPreset: 'clip-zero-shot',
+        depthPreset: 'depth-anything-small',
         vlmPrompt: '请用中文详细描述这张图片的主体、场景、风格、构图与可见文字。',
         askPrompt: '{question}',
         samPointsPerTarget: 1,
+        faceModel: 'scrfd-500m',
+        faceModelUrl: '',
+        faceEmbedModel: 'w600k-mbf',
+        faceEmbedUrl: '',
         faceConfidence: 0.6,
+        faceMatchThreshold: 0.4,
         srTile: 256,
     },
+    // 人脸库：{id,name,vector(base64 Float32),dim,createdAt}，识别只在本地比对
+    faceGallery: [],
     comfy: {
         server: 'http://127.0.0.1:8188',
         mode: 'frontend',            // frontend | api
@@ -4872,6 +5184,7 @@ const DEFAULT_SETTINGS = {
         profiles: {},
         activeProfileId: 'default',
     },
+    collapseSeed: null,            // 折叠默认值的补种标记（老设置里 collapsed 全是 false）
     tools: defaultToolbarState(),
     customScripts: [],               // {id,name,label,icon,media,code,enabled,params}
     linkTools: [],                   // {id,name,label,icon,media,template,method,openTab,headers,enabled}
@@ -4891,14 +5204,6 @@ const BUILTIN_VARS = [
 
 function findTool(id) {
     return TOOLS.find((t) => t.id === id) || null;
-}
-
-function toolsForMedia(mediaType, isBg) {
-    return TOOLS.filter((t) => {
-        if (isBg && !t.media.includes('bg')) return false;
-        if (!isBg && !t.media.includes(mediaType)) return false;
-        return true;
-    });
 }
 
 function migrateSettings(raw) {
@@ -4923,7 +5228,19 @@ function migrateSettings(raw) {
         }
         return s;
     }
-    return mergeDeep(s, raw);
+    const out = mergeDeep(s, raw);
+    // 老设置的 tools 里每个 id 都写死了 collapsed:false，会把新默认（视频长尾折叠）整个盖掉，
+    // 于是升级后「还是所有按钮平铺」。只对用户没动过的按钮补上新默认，动过的保持原样。
+    if (!out.collapseSeed) {
+        for (const t of TOOLS) {
+            const st = out.tools && out.tools[t.id];
+            if (!st) continue;
+            const untouched = st.label == null && st.icon == null && st.order == null && st.params == null;
+            if (untouched && DEFAULT_COLLAPSED.includes(t.id)) st.collapsed = true;
+        }
+        out.collapseSeed = 2;
+    }
+    return out;
 }
 
 function mergeDeep(base, patch) {
@@ -4939,14 +5256,13 @@ function mergeDeep(base, patch) {
 }
 
 // 工具栏实际渲染清单：内置(启用) + 自定义脚本(启用) + 链接工具(启用)
-function buildToolbar(settings, mediaType, isBg) {
+function buildToolbar(settings, mediaType) {
     const items = [];
     const state = settings.tools || {};
     for (const t of TOOLS) {
         const st = state[t.id] || { enabled: false };
         if (!st.enabled) continue;
         if (!t.media.includes(mediaType)) continue;
-        if (isBg && !t.media.includes('bg')) continue;
         items.push({
             id: t.id,
             label: st.label || t.label,
@@ -4979,7 +5295,7 @@ function buildToolbar(settings, mediaType, isBg) {
     return items;
 }
 
-return { "ICONS": (typeof ICONS === 'undefined' ? undefined : ICONS), "TOOLS": (typeof TOOLS === 'undefined' ? undefined : TOOLS), "TOOL_GROUPS": (typeof TOOL_GROUPS === 'undefined' ? undefined : TOOL_GROUPS), "DEFAULT_TOOLS": (typeof DEFAULT_TOOLS === 'undefined' ? undefined : DEFAULT_TOOLS), "DEFAULT_COLLAPSED": (typeof DEFAULT_COLLAPSED === 'undefined' ? undefined : DEFAULT_COLLAPSED), "defaultToolbarState": (typeof defaultToolbarState === 'undefined' ? undefined : defaultToolbarState), "DEFAULT_SETTINGS": (typeof DEFAULT_SETTINGS === 'undefined' ? undefined : DEFAULT_SETTINGS), "BUILTIN_VARS": (typeof BUILTIN_VARS === 'undefined' ? undefined : BUILTIN_VARS), "findTool": (typeof findTool === 'undefined' ? undefined : findTool), "toolsForMedia": (typeof toolsForMedia === 'undefined' ? undefined : toolsForMedia), "migrateSettings": (typeof migrateSettings === 'undefined' ? undefined : migrateSettings), "mergeDeep": (typeof mergeDeep === 'undefined' ? undefined : mergeDeep), "buildToolbar": (typeof buildToolbar === 'undefined' ? undefined : buildToolbar) };
+return { "ICONS": (typeof ICONS === 'undefined' ? undefined : ICONS), "TOOLS": (typeof TOOLS === 'undefined' ? undefined : TOOLS), "TOOL_GROUPS": (typeof TOOL_GROUPS === 'undefined' ? undefined : TOOL_GROUPS), "DEFAULT_TOOLS": (typeof DEFAULT_TOOLS === 'undefined' ? undefined : DEFAULT_TOOLS), "DEFAULT_COLLAPSED": (typeof DEFAULT_COLLAPSED === 'undefined' ? undefined : DEFAULT_COLLAPSED), "defaultToolbarState": (typeof defaultToolbarState === 'undefined' ? undefined : defaultToolbarState), "DEFAULT_SETTINGS": (typeof DEFAULT_SETTINGS === 'undefined' ? undefined : DEFAULT_SETTINGS), "BUILTIN_VARS": (typeof BUILTIN_VARS === 'undefined' ? undefined : BUILTIN_VARS), "findTool": (typeof findTool === 'undefined' ? undefined : findTool), "migrateSettings": (typeof migrateSettings === 'undefined' ? undefined : migrateSettings), "mergeDeep": (typeof mergeDeep === 'undefined' ? undefined : mergeDeep), "buildToolbar": (typeof buildToolbar === 'undefined' ? undefined : buildToolbar) };
 })();
 __M["src/common/builtin-scripts.js"] = (function(){
 // 内置自定义功能示例：把"发送到 ComfyUI"与"发送并立即执行"实现为用户可编辑的脚本，
@@ -4989,7 +5305,7 @@ const CONTEXT_API_DOC = `可用 API（ctx.*）：
   ctx.media            {kind:'image'|'video'|'bg', src, width, height, displayWidth, displayHeight, time, duration, mime, isFrame, via}
   ctx.dataUrl          当前媒体的 dataURL（视频=当前帧）；ctx.width/ctx.height 同义
   ctx.params           该按钮在设置里配置的参数对象
-  ctx.settings         {comfy, output, video, ai:{device,models}}
+  ctx.settings         {comfy, output, video, ai:{device,hub}}
   ctx.lastFaces/ctx.lastMasks  上一次 AI 识别结果
   ctx.fetch({url, method, headers, body, form, json, as:'text'|'json'|'dataUrl'})   走后台，绕过 CORS 与防盗链
   ctx.host({chain:[{op,params}], format, quality})      跑像素算子链，返回 {dataUrl,width,height,reports}
@@ -5122,7 +5438,7 @@ __M["src/content/main.mjs"] = (function(){
 // 内容脚本入口：设置同步、媒体探测、工具栏显隐、宿主连接、键盘与全屏处理。
 
 const { makeProber } = __M["src/content/probe.js"];
-const { ensureRoot, mountToolbar, Toolbar, ResultPanel, Picker, drawBoxes, drawMask, toast, attachToActiveLayer } = __M["src/content/ui.mjs"];
+const { ensureRoot, mountToolbar, Toolbar, ResultPanel, LogDock, Picker, drawBoxes, drawMask, toast, attachToActiveLayer } = __M["src/content/ui.mjs"];
 const { Runner, copyText } = __M["src/content/runner.mjs"];
 const { buildToolbar, migrateSettings, DEFAULT_SETTINGS } = __M["src/common/registry.js"];
 const { ensureBuiltins } = __M["src/common/builtin-scripts.js"];
@@ -5143,6 +5459,7 @@ const STATE = {
 let prober = null;
 let toolbar = null;
 let panel = null;
+let logDock = null;
 let runner = null;
 let boxLayer = null;
 let maskLayer = null;
@@ -5165,7 +5482,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     STATE.settings = s;
     if (toolbar) toolbar.applySettings(s);
     if (runner) runner.ctx.settings = s;
-    refreshItems();
+    refresh(true);
 });
 
 // ComfyUI 自己的页面不注入工具栏，否则会干扰画布拖拽。
@@ -5195,17 +5512,19 @@ async function boot(s) {
     boxLayer = mounted.box;
 
     panel = new ResultPanel({ shadow, settings: s });
+    logDock = new LogDock({ shadow });
     STATE.picker = new Picker({ shadow, settings: s });
     toolbar = new Toolbar({ wrap, settings: s, onDragEnd: persistToolbarOffsets });
+    toolbar.onLog = (text) => logDock.status(text);
     toolbar.onOpenSettings = () => chrome.runtime.sendMessage({ action: 'openOptions' });
-    toolbar.itemBuilder = (s, mediaType) => buildToolbar(s, mediaType || 'image', STATE.media && STATE.media.kind === 'bg');
+    toolbar.itemBuilder = (s, mediaType) => buildToolbar(s, mediaType || 'image');
 
     runner = new Runner({
         settings: s,
         media: null,
         toolbar, panel, shadow,
         maskLayer, boxLayer,
-        setStatus: (text) => { toolbar.setStatus?.('__progress', text); if (!text) toolbar.resetBusy(); },
+        setStatus: (text) => { logDock.status(text); if (!text) toolbar.resetBusy(); },
         ensureHost: ensureHost,
         hostSend: (req) => new Promise((resolve) => {
             try {
@@ -5216,6 +5535,12 @@ async function boot(s) {
             } catch (e) { resolve({ ok: false, error: e.message }); }
         }),
         runToolById: (id, over) => { const it = toolbar.items.find((x) => x.id === id) || { id, label: id, action: { type: 'comfy', autoQueue: /run/.test(id) } }; runner.dispatch(it); },
+        patchSettings: async (patch) => {
+            const res = await chrome.runtime.sendMessage({ action: 'patchSettings', patch });
+            // storage.onChanged 会把新设置推回来，这里只兜住失败
+            if (res && res.ok === false) console.warn('[mtb] 写设置失败', res.error);
+            return res;
+        },
         replaceTemp: (spec) => { STATE.temp = spec; },
         startPick: (text, onPoint, onDone) => {
             STATE.pickActive = true;
@@ -5242,7 +5567,7 @@ async function boot(s) {
 
     setInterval(() => { if (!STATE.pickActive) refresh(false); }, 300);
 
-    window.__mtb = { state: STATE, toolbar, runner, panel, refresh: () => refresh(true) };
+    window.__mtb = { state: STATE, toolbar, runner, panel, logDock, refresh: () => refresh(true) };
     refresh(true);
 }
 
@@ -5280,7 +5605,7 @@ function wrapVisible() { return toolbar?.wrap.classList.contains('show'); }
 
 function probeAndShow(x, y) {
     const found = prober.findMediaAtPoint(x, y);
-    if (!found) { if (STATE.settings.toolbar.showOn !== 'always') hideToolbar(); return; }
+    if (!found) { if (STATE.settings.toolbar.showOn !== 'always' && !overToolbarChrome(x, y)) hideToolbar(); return; }
     STATE.media = { ...found, kind: found.kind };
     STATE.temp = null;
     showForMedia();
@@ -5289,11 +5614,36 @@ function probeAndShow(x, y) {
 function refresh(force) {
     if (!prober || !STATE.settings) return;
     const found = prober.findMediaAtPoint(STATE.lastMouse.x, STATE.lastMouse.y);
-    if (!found) { if (STATE.settings.toolbar.showOn !== 'always') hideToolbar(); return; }
+    if (!found) {
+        if (STATE.settings.toolbar.showOn !== 'always' && !overToolbarChrome(STATE.lastMouse.x, STATE.lastMouse.y)) hideToolbar();
+        return;
+    }
     const same = STATE.media && STATE.media.el === found.el && STATE.media.src === found.src;
     STATE.media = found;
+    if (!same) clearOverlays();   // 换了一张图，别把上一张的人脸框/掩码跟到新元素上
     if (!same && !force) showForMedia();
     else toolbar.position(found.displayRect);
+}
+
+// 指针已经移到工具栏本身（含它展开的 ▾ 菜单、结果面板、取点提示）上时不能收栏：
+// 宽工具栏配小图时，栏子会夹到视口右边、超出图片范围，用户伸手点右边的按钮
+// 途中指针离开图片，栏子就会在手底下消失。
+function overToolbarChrome(x, y) {
+    if (!toolbar?.wrap?.classList.contains('show')) return false;
+    const root = document.getElementById('mtb-root');
+    const shadow = root && root.shadowRoot;
+    const els = [toolbar.wrap, toolbar.menu];
+    if (shadow) for (const sel of ['.panel.show', '.prompt.show', '.pickhint.show', '.logbox.show']) {
+        const el = shadow.querySelector(sel);
+        if (el) els.push(el);
+    }
+    for (const el of els) {
+        if (!el) continue;
+        if (el === toolbar.menu && !el.classList.contains('show')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return true;
+    }
+    return false;
 }
 
 function showForMedia() {
@@ -5301,7 +5651,7 @@ function showForMedia() {
     if (!m) return hideToolbar();
     runner.ctx.media = m;
     const mediaType = m.kind === 'video' ? 'video' : 'image';
-    const items = buildToolbar(STATE.settings, mediaType, m.kind === 'bg');
+    const items = buildToolbar(STATE.settings, mediaType);
     if (!items.length) return hideToolbar();
     const sig = items.map((i) => i.id + (i.label || '') + (i.icon || '') + (i.collapsed ? 'v' : '-')).join('|') + '#' + STATE.settings.toolbar.theme + STATE.settings.toolbar.iconMode + STATE.settings.toolbar.layout + STATE.settings.toolbar.scale + STATE.settings.toolbar.maxTools;
     if (toolbar.signature !== sig) { toolbar.signature = sig; toolbar.render(items, mediaType); }
@@ -5309,6 +5659,12 @@ function showForMedia() {
     positionLayers();
     attachToActiveLayer(document.getElementById('mtb-root'));
     if (STATE.temp) { /* 上一步结果作为当前源 */ }
+}
+
+function clearOverlays() {
+    if (boxLayer) drawBoxes(boxLayer, [], null);
+    if (maskLayer) drawMask(maskLayer, [], null);
+    if (runner?.ctx) runner.ctx.facesKey = null;
 }
 
 function hideToolbar() {
@@ -5362,8 +5718,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return false;
     }
     if (msg?.action === 'mtbHostEvent' && msg.target === 'ext') return false;   // 发给扩展页的那份，内容脚本别接
+    if (msg?.action === 'mtbHostEvent' && msg.type === 'modelProgress') {
+        const line = msg.text || `${msg.loaded || 0}/${msg.total || 0}`;
+        // 模型下载进度：控制台 + 设置页 + 右侧日志窗，不碰工具栏
+        console.log('[mtb] 模型下载', msg.warmFor || msg.kind || '', line);
+        logDock.status(`下载 ${msg.warmFor || msg.kind || '模型'} ${line}`);
+        return false;
+    }
     if (msg?.action === 'mtbHostEvent' && msg.type === 'aiProgress') {
-        toolbar.setStatus?.('__progress', msg.text || '');
+        logDock.status(msg.text || '');
         return false;
     }
     if (msg?.action === 'mtbHostEvent' && msg.type === 'toolUi') {

@@ -26,10 +26,12 @@ export const RUNTIME_FILES = [
     },
 ];
 
-// 多个镜像轮询：jsDelivr 主、fastly/gcore 是它的国内友好别名，unpkg 兜底
+// 多个镜像轮询：首选自己镜像到 ModelScope 的 wasm（本机实测 9~15 MB/s，且 resolve 直链带 CORS），
+// jsDelivr 及其国内友好别名次之，unpkg 兜底。版本对不上时 ModelScope 上就是 404，会自动落到下一个源。
 export function cdnUrls(name) {
     const p = `onnxruntime-web@${ORT_VERSION}/dist/${name}`;
     return [
+        `https://www.modelscope.cn/models/cjc1887415157/mtb-ort-wasm/resolve/master/${name}`,
         `https://cdn.jsdelivr.net/npm/${p}`,
         `https://fastly.jsdelivr.net/npm/${p}`,
         `https://gcore.jsdelivr.net/npm/${p}`,
@@ -190,6 +192,15 @@ export async function applyWasmPaths(ort, vendorBase) {
         throw err;
     }
     const bytes = await hit.arrayBuffer();
+    const want = (RUNTIME_FILES.find((f) => f.name === name) || {}).bytes || 0;
+    if (want && bytes.byteLength !== want) {
+        // 断流时写进 Cache 的半截 wasm 不会报「下载失败」，而是让 ORT 在 _free 里
+        // 抛 memory access out of bounds —— 直接判死并删掉，让「安装运行时」重下一份
+        await cache.delete(cacheKey(name));
+        const err = new Error(`已下载的 ORT 运行时不完整（${bytes.byteLength}/${want} 字节），已丢弃；请到设置页「AI 与模型 → 运行时」重新点「安装运行时」`);
+        err.code = 'RUNTIME_CORRUPT';
+        throw err;
+    }
     const url = URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));
     ort.env.wasm.wasmPaths = { wasm: url, mjs: glue };
     return { source: 'cache', bytes: bytes.byteLength, blobUrl: url.slice(0, 24) + '…' };

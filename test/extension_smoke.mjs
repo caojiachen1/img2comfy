@@ -47,15 +47,36 @@ function makePng(w, h) {
 }
 const PNG = makePng(600, 400);
 const MP4 = path.join(ROOT, 'test/media/sample.mp4');
+// 人脸链路用本地素材：省掉几百 MB 的多模态下载，也不让网络抖动把测试变红
+const FACE_JPG = path.join(ROOT, 'test/media/face_lena.jpg');
+const DET_ONNX = path.join(ROOT, 'test/media/det_500m.onnx');
+const REC_ONNX = path.join(ROOT, 'test/media/w600k_mbf.onnx');
+const FACE_ASSETS = [FACE_JPG, DET_ONNX, REC_ONNX].every((f) => fs.existsSync(f));
+const MEDIA_ROUTES = {
+    '/face.jpg': [FACE_JPG, 'image/jpeg'],
+    '/det_500m.onnx': [DET_ONNX, 'application/octet-stream'],
+    '/w600k_mbf.onnx': [REC_ONNX, 'application/octet-stream'],
+};
 const FIXTURE = `<!doctype html><meta charset=utf-8><title>fx</title><body style="margin:0;background:#333">
 <div style="height:140px"></div>
 <img id="big" width="600" height="400" src="/big.png">
+<img id="face" width="420" height="420" src="/face.jpg">
 <div id="bgbox" style="width:600px;height:400px;background-image:url('/big.png');background-size:cover"></div>
 <video id="vid" width="480" height="300" src="/clip.mp4" muted preload="auto"></video>
+<div id="xstyle" style="width:600px;height:400px;margin-top:12px;background-image:url('/big.png');background-size:cover"><img id="xph" src="/big.png" alt="" style="opacity:0;width:600px;height:400px"></div>
+<img id="thumb" width="120" height="120" src="/big.png" style="margin-top:12px">
+<img id="icon" width="24" height="24" src="/big.png" style="margin-top:12px">
 </body>`;
 
 const server = http.createServer((req, res) => {
     if (req.url.startsWith('/big.png')) { res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-store' }); return res.end(PNG); }
+    for (const [route, [file, type]] of Object.entries(MEDIA_ROUTES)) {
+        if (req.url.startsWith(route)) {
+            if (!fs.existsSync(file)) { res.writeHead(404); return res.end('no asset'); }
+            res.writeHead(200, { 'content-type': type, 'content-length': fs.statSync(file).size, 'cache-control': 'no-store' });
+            return fs.createReadStream(file).pipe(res);
+        }
+    }
     if (req.url.startsWith('/clip.mp4') && fs.existsSync(MP4)) {
         const st = fs.statSync(MP4), range = req.headers.range;
         if (range) {
@@ -84,13 +105,37 @@ const proc = spawn(BROWSER, [
 ], { stdio: 'ignore' });
 
 const report = { browser: BROWSER, site: `http://127.0.0.1:${SITE}/`, steps: [] };
+// 产物必须边走边落盘：整份 JSON 只在末尾写的话，中途中断就什么都留不下，
+// 日志停在一行 OK 上会被误读成「跑完了且全绿」（2026-10-17 真就这么骗过一次）。
+const OUT = path.join(ROOT, 'test/out_smoke.json');
+function dump(extra) {
+    const failed = report.steps.filter((s) => !s.ok);
+    report.summary = { total: report.steps.length, failed: failed.length, names: failed.map((s) => s.name) };
+    if (extra) report.aborted = extra;
+    try { fs.writeFileSync(OUT, JSON.stringify(report, null, 1)); } catch (e) { /* 只读盘 */ }
+    return report.summary;
+}
 let cdp = null;
 for (let i = 0; i < 90; i++) { await wait(350); try { cdp = await Cdp.connect(PORT); break; } catch (e) { /* 等启动 */ } }
-if (!cdp) { console.log(JSON.stringify({ fatal: 'CDP 不可达' })); process.exit(1); }
+if (!cdp) { console.log(JSON.stringify({ fatal: 'CDP 不可达' })); dump(); process.exit(1); }
+
+// 任何未被接住的异常/超时都必须留下「断在第几步」并给出非零码，绝不静默收尾
+process.on('uncaughtException', (e) => abort('未捕获异常', e));
+process.on('unhandledRejection', (e) => abort('未处理的 Promise 失败', e));
+function abort(kind, e) {
+    const last = report.steps.length ? report.steps[report.steps.length - 1].name : '(还没开始)';
+    console.log(`\nABORT ${kind}：断在「${last}」之后  ${String((e && e.stack) || e).split('\n').slice(0, 3).join(' | ')}`);
+    dump({ kind, error: String((e && e.message) || e), afterStep: last });
+    try { proc.kill(); } catch (x) { /* 已退出 */ }
+    process.exit(2);
+}
+const WATCHDOG = 20 * 60 * 1000;
+const watchdog = setTimeout(() => abort('超时', new Error(`${WATCHDOG / 60000} 分钟内没跑完`)), WATCHDOG);
 
 function step(name, ok, data) {
     report.steps.push({ name, ok: !!ok, ...data });
     console.log(`${ok ? 'OK   ' : 'FAIL '} ${name}  ${JSON.stringify(data).slice(0, 260)}`);
+    dump();
 }
 
 // Chrome 自带扩展也有 background.js 的 service_worker target（权限只有 3 个、没有 chrome.storage），
@@ -168,6 +213,35 @@ const op = await cdp.ev(fx, `(async()=>{
 step('点像素算子按钮：宿主跑算子链并出结果图（尺寸与像素都对）',
     !!(op && op.ok && ((op.kind === 'invert' && op.left[0] === 0 && op.right[0] === 255) || (op.kind === 'lanczos' && op.size === '1200x800'))), { op });
 
+// 过程日志进右侧悬浮窗（真扩展里验一次，页面级 harness 只是复制品），且工具栏按钮旁不许有状态条
+const logFx = await cdp.ev(fx, `(()=>{
+  const s=document.getElementById('mtb-root').shadowRoot;
+  const dock=s.querySelector('.logbox');
+  return {
+    exists: !!dock,
+    shown: !!(dock && dock.classList.contains('show')),
+    lines: dock ? [...dock.querySelectorAll('.ln .tx')].map((x)=>x.textContent.trim()).slice(-3) : [],
+    chip: !!s.querySelector('.wrap .status'),
+    dockW: dock ? Math.round(dock.getBoundingClientRect().width) : 0,
+  };
+})()`);
+step('日志窗：过程日志落在右侧悬浮窗里，工具栏按钮旁没有状态条',
+    !!(logFx.exists && logFx.shown && logFx.lines.length >= 1 && !logFx.chip && logFx.dockW > 100), { logFx });
+
+// 位置锁定：已经显示着的工具栏，滚动页面不会让它自己挪（旧实现加 scrollX/Y，一滚就往下飞）
+const lockFx = await cdp.ev(fx, `(async()=>{
+  const wrap=document.getElementById('mtb-root').shadowRoot.querySelector('.wrap');
+  const a={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top)};
+  window.scrollTo(0,100);
+  await new Promise(r=>setTimeout(r,700));
+  const b={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')};
+  window.scrollTo(0,0);
+  await new Promise(r=>setTimeout(r,400));
+  return {a,b};
+})()`);
+step('真扩展里滚动页面后工具栏不自己移动位置',
+    !!(lockFx.b && lockFx.b.show && lockFx.b.l === lockFx.a.l && lockFx.b.t === lockFx.a.t), { lockFx });
+
 const drag = await cdp.ev(fx, `(async()=>{
   const host=document.getElementById('mtb-root'), wrap=host.shadowRoot.querySelector('.wrap');
   const h=wrap.querySelector('.draghandle'), r=h.getBoundingClientRect();
@@ -181,11 +255,13 @@ const drag = await cdp.ev(fx, `(async()=>{
 step('拖拽 ⠿ 手柄不抛错、工具栏保持可见（位移与持久化由 harness_page 覆盖）', !!(drag && drag.w > 60 && drag.h > 10), { drag });
 
 const bg = await cdp.ev(fx, `(async()=>{
-  const box=document.getElementById('bgbox'), r=box.getBoundingClientRect();
+  const box=document.getElementById('bgbox'); box.scrollIntoView({block:'center'});
+  await new Promise(res=>setTimeout(res,400));
+  const r=box.getBoundingClientRect();
   document.dispatchEvent(new MouseEvent('mouseover',{clientX:r.left+r.width/2,clientY:r.top+r.height/2,bubbles:true}));
   await new Promise(res=>setTimeout(res,900));
   const wrap=document.getElementById('mtb-root').shadowRoot.querySelector('.wrap');
-  return {ok:wrap.classList.contains('show'), buttons:[...wrap.querySelectorAll('button.btn')].map(b=>b.textContent.trim())};
+  return {ok:wrap.classList.contains('show'), at:[Math.round(r.left),Math.round(r.top)], buttons:[...wrap.querySelectorAll('button.btn')].map(b=>b.textContent.trim())};
 })()`);
 step('background-image 容器也能出工具栏', !!(bg && bg.ok), { bg });
 
@@ -211,6 +287,47 @@ if (fs.existsSync(MP4)) {
   })()`);
     step('视频态取当前帧（无播放器 UI 的原生分辨率帧）', !!(vid && vid.ok), { vid });
 }
+
+// x.com 那类照片：真正在画的是容器的 background-image，里面那张 <img> 只是 opacity:0 的占位。
+// 占位 img 一旦被认成「不透明遮挡物」，它爹就被剔除，整站再也弹不出工具栏（2026-10-18 用户报障）。
+const xstyle = await cdp.ev(fx, `(async()=>{
+  const box=document.getElementById('xstyle'); box.scrollIntoView({block:'center'});
+  await new Promise(res=>setTimeout(res,400));
+  const r=box.getBoundingClientRect();
+  document.dispatchEvent(new MouseEvent('mouseover',{clientX:r.left+r.width/2,clientY:r.top+r.height/2,bubbles:true}));
+  await new Promise(res=>setTimeout(res,900));
+  const root=document.getElementById('mtb-root'), wrap=root.shadowRoot.querySelector('.wrap');
+  const buttons=[...wrap.querySelectorAll('button.btn')].map(b=>b.textContent.trim());
+  // 内容脚本在隔离世界里，页面世界读不到 window.__mtb；用「详细信息」面板回显的 kind 来判定
+  const info=[...wrap.querySelectorAll('button.btn')].find(b=>b.textContent.includes('详细信息'));
+  if (info) info.click();
+  let kind=null;
+  for (let i=0;i<20 && kind===null;i++){
+    await new Promise(res=>setTimeout(res,300));
+    const p=root.shadowRoot.querySelector('.panel');
+    const t=p&&p.textContent;
+    if (t && /类型/.test(t)) kind=(t.match(/类型\\s*([a-z]+)/)||[])[1]||'?';
+  }
+  return {ok:wrap.classList.contains('show'), kind, buttons};
+})()`);
+step('x.com 式背景图容器（内含 opacity:0 占位 img）出的是完整工具栏，不只是链接三枚',
+    !!(xstyle && xstyle.ok && xstyle.kind === 'bg'
+        && xstyle.buttons.some((b) => b.includes('复制图片')) && xstyle.buttons.some((b) => b.includes('下载'))), { xstyle });
+
+const sizes = await cdp.ev(fx, `(async()=>{
+  const probe=async(id)=>{
+    document.dispatchEvent(new MouseEvent('mouseover',{clientX:2,clientY:2,bubbles:true}));
+    await new Promise(res=>setTimeout(res,500));
+    const el=document.getElementById(id); el.scrollIntoView({block:'center'});
+    await new Promise(res=>setTimeout(res,350));
+    const r=el.getBoundingClientRect();
+    document.dispatchEvent(new MouseEvent('mouseover',{clientX:r.left+r.width/2,clientY:r.top+r.height/2,bubbles:true}));
+    await new Promise(res=>setTimeout(res,800));
+    return document.getElementById('mtb-root').shadowRoot.querySelector('.wrap').classList.contains('show');
+  };
+  return { thumb: await probe('thumb'), icon: await probe('icon') };
+})()`);
+step('显示很小但源很大的缩略图能悬停，24px 图标仍不打扰', !!(sizes && sizes.thumb && !sizes.icon), { sizes });
 
 // 先数一次：这一步之后测试自己会打开 host.html，晚一点再数就会把自己的标签页算成「多余」
 const hostTabsBefore = await cdp.ev(swSess, `(async()=>(await chrome.tabs.query({})).filter(t=>(t.url||'').indexOf('src/host/host.html')>=0).length)()`);
@@ -248,6 +365,29 @@ const custom = await cdp.ev(opt, `(async()=>{
   return {names, editor:!!document.querySelector('#scriptEditor textarea'), codeLen:Math.max(0,...[...document.querySelectorAll('#scriptEditor textarea')].map(x=>(x.value||'').length)), links:document.querySelectorAll('#linkList .item').length};
 })()`);
 step('自定义功能面板：内置 ComfyUI 示例列出且可编辑', EXT_SKIP || !!(custom && custom.editor && custom.names.length >= 3 && custom.codeLen > 50), { custom });
+
+// ---- 多模态档位对照：小模型能出文、大模型是不是把 wasm 内存撑爆（用户报的 memory access out of bounds）
+if (process.argv.includes('--vlm')) {
+    for (const preset of (process.env.VLM_PRESETS || 'smolvlm2-256m,qwen3vl-2b').split(',')) {
+        const t0 = Date.now();
+        const r = await cdp.ev(opt, `(async()=>{
+  const d=await chrome.storage.local.get(['mtbSettings']); const s=d.mtbSettings;
+  s.ai.vlmPreset=${JSON.stringify(preset)}; s.ai.downloadBudgetMB=0; s.ai.maxDim=256;
+  await chrome.storage.local.set({mtbSettings:s});
+  const c=document.createElement('canvas'); c.width=96; c.height=64; const g=c.getContext('2d');
+  g.fillStyle='#fff'; g.fillRect(0,0,96,64); g.fillStyle='#e33'; g.beginPath(); g.arc(30,32,18,0,7); g.fill();
+  const dataUrl=c.toDataURL('image/png');
+  const res=await new Promise((resolve)=>{
+    const to=setTimeout(()=>resolve({__timeout:true}), ${Number(process.env.VLM_WAIT || 420000)});
+    chrome.runtime.sendMessage({ action:'mtbHost', type:'ai', task:'describe', ai:s.ai, dataUrl, maxNewTokens:12 },
+      (x)=>{ clearTimeout(to); resolve(chrome.runtime.lastError ? { error: chrome.runtime.lastError.message } : x); });
+  });
+  return { text: res && res.text, engine: res && res.engine, model: res && res.model, error: res && (res.error || res.message), timeout: !!res.__timeout };
+})()`);
+        step(`多模态 ${preset}：真扩展里出文而不是 wasm 崩溃/超时`, !!(r && typeof r.text === 'string' && r.text.length > 0),
+            { ms: Date.now() - t0, engine: r && r.engine, text: String((r && r.text) || '').slice(0, 50), err: r && (r.error || (r.timeout ? '超时未返回' : '')) });
+    }
+}
 
 const ai = await cdp.ev(opt, `(async()=>{
   document.querySelector('#tabs button[data-tab="ai"]').click();
@@ -362,16 +502,87 @@ step('逐按钮扫描：没有按钮触发 ReferenceError/类型错误', !sweep.
 });
 step('逐按钮扫描：按钮宽度可见（面板不塌形）', sweep.every((s) => !s.panel || s.w > 240), { panels: sweep.filter((s) => s.panel).map((s) => s.w) });
 
+// ---- 人脸链路：折叠菜单里点「登记人脸」→ 写进 chrome.storage → 「认出是谁」标名字
+{
+    if (!FACE_ASSETS) {
+        step('人脸链路端到端（缺 test/media 素材，跳过）', true, { note: '需要 face_lena.jpg / det_500m.onnx / w600k_mbf.onnx' });
+    } else {
+        const shadowPos = (sel, word) => cdp.ev(fx, `(()=>{
+  const s=document.getElementById('mtb-root').shadowRoot;
+  const b=[...s.querySelectorAll(${JSON.stringify(sel)})].find((x)=>!${JSON.stringify(word || '')}||x.textContent.includes(${JSON.stringify(word || '')}));
+  if(!b) return null; const r=b.getBoundingClientRect(); return {x:r.left+r.width/2,y:r.top+r.height/2,w:Math.round(r.width),h:Math.round(r.height)};
+})()`);
+        const clickShadow = async (sel, word) => {
+            const p = await shadowPos(sel, word);
+            if (!p) return { ok: false, why: '找不到 ' + sel + (word ? ' 「' + word + '」' : '') };
+            await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, buttons: 0 }, fx);
+            await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount: 1, buttons: 1 }, fx);
+            await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', clickCount: 1, buttons: 0 }, fx);
+            return { ok: true, p };
+        };
+        const hoverFace = async () => {
+            await cdp.ev(fx, `document.getElementById('face').scrollIntoView({block:'center'})`);
+            await wait(400);
+            const p = await cdp.ev(fx, `(()=>{const r=document.getElementById('face').getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2};})()`);
+            await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, buttons: 0 }, fx);
+            await wait(1200);
+        };
+        await cdp.ev(swSess, `(async()=>{
+  const d=await chrome.storage.local.get(['mtbSettings']); const s=d.mtbSettings;
+  s.ai.faceModel='custom'; s.ai.faceModelUrl='http://127.0.0.1:${SITE}/det_500m.onnx';
+  s.ai.faceEmbedModel='custom'; s.ai.faceEmbedUrl='http://127.0.0.1:${SITE}/w600k_mbf.onnx';
+  s.ai.faceConfidence=0.5; s.ai.faceMatchThreshold=0.4; s.faceGallery=[];
+  await chrome.storage.local.set({mtbSettings:s}); return true;})()`);
+        await wait(1200);
+
+        await hoverFace();
+        const openMenu = await realClick('更多');
+        await wait(400);
+        const menuState = await cdp.ev(fx, `(()=>{const s=document.getElementById('mtb-root').shadowRoot;const m=s.querySelector('.menu');
+  return m?{cls:m.className,show:m.classList.contains('show'),rect:[Math.round(m.getBoundingClientRect().width),Math.round(m.getBoundingClientRect().height)],items:[...m.querySelectorAll('.mi')].map(x=>x.textContent.trim())}:{none:true};})()`);
+        const regClick = await clickShadow('.menu .mi', '登记人脸');
+        let dialog = null;
+        for (let i = 0; i < 240 && !dialog; i++) {
+            await wait(500);
+            dialog = await cdp.ev(fx, `(()=>{const p=document.getElementById('mtb-root').shadowRoot.querySelector('.prompt.show');return p?{t:p.querySelector('.t').textContent.slice(0,40)}:null;})()`);
+        }
+        step('折叠菜单里点「登记人脸」：跑完检测+识别后弹出起名框', !!(openMenu.ok && regClick.ok && regClick.p?.w && dialog), { openMenu, menuState, regClick, dialog });
+        await cdp.ev(fx, `(()=>{const p=document.getElementById('mtb-root').shadowRoot.querySelector('.prompt.show');p.querySelector('textarea').value='莉娜';return true;})()`);
+        const okClick = await clickShadow('.prompt .ok');
+        let stored = null;
+        for (let i = 0; i < 40 && !stored; i++) {
+            await wait(400);
+            stored = await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const g=(d.mtbSettings.faceGallery||[])[0]||null;return g?{name:g.name,dim:g.dim,vlen:(g.vector||'').length}:null;})()`);
+        }
+        step('起名确认后写进人脸库（chrome.storage 里 512 维 base64 向量）', !!(okClick.ok && stored && stored.name === '莉娜' && stored.dim === 512 && stored.vlen > 500), { okClick, stored });
+
+        await hoverFace();
+        const recClick = await realClick('认出是谁');
+        let verdict = null;
+        const peek = () => cdp.ev(fx, `(()=>{const s=document.getElementById('mtb-root').shadowRoot;
+  const p=s.querySelector('.panel.show');
+  if(!p||!p.querySelector('.tt')) return null;
+  const box=s.querySelector('.boxlayer'), wrap=s.querySelector('.wrap'), pr=p.getBoundingClientRect();
+  return {title:p.querySelector('.tt').textContent, body:(p.innerText||'').slice(0,120),
+    boxes:[...s.querySelectorAll('.box')].map(b=>b.textContent),
+    dbg:{boxDisp:box?getComputedStyle(box).display:null, boxLeft:box?Math.round(box.getBoundingClientRect().left):null, boxTop:box?Math.round(box.getBoundingClientRect().top):null,
+      boxW:box?Math.round(box.getBoundingClientRect().width):null,
+      wrapShow:!!(wrap&&wrap.classList.contains('show')), panelAt:[Math.round(pr.left),Math.round(pr.top)]}};})()`);
+        for (let i = 0; i < 120 && !verdict; i++) { await wait(500); verdict = await peek(); }
+        // 面板先出、框后画是常见顺序，再多看几轮，取「框最多」的那一帧
+        for (let i = 0; i < 8 && verdict; i++) { await wait(400); const v = await peek(); if (v && v.boxes.length > verdict.boxes.length) verdict = v; }
+        step('点「认出是谁」：面板报匹配到莉娜，图上框的标签也带名字', !!(recClick.ok && verdict && /莉娜/.test(verdict.title + verdict.body) && verdict.boxes.some((t) => /莉娜/.test(t))), { recClick, verdict });
+    }
+}
+
 report.pageErrors = cdp.pageErrors().slice(0, 15);
-const failed = report.steps.filter((s) => !s.ok);
-report.summary = { total: report.steps.length, failed: failed.length, names: failed.map((s) => s.name) };
 console.log('\n=== 页面错误（去重） ===');
 console.log(report.pageErrors.length ? report.pageErrors.join('\n') : '（无）');
 console.log('\n=== 汇总 ===');
-console.log(JSON.stringify(report.summary, null, 1));
-fs.writeFileSync(path.join(ROOT, 'test/out_smoke.json'), JSON.stringify(report, null, 1));
+console.log(JSON.stringify(dump(), null, 1));
+clearTimeout(watchdog);
 cdp.close();
 try { proc.kill(); } catch (e) { /* 已退出 */ }
 server.close();
 setTimeout(() => { try { fs.rmSync(profile, { recursive: true, force: true }); } catch (e) { /* 锁 */ } try { fs.rmSync(DL, { recursive: true, force: true }); } catch (e) { /* 锁 */ } }, 400);
-process.exit(failed.length ? 1 : 0);
+process.exit(report.summary.failed ? 1 : 0);

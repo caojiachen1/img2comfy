@@ -25,6 +25,21 @@ node scripts/setup-vendor.mjs
 「显示位置（常驻 / 折叠）」放在该按钮右侧 ⚙ 的设置面板里，和它的参数一起改；折叠项收在工具栏末尾的
 「⋯ 更多 ▾」里，点一下就执行并自动收起（点别处或按 Esc 也收）。
 
+悬停只认**最上层**那张媒体：`elementsFromPoint` 会漏掉 `pointer-events:none` 的元素，所以命中栈下标不能
+单独当图层深浅，另按 CSS 绘制顺序（同父分叉处先看 z-index/是否定位，再看 DOM 顺序）比较，被压在下面的
+图片永远不弹工具栏。但**隐形的不算遮挡物**（`display:none`/`visibility:hidden`/`opacity:0`）：x.com 的照片
+正是「容器 `background-image` + 里面一张 `opacity:0` 的占位 `<img>`」，占位图若被当成不透明遮挡物，
+它爹（真正那张图）就被剔除，整站再也弹不出工具栏；父容器与自己的后代互为遮挡物同样不成立。
+候选全被剔除时也不再直接放弃，而是退回候选里最上层那个——「有图却什么都不弹」比弹错一张更糟。
+`background-image` 容器与 `<img>` 走同一条直链取图路径，所以拿到的是**完整工具栏**（复制/下载/算子/AI/ComfyUI），
+不再只有三枚链接按钮。尺寸闸门除「两边都 ≥ 最小尺寸」外还认两种：细长横幅（短边 ≥ 40%、面积够）与
+「显示很小但源图很大」的缩略图（短边 ≥ 64px、源图两边都达标），24px 一类的图标仍然不打扰；
+阈值是设置页的「最小尺寸」（`toolbar.minImgSize`，默认 200）。
+工具栏**一旦显示就锁住屏幕位置**——移动指针、换图、重新探测、页面滚动都不会让它自己
+跑掉，只有拖 ⠿ 手柄才会挪（松手即写回 `offsetX/offsetY`）；收起后再次悬停别的图片才按那张图重新锚定。
+「推理中 / 取帧中 / 已开始下载」这类过程日志全部进**右侧悬浮日志窗**（同一任务原地刷一行，结束补耗时，
+✕ 或超时收起，可拖动），工具栏按钮旁边不再有状态文字。
+
 改动 `src/content/**`、`src/common/**` 后需要重跑 `build-content.mjs`（内容脚本是打包产物）。
 `src/host`、`src/options`、`background.js` 是扩展页/SW，用原生 ES 模块，改完在扩展页
 点「重新加载」即可，不需要打包。
@@ -38,18 +53,21 @@ MV3 扩展页的 `script-src 'self'` 挡掉了跨源脚本与 `blob:` 模块，�
 - 设置页「AI 与模型 → AI 运行时文件」列出每个文件的状态（扩展包内 / 已下载 / 未安装 / 不完整）、总大小与
   存储余量；按钮是「安装运行时 / 安装全部三份 / 重新检测 / 清除已装」，下面是进度条与实时速率。
 - 版本按 transformers.js 4.3.1 依赖的 `onnxruntime-web@1.31.0-dev.20260914-8d85527a0` 锁死，下完用
-  **字节数复核**（26,861,777），对不上就换下一个源：jsDelivr → fastly → gcore → unpkg。
+  **字节数复核**（26,861,777），对不上就换下一个源：自建 ModelScope 镜像 → jsDelivr → fastly → gcore → unpkg。
 - 机制验证：`PAGE=wasm_probe.html node test/face_probe.mjs` 跑「wasm → Cache → blob → ORT 真推理」；
   `PAGE=runtime_probe.html node test/face_probe.mjs` 跑「假装包里没有 → 真 CDN 下载 → 进度事件 → 装好后的状态」。
 - 想离线预置或 CDN 全不通，仍可跑 `node scripts/setup-vendor.mjs`；包里有文件时不会重复下载。
-- 模型源新增 **ModelScope 魔搭**（`https://www.modelscope.cn/models/{id}/resolve/master/{file}`；
-  它只镜像了部分 HF 仓库，取不到会 404，此时回落 hf-mirror）。
+- **默认模型源是 ModelScope，且权重全部镜像到自建仓库**（`cjc1887415157/*`，
+  `https://www.modelscope.cn/models/{id}/resolve/master/{file}`，实测下行 5~15 MB/s、上行 ~4.5 MB/s，
+  且 resolve 直链带 `Access-Control-Allow-Origin:*`，扩展页可直接取）。
+  搬运与校验脚本：`node scripts/ms-mirror.mjs --list` 看计划、`--all` 全搬（按字节数校验后才上传，
+  半截文件不会进仓库）；`node scripts/ms-check.mjs` 查上游是否已有同步仓。
 
 ## 二、验证
 
 ```bash
 node scripts/check-imports.mjs        # 语法 + 相对路径 + 具名导入是否存在（30+ 文件）
-node test/unit_pure.mjs              # 182 条纯算法单测（重采样/色彩/滤波/边缘/CV/算子链/设置）
+node test/unit_pure.mjs              # 209 条纯算法单测（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学）
 node test/run_browser.mjs            # 页面级：内容脚本包 + 工具栏 + 拖拽 + 算子链 + 视频取帧
 node test/run_browser.mjs --ai       # 再加：vendor + slimSAM/swin2SR/YuNet 真实推理 + 设置页
 node test/run_browser.mjs --ai --only=sr|sam|face|vlm|script|options   # 单跑某一阶段
@@ -58,7 +76,7 @@ node test/run_browser.mjs --ai --only=sr|sam|face|vlm|script|options   # 单跑�
 `--only=script` 那一支是 QuickJS 引擎的端到端检查（7 条）：引擎加载、异步服务桥接、语法错误捕获、
 运行时异常回传、`module.exports` 形式、死循环被中断、供设置页用的语法检查。
 
-`--only=options` 那一支是**设置页**检查（`test/harness_options.html`，22 条）：扩展页在无头里打不开，
+`--only=options` 那一支是**设置页**检查（`test/harness_options.html`，52 条）：扩展页在无头里打不开，
 所以把 `options.html` 的 DOM 搬进普通网页、用 `harness_stub.js` 冒充后台，然后逐个点开标签页、
 点每个按钮（检测运行时/模型占用/测试连接/自检/新建脚本/语法检查/试跑/新建链接）。
 它专门用来逼出「只有点到那个按钮才炸」的 `ReferenceError`——已揪出过 `doRuntimeProbe` 里把函数参数
@@ -81,7 +99,10 @@ node test/extension_smoke.mjs --headed     # 有头：扩展页能打开，剪�
 node test/extension_smoke.mjs              # 无头：扩展页必然 chrome-error，那几步自动按「跳过」处理
 ```
 
-历史 v1 用例仍可用（`test/run_headless.js` + `test/cors_server.py`，针对旧的 `content.js`）。
+v1 的那套（`content.js` / `content.css` / `popup.*` / `test/index.html` + `run_headless.js` + `harness.js`
+跨源取帧用例）已经删掉：新版工具栏与取帧链路由 `test/run_browser.mjs` 与 `test/extension_smoke.mjs` 覆盖，
+旧文件既不在清单里也不再被引用。`test/cors_server.py` 留着，它是有 CORS 回声的静态服务器，
+`node test/face_probe.mjs`、`node test/face_fit.mjs` 这两个量人脸几何的排障工具靠它起页面。
 
 ## 三、能力清单
 
@@ -105,13 +126,14 @@ Sobel/Scharr/Laplacian/Canny/LoG；OTSU·固定·自适应均值·Sauvola·局�
 SSIM/PSNR/MSE、帧间差、内容区测量。
 
 **AI**（`vendor/` + 浏览器内推理，可切 GPU/CPU）：
-- 看图说话 / 提问 / OCR / 标签：**Qwen3-VL-2B**（默认，`onnx-community/Qwen3-VL-2B-Instruct-ONNX`）
-  或 Qwen2-VL-2B / SmolVLM2-500M/2.2B / Moondream2，也可手填任意仓库 ID
-- 点选抠图 / 自动分割：**slimSAM**（约 13MB，已实测跑通）、MobileSAM、SAM ViT-B
+- 看图说话 / 提问 / OCR / 标签：**Qwen3-VL-2B**（默认，`cjc1887415157/Qwen3-VL-2B-Instruct-ONNX`）
+  或 Qwen2-VL-2B / SmolVLM2-500M / SmolVLM2-256M（CPU 首选，q4 约 250MB），也可手填任意仓库 ID
+- 点选抠图 / 自动分割：**slimSAM**（约 13MB，已实测跑通）、SAM ViT-B
 - 人脸识别 / 人脸打码：**YuNet 2023mar**（232KB，已实测加载+推理+多输出解码）
 - AI 超分：**swin2SR** 系列（5–10MB，已实测 256×128 → 512×256）、或自填任意 Real-ESRGAN 类 ONNX
 - 深度图：Depth Anything Small/Base
-- 权重下载走 `hf-mirror.com`（默认，国内可达）并可换源；进度实时刷在按钮上；Cache API 持久缓存 + 占用统计/清理；
+- 权重下载默认走自建 **ModelScope** 镜像（`cjc1887415157/*`，国内实测 5~15 MB/s），设置里可切回
+  hf-mirror / huggingface.co / jsDelivr / 自定义源；进度实时刷在按钮上；Cache API 持久缓存 + 占用统计/清理；
   下载预算闸门（超预算要先确认）
 
 **视频专属**：提取当前帧（四级降级：画布直取 → CORS 克隆免整包下载 → 整包重建 → 标签页截图裁剪）、
@@ -164,10 +186,11 @@ test/                         unit_pure（182 条）、run_browser + harness_pag
 
 ## 五、已知边界（如实记录）
 
-- 端到端验证覆盖到：182 条算法单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧、
-  slimSAM 与 swin2SR 的真实推理、YuNet 的加载+推理+多输出解码。**多模态（Qwen3-VL/SmolVLM）在
-  本轮测试里没有跑完**（数百 MB 权重经测试代理在超时预算内没下完），链路是通的但结论要你在浏览器里
-  点一次「看图说话」才算数；GB 级权重在 CPU 模式下会很慢，建议 GPU + `q4`。
+- 端到端验证覆盖到：209 条算法单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+  slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）、
+  多模态也跑通了真推理（`qwen3vl-2b` q4f16 约 490s、`smolvlm2-256m` 约 146s 出答案）。
+  GB 级权重在 CPU 模式下仍然很慢，建议 GPU + `q4`；断流写坏的半截缓存会在建会话时炸成
+  protobuf/内存错误，现在会丢缓存自动重下一次。
 - 扩展页（`options.html` / `host.html`）在 **headless** CfT 里打不开（返回 `chrome-error://`），这是无头模式的限制，
   不是清单/CSP 问题：`scripts/probe-manifest.mjs` 实测 8 种 manifest 变体都能正常注册 SW、扩展能被加载。
   **有头 CfT 可以打开扩展页**，所以设置页与宿主页已经进了 `extension_smoke.mjs --headed` 的断言；
@@ -180,5 +203,3 @@ test/                         unit_pure（182 条）、run_browser + harness_pag
   唯一需要 eval 的是用户自定义脚本，现在改为在 wasm 里跑 QuickJS 解释器（`src/common/script-vm.js`），
   因此 manifest 里既没有 `sandbox` 页也没有放松 CSP；设置页的「语法检查」同样经宿主转发给 QuickJS 编译。
 - 用户脚本不能直接操作页面 DOM（只能经 `ctx.overlay/panel`），这是刻意的安全边界。
-- 旧文件 `content.js` / `content.css` / `popup.html` / `popup.js` 属于 v1，manifest 已不引用，保留是为了
-  让老测试用例还能跑；确认新版没问题后可以删。

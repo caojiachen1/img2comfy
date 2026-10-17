@@ -13,11 +13,11 @@ export const ICONS = {
 // 每个工具: action.type = step(像素算子链) | builtin(内容脚本能力) | ai(host 模型) | script(用户脚本) | link(链接模板)
 export const TOOLS = [
     // —— 基础操作 ——
-    { id: 'copy-link', group: '基础', label: '复制链接', icon: ICONS.link, media: ['image', 'video', 'bg'], action: { type: 'builtin', fn: 'copyLink' }, hint: '复制图片/视频直链地址（自动去除临时签名参数可选）' },
+    { id: 'copy-link', group: '基础', label: '复制链接', icon: ICONS.link, media: ['image', 'video'], action: { type: 'builtin', fn: 'copyLink' }, hint: '复制图片/视频直链地址（自动去除临时签名参数可选）' },
     { id: 'copy-image', group: '基础', label: '复制图片', icon: ICONS.copy, media: ['image', 'video'], action: { type: 'builtin', fn: 'copyImage' }, hint: '把当前图（或视频当前帧）复制到剪贴板' },
     { id: 'download', group: '基础', label: '下载', icon: ICONS.download, media: ['image', 'video'], action: { type: 'builtin', fn: 'download' }, hint: '下载原图；视频则下载当前帧 PNG' },
-    { id: 'open-src', group: '基础', label: '新标签打开', icon: ICONS.open, media: ['image', 'video', 'bg'], action: { type: 'builtin', fn: 'openSrc' }, hint: '在新标签打开原始直链' },
-    { id: 'info', group: '基础', label: '详细信息', icon: ICONS.info, media: ['image', 'video', 'bg'], action: { type: 'builtin', fn: 'info' }, hint: '显示源地址、尺寸、大小、类型、编解码、时长等' },
+    { id: 'open-src', group: '基础', label: '新标签打开', icon: ICONS.open, media: ['image', 'video'], action: { type: 'builtin', fn: 'openSrc' }, hint: '在新标签打开原始直链' },
+    { id: 'info', group: '基础', label: '详细信息', icon: ICONS.info, media: ['image', 'video'], action: { type: 'builtin', fn: 'info' }, hint: '显示源地址、尺寸、大小、类型、编解码、时长等' },
     { id: 'view-full', group: '基础', label: '原图预览', icon: ICONS.eye, media: ['image'], action: { type: 'builtin', fn: 'viewFull' }, hint: '在页面内浮层查看真实分辨率原图' },
     { id: 'clean-url', group: '基础', label: '复制干净链接', icon: '🧼', media: ['image', 'video'], action: { type: 'builtin', fn: 'cleanLink' }, hint: '去掉签名/尺寸后缀等噪声参数后复制' },
 
@@ -68,6 +68,8 @@ export const TOOLS = [
     { id: 'ai-sam-auto', group: 'AI', label: '自动分割', icon: '🪄', media: ['image'], ai: 'samauto', action: { type: 'ai', task: 'samAuto' }, needsHost: true },
     { id: 'ai-face', group: 'AI', label: '人脸识别', icon: ICONS.face, media: ['image', 'video'], ai: 'face', action: { type: 'ai', task: 'face' }, needsHost: true },
     { id: 'ai-face-blur', group: 'AI', label: '人脸打码', icon: '🕶', media: ['image', 'video'], ai: 'faceblur', action: { type: 'ai', task: 'faceBlur' }, needsHost: true },
+    { id: 'ai-face-rec', group: 'AI', label: '认出是谁', icon: '🪪', media: ['image', 'video'], ai: 'facerec', action: { type: 'ai', task: 'recognize' }, needsHost: true, hint: 'SCRFD 检测 + 5 点对齐 + 识别向量，与人脸库比对' },
+    { id: 'ai-face-reg', group: 'AI', label: '登记人脸', icon: '📛', media: ['image', 'video'], ai: 'facereg', action: { type: 'ai', task: 'faceRegister' }, needsHost: true, hint: '把图中最大的一张脸存进人脸库并起名字' },
     { id: 'ai-sr', group: 'AI', label: 'AI 超分', icon: '🔍', media: ['image', 'video'], ai: 'sr', action: { type: 'ai', task: 'superResolve' }, needsHost: true, hint: 'swin2SR / ESRGAN ONNX 模型放大' },
     { id: 'ai-depth', group: 'AI', label: '深度图', icon: '🌊', media: ['image'], ai: 'depth', action: { type: 'ai', task: 'depth' }, needsHost: true },
     { id: 'ai-clear', group: 'AI', label: '清除标注', icon: ICONS.x, media: ['image', 'video'], action: { type: 'builtin', fn: 'clearOverlay' } },
@@ -93,10 +95,10 @@ export const DEFAULT_TOOLS = [
     'copy-link', 'copy-image', 'download', 'open-src', 'info',
     'v-frame', 'v-frame-save', 'v-play', 'v-speed', 'v-loop',
     'v-seek-in', 'v-seek-out', 'v-copy-time', 'v-frames-sheet', 'v-mute', 'v-piP',
-    'ai-describe', 'ai-sam', 'ai-face', 'upscale-lanczos', 'autotrim', 'gear',
+    'ai-describe', 'ai-sam', 'ai-face', 'ai-face-rec', 'ai-face-reg', 'upscale-lanczos', 'autotrim', 'gear',
 ];
 // 视频态本来按钮就多，长尾的默认收进 ▾ 菜单，免得把工具栏撑到屏幕外
-export const DEFAULT_COLLAPSED = ['v-seek-in', 'v-seek-out', 'v-copy-time', 'v-frames-sheet', 'v-mute', 'v-piP'];
+export const DEFAULT_COLLAPSED = ['v-seek-in', 'v-seek-out', 'v-copy-time', 'v-frames-sheet', 'v-mute', 'v-piP', 'ai-face-reg'];
 
 // 默认工具栏：图片/视频各自显示哪些（顺序即显示顺序）
 export function defaultToolbarState() {
@@ -155,27 +157,30 @@ export const DEFAULT_SETTINGS = {
         enabled: true,
         device: 'auto',              // auto | webgpu | wasm
         dtype: 'q4',                 // q4 | q4f16 | int8 | fp16
-        hub: 'hf-mirror',            // hf-mirror | huggingface | jsdelivr | custom
+        hub: 'modelscope',           // modelscope | hf-mirror | huggingface | jsdelivr | custom
         hubCustom: '',
         maxDim: 1024,
         keepAwake: true,
         downloadBudgetMB: 4096,
         autoUnloadAfter: 0,
-        models: {
-            vlm: 'onnx-community/Qwen3-VL-2B-Instruct-ONNX',
-            sam: 'Xenova/slimsam-77-uniform',
-            face: 'yunet-2023mar',
-            sr: 'Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr',
-            tags: 'Xenova/vit-gpt2-image-captioning',
-            depth: 'Xenova/depth-anything-small-hf',
-            ocr: 'sentence-transformers/all-MiniLM-L6-v2',
-        },
+        vlmPreset: 'qwen3vl-2b',
+        samPreset: 'slimsam',
+        srPreset: 'swin2sr-x2',
+        tagsPreset: 'clip-zero-shot',
+        depthPreset: 'depth-anything-small',
         vlmPrompt: '请用中文详细描述这张图片的主体、场景、风格、构图与可见文字。',
         askPrompt: '{question}',
         samPointsPerTarget: 1,
+        faceModel: 'scrfd-500m',
+        faceModelUrl: '',
+        faceEmbedModel: 'w600k-mbf',
+        faceEmbedUrl: '',
         faceConfidence: 0.6,
+        faceMatchThreshold: 0.4,
         srTile: 256,
     },
+    // 人脸库：{id,name,vector(base64 Float32),dim,createdAt}，识别只在本地比对
+    faceGallery: [],
     comfy: {
         server: 'http://127.0.0.1:8188',
         mode: 'frontend',            // frontend | api
@@ -187,6 +192,7 @@ export const DEFAULT_SETTINGS = {
         profiles: {},
         activeProfileId: 'default',
     },
+    collapseSeed: null,            // 折叠默认值的补种标记（老设置里 collapsed 全是 false）
     tools: defaultToolbarState(),
     customScripts: [],               // {id,name,label,icon,media,code,enabled,params}
     linkTools: [],                   // {id,name,label,icon,media,template,method,openTab,headers,enabled}
@@ -206,14 +212,6 @@ export const BUILTIN_VARS = [
 
 export function findTool(id) {
     return TOOLS.find((t) => t.id === id) || null;
-}
-
-export function toolsForMedia(mediaType, isBg) {
-    return TOOLS.filter((t) => {
-        if (isBg && !t.media.includes('bg')) return false;
-        if (!isBg && !t.media.includes(mediaType)) return false;
-        return true;
-    });
 }
 
 export function migrateSettings(raw) {
@@ -238,7 +236,19 @@ export function migrateSettings(raw) {
         }
         return s;
     }
-    return mergeDeep(s, raw);
+    const out = mergeDeep(s, raw);
+    // 老设置的 tools 里每个 id 都写死了 collapsed:false，会把新默认（视频长尾折叠）整个盖掉，
+    // 于是升级后「还是所有按钮平铺」。只对用户没动过的按钮补上新默认，动过的保持原样。
+    if (!out.collapseSeed) {
+        for (const t of TOOLS) {
+            const st = out.tools && out.tools[t.id];
+            if (!st) continue;
+            const untouched = st.label == null && st.icon == null && st.order == null && st.params == null;
+            if (untouched && DEFAULT_COLLAPSED.includes(t.id)) st.collapsed = true;
+        }
+        out.collapseSeed = 2;
+    }
+    return out;
 }
 
 export function mergeDeep(base, patch) {
@@ -254,14 +264,13 @@ export function mergeDeep(base, patch) {
 }
 
 // 工具栏实际渲染清单：内置(启用) + 自定义脚本(启用) + 链接工具(启用)
-export function buildToolbar(settings, mediaType, isBg) {
+export function buildToolbar(settings, mediaType) {
     const items = [];
     const state = settings.tools || {};
     for (const t of TOOLS) {
         const st = state[t.id] || { enabled: false };
         if (!st.enabled) continue;
         if (!t.media.includes(mediaType)) continue;
-        if (isBg && !t.media.includes('bg')) continue;
         items.push({
             id: t.id,
             label: st.label || t.label,

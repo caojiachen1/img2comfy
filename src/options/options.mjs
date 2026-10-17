@@ -134,7 +134,7 @@ export async function renderPreviewToolbar() {
     if (!previewRef) previewRef = await mountToolbarIntoSlot();
     const { wrap, shadow, host } = previewRef;
     const t = S.settings.toolbar;
-    previewItems = buildToolbar(S.settings, previewMedia, false);
+    previewItems = buildToolbar(S.settings, previewMedia);
     wrap.className = 'wrap show' + (t.layout === 'vertical' ? ' vertical' : '') + (t.layout === 'grid' ? ' grid' : '');
     wrap.dataset.theme = t.theme;
     wrap.style.setProperty('--scale', String(t.scale));

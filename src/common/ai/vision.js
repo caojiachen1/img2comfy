@@ -4,16 +4,19 @@ import { clamp } from '../util.js';
 import { mkPx } from '../imgops/geometry.js';
 import { canvasInput } from './input.js';
 import { tensorToPixels } from '../ai-io.js';
+import { modelIdFor } from './sources.js';
+
+export { modelIdFor };
 
 export const TAG_PRESETS = [
-    { id: 'mobilenetv4', name: 'MobileNetV4 小（约 10MB，ImageNet 标签）', model: 'onnx-community/mobilenetv4_conv_small.e2400_r224_in1k', dtype: 'q4' },
-    { id: 'vit-base', name: 'ViT Base（约 90MB，更准）', model: 'Xenova/vit-base-patch16-224', dtype: 'q4' },
-    { id: 'clip-zero-shot', name: 'CLIP 零样本（自定义中文/英文标签）', model: 'Xenova/clip-vit-base-patch32', dtype: 'q4' },
+    { id: 'mobilenetv4', name: 'MobileNetV4 小（约 10MB，ImageNet 标签）', model: 'onnx-community/mobilenetv4_conv_small.e2400_r224_in1k', ms: 'cjc1887415157/mobilenetv4_conv_small.e2400_r224_in1k', dtype: 'q4' },
+    { id: 'vit-base', name: 'ViT Base（约 90MB，更准）', model: 'Xenova/vit-base-patch16-224', ms: 'cjc1887415157/vit-base-patch16-224', dtype: 'q4' },
+    { id: 'clip-zero-shot', name: 'CLIP 零样本（自定义中文/英文标签）', model: 'Xenova/clip-vit-base-patch32', ms: 'cjc1887415157/clip-vit-base-patch32', dtype: 'q4' },
 ];
 
 export const DEPTH_PRESETS = [
-    { id: 'depth-anything-small', name: 'Depth Anything Small（约 50MB）', model: 'Xenova/depth-anything-small-hf', dtype: 'q4' },
-    { id: 'depth-anything-base', name: 'Depth Anything Base（约 100MB）', model: 'Xenova/depth-anything-base-hf', dtype: 'q4' },
+    { id: 'depth-anything-small', name: 'Depth Anything Small（约 50MB）', model: 'Xenova/depth-anything-small-hf', ms: 'cjc1887415157/depth-anything-small-hf', dtype: 'q4' },
+    { id: 'depth-anything-base', name: 'Depth Anything Base（约 100MB）', model: 'Xenova/depth-anything-base-hf', ms: 'cjc1887415157/depth-anything-base-hf', dtype: 'q4' },
 ];
 
 export class VisionRunner {
@@ -32,35 +35,22 @@ export class VisionRunner {
         return this.cache.get(key);
     }
 
+    // 管线签名是 _call(image, { top_k })（snake_case），传 topK 会被静默忽略、永远只回 5 条
     async classify(px, { model, topK = 8, threshold = 0.2 } = {}) {
         const p = await this.pipe('image-classification', model);
-        const out = await p(canvasInput(px, this.tf), { topK });
-        const labels = (Array.isArray(out) ? out[0] : out) || [];
+        const labels = listOf(await p(canvasInput(px, this.tf), { top_k: topK }));
         return {
             labels: labels.slice(0, topK).map((o) => ({ label: o.label, score: Number((o.score ?? o.confidence ?? 0).toFixed(3)) })),
             filtered: labels.filter((o) => (o.score ?? o.confidence ?? 0) >= threshold).slice(0, topK).map((o) => o.label),
         };
     }
 
-    async zeroShot(px, { model, candidateLabels = [] } = {}) {
+    // 压缩后的签名是 _call(image, candidateLabels, { hypothesis_template })：
+    // 候选标签走的是第二个位置参数，塞进 options 里会直接 "s.map is not a function"
+    async zeroShot(px, { model, candidateLabels = [], template } = {}) {
         const p = await this.pipe('zero-shot-image-classification', model);
-        const out = await p(canvasInput(px, this.tf), { candidateLabels });
-        return { labels: (out[0] || out || []).map?.((o) => ({ label: o.label, score: Number((o.score ?? 0).toFixed(3)) })) || [] };
-    }
-
-    async detect(px, { model = 'Xenova/detr-resnet-50', threshold = 0.5 } = {}) {
-        const p = await this.pipe('object-detection', model);
-        const out = await p(canvasInput(px, this.tf), { threshold });
-        const items = Array.isArray(out) ? out : (out && out.output) || [];
-        return {
-            boxes: items.map((o) => ({
-                x: Math.round(o.xmin ?? o.box?.xmin ?? 0),
-                y: Math.round(o.ymin ?? o.box?.ymin ?? 0),
-                width: Math.round((o.xmax ?? o.box?.xmax ?? 0) - (o.xmin ?? o.box?.xmin ?? 0)),
-                height: Math.round((o.ymax ?? o.box?.ymax ?? 0) - (o.ymin ?? o.box?.ymin ?? 0)),
-                label: o.label, score: Number((o.score ?? 0).toFixed(3)),
-            })),
-        };
+        const out = await p(canvasInput(px, this.tf), candidateLabels, template ? { hypothesis_template: template } : {});
+        return { labels: listOf(out).map((o) => ({ label: o.label ?? o.candidate_label, score: Number((o.score ?? 0).toFixed(3)) })) };
     }
 
     async depth(px, { model, colormap = 'viridis' } = {}) {
@@ -82,8 +72,16 @@ const VIRIDIS = [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253
 const INFERNO = [[0, 0, 4], [87, 16, 134], [198, 51, 118], [249, 137, 10], [252, 255, 164]];
 const GRAY = [[0, 0, 0], [255, 255, 255]];
 
-function colorizeDepth(gray, name) {
-    const stops = name === 'inferno' ? INFERNO : name === 'gray' ? GRAY : VIRIDIS;
+// transformers.js 的分类/零样本管线：单图返回扁平数组，批量才返回 [[...]]。
+// 硬取 out[0] 会拿到第一个结果对象（.slice 直接抛），零样本那条更是被 ?.map 静默吞成空数组。
+export function listOf(out) {
+    if (Array.isArray(out)) return Array.isArray(out[0]) ? out[0] : out;
+    if (out && Array.isArray(out.labels)) return out.labels;
+    if (out && Array.isArray(out.output)) return out.output;
+    return [];
+}
+
+function colorizeDepth(gray, name) {    const stops = name === 'inferno' ? INFERNO : name === 'gray' ? GRAY : VIRIDIS;
     const out = mkPx(gray.width, gray.height);
     const g = gray.data;
     for (let i = 0, j = 0; i < out.data.length; i += 4, j++) {

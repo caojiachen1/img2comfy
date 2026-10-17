@@ -56,6 +56,13 @@ Object.assign(window.__mtbStubHandlers, {
         if (msg.type === 'runtime') return { ok: true, runtime: { webgpu: false, reason: 'stub 里无 GPU', device: 'wasm', hub: 'hf-mirror' } };
         if (msg.type === 'ai' && msg.task === 'cacheSummary') return { ok: true, result: { entries: [{ bytes: 12345, model: 'Xenova/stub' }], count: 1, totalText: '12.1 KB' } };
         if (msg.type === 'ai' && msg.task === 'clearCache') return { ok: true, result: { cleared: 1 } };
+        if (msg.type === 'ai' && msg.task === 'warm') {
+            for (const pct of [30, 70]) {
+                chrome.runtime.sendMessage({ action: 'mtbEvent', type: 'modelProgress', warmFor: msg.kind, phase: 'download', loaded: pct * 1e5, total: 1e7, text: 'download' });
+                await new Promise((r) => setTimeout(r, 90));
+            }
+            return { ok: true, kind: msg.kind, ran: true, ms: 4200 };
+        }
         if (msg.type === 'ai') return { ok: true, text: '一张测试图（stub）', ms: 900 };
         if (msg.type === 'compile') return { ok: true };
         if (msg.type === 'runtimeStatus') return { ok: true, status: rtStatus(false) };
@@ -140,6 +147,51 @@ try {
     chrome.runtime.onMessage.removeListener(progListener);
     clickIf('#btnRuntimeCheck');
     await wait(600);
+
+    // ---- 4c) 模型逐个下载：每个模型一行、各自一个下载按钮与进度条
+    const modelRows = $$('#modelList .m');
+    step('模型清单每个模型一行且带独立下载按钮', modelRows.length === 7 && modelRows.every((r) => !!r.querySelector('.dl') && !!r.querySelector('.mbar i')),
+        { rows: modelRows.length, kinds: modelRows.map((r) => r.dataset.kind).join(',') });
+    window.__mp = 0;
+    chrome.runtime.onMessage.addListener((m) => { if (m?.action === 'mtbHostEvent' && m.type === 'modelProgress') window.__mp++; });
+    const vlmRow = $('#modelList .m[data-kind="vlm"]');
+    vlmRow && vlmRow.querySelector('.dl').click();
+    await until(() => /已下载|失败|下载失败/.test(txt('#modelList .m[data-kind="vlm"] .st')), 12000);
+    const vlmSt = txt('#modelList .m[data-kind="vlm"] .st');
+    step('点某个模型的「下载」：该行进度条走动且状态更新（下载进度只出现在设置页）',
+        /已下载/.test(vlmSt) && window.__mp >= 2 && ($('#modelList .m[data-kind="vlm"] .mbar i') || {}).style?.width === '100%',
+        { st: vlmSt.slice(0, 70), events: window.__mp, bar: ($('#modelList .m[data-kind="vlm"] .mbar i') || {}).style?.width });
+
+    // ---- 4d) 人脸库：空库提示 → 灌三条特征 → 出行/能删/过像提醒/阈值可改
+    const { packVector } = await import('/src/common/ai/face.js');
+    step('人脸库：空库时说明怎么登记', /还没有登记过人脸/.test(txt('#faceGallery')), { hint: txt('#faceGallery').slice(0, 46) });
+    const unit = (arr) => { const n = Math.hypot(...arr); return arr.map((v) => v / n); };
+    const vec = (arr) => { const v = new Float32Array(512); unit(arr).forEach((x, i) => { v[i] = x; }); return v; };
+    const now = Date.now();
+    window.__S.settings.faceGallery = [
+        { id: 'a', name: '甲', vector: packVector(vec([1, 0, 0])), dim: 512, createdAt: now },
+        { id: 'b', name: '乙', vector: packVector(vec([0, 1, 0])), dim: 512, createdAt: now },
+        { id: 'c', name: '丙', vector: packVector(vec([0.9, 0.44, 0])), dim: 512, createdAt: now },
+    ];
+    $('#tabs button[data-tab="help"]').click();
+    await wait(120);
+    $('#tabs button[data-tab="ai"]').click();
+    await until(() => $$('#faceGallery .faces .f').length === 3, 4000);
+    const faceRows = $$('#faceGallery .faces .f');
+    const warnTxt = txt('#faceGallery');
+    step('人脸库：三条特征各一行、显示名字与维度，且提醒「甲/丙」太像', faceRows.length === 3 && /甲/.test(warnTxt) && /相似度/.test(warnTxt) && /互相认错/.test(warnTxt),
+        { rows: faceRows.length, warn: (warnTxt.match(/「.+?」与「.+?」[^]*?阈值/) || [''])[0].slice(0, 60) });
+    const thrInput = $('#faceGallery .gthr input');
+    thrInput.value = '0.95';
+    thrInput.dispatchEvent(new Event('change'));
+    await wait(150);
+    const stillWarn = /互相认错/.test(txt('#faceGallery'));
+    step('人脸库：阈值调到 0.95 后写回设置且不再报互相认错', window.__S.settings.ai.faceMatchThreshold === 0.95 && !stillWarn,
+        { thr: window.__S.settings.ai.faceMatchThreshold, warn: stillWarn });
+    $$('#faceGallery .faces .f button.mini')[0].click();
+    await wait(150);
+    step('人脸库：点删除只去掉那一行', $$('#faceGallery .faces .f').length === 2 && window.__S.settings.faceGallery.every((f) => f.name !== '甲'),
+        { rows: $$('#faceGallery .faces .f').length, names: window.__S.settings.faceGallery.map((f) => f.name).join(',') });
 
     // ---- 5) 自定义功能：切到面板 → 新建脚本 → 语法检查 → 用示例图试跑
     const customTab = $$('#tabs button').find((x) => x.dataset.tab === 'custom');

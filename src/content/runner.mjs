@@ -451,8 +451,21 @@ export class Runner {
     }
 
     // —— AI ——
+    mediaKey() {
+        const m = this.ctx.media;
+        if (!m) return '';
+        return `${m.kind}|${m.src || (m.el && (m.el.currentSrc || m.el.src)) || ''}|${m.el && m.el.currentTime ? Math.round(m.el.currentTime * 10) : 0}`;
+    }
+
     async runAi(item) {
         const task = item.action.task;
+        // 同一张图上再点一次「人脸识别」就是收起人脸框 —— 不然框会一直糊在图上，得另找「清除」
+        if (task === 'face' && this.ctx.facesKey && this.ctx.facesKey === this.mediaKey() && this.ctx.boxLayer?.__boxes?.length) {
+            drawBoxes(this.ctx.boxLayer, [], null);
+            this.ctx.facesKey = null;
+            toast(this.ctx.shadow, '已收起人脸框（再点一次重新识别）', 1800);
+            return;
+        }
         try {
             this.ctx.setStatus?.('准备模型…');
             if (task === 'ask') {
@@ -467,8 +480,9 @@ export class Runner {
             }
             if (task === 'samPick') { this.startSamPick(); return; }
             const src = await this.currentSource();
-            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : 'AI 推理中…');
-            const r = await this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, maxNewTokens: item.params?.maxNewTokens });
+            if (task === 'faceRegister') { await this.registerFace(src); return; }
+            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : task === 'recognize' ? '识别中…' : 'AI 推理中…');
+            const r = await this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, gallery: this.s.faceGallery || [], maxNewTokens: item.params?.maxNewTokens });
             this.ctx.setStatus?.('');
             if (r.blocked) {
                 this.ctx.panel.show({
@@ -484,6 +498,28 @@ export class Runner {
             toast(this.ctx.shadow, errText('AI 失败: ', e), 5200, true);
             console.warn('[mtb] AI 失败', e);
         }
+    }
+
+    // 登记人脸：取图里最大的一张脸 → 提特征 → 起名 → 写进本地人脸库（同名覆盖）
+    async registerFace(src) {
+        const r = await this.sendToHost({ type: 'ai', task: 'faceRegister', ...src, ai: this.s.ai });
+        this.ctx.setStatus?.('');
+        if (r.blocked) {
+            this.ctx.panel.show({ title: '需要确认下载', text: r.blocked.reason, actions: [{ label: '确认登记', run: () => this.sendToHost({ type: 'ai', task: 'faceRegister', ...src, ai: this.s.ai, confirmBudget: true }).then((x) => this.saveFace(x)) }] });
+            return;
+        }
+        await this.saveFace(r);
+    }
+
+    async saveFace(r) {
+        if (!r || !r.vector) { toast(this.ctx.shadow, '没拿到人脸特征', 2600, true); return; }
+        const name = await promptFor(this.ctx.shadow, { title: `给这张脸起个名字（${r.faces > 1 ? '图里有 ' + r.faces + ' 张脸，取最大的' : '已取到人脸'}）`, placeholder: '例如：张三', near: this.ctx.toolbar?.currentTarget });
+        const clean = String(name || '').trim();
+        if (!clean) { toast(this.ctx.shadow, '已取消登记', 1600); return; }
+        const gallery = (this.s.faceGallery || []).filter((g) => g && g.name !== clean);
+        gallery.push({ id: 'f' + Date.now().toString(36), name: clean, vector: r.vector, dim: r.dim, createdAt: Date.now() });
+        await this.ctx.patchSettings?.({ faceGallery: gallery });
+        toast(this.ctx.shadow, `已登记「${clean}」，人脸库 ${gallery.length} 人`, 2600);
     }
 
     async applyAiResult(item, r, src) {
@@ -513,8 +549,19 @@ export class Runner {
                 const ref = { refWidth: r.sourceWidth || near.width, refHeight: r.sourceHeight || near.height };
                 drawBoxes(this.ctx.boxLayer, boxes.map((b) => ({ ...b, ...ref })), near);
             }
-            if (r.faces) this.ctx.lastFaces = r.faces;
+            if (r.faces) { this.ctx.lastFaces = r.faces; this.ctx.facesKey = this.mediaKey(); }
+            if (r.faces && !r.faces.length) toast(this.ctx.shadow, '这张图没检出人脸（换个角度/光线更强的图试试，或在设置里换检测模型）', 3200, true);
             if (r.masks) this.ctx.lastMasks = r.masks;
+        }
+        if (r.faces && typeof r.named === 'number') {
+            const lines = r.faces.map((f, i) => `#${i + 1} ${f.name ? '「' + f.name + '」' : '陌生'}${f.sim != null ? ' 相似度 ' + Math.round(f.sim * 100) + '%' : ''}`);
+            this.ctx.panel.show({
+                title: `认出是谁 · 匹配 ${r.named}/${r.count}`,
+                text: (r.gallery ? `人脸库 ${r.gallery} 人，判定阈值 ${Math.round(r.threshold * 100)}%` : '人脸库还是空的：先用「登记人脸」把常看到的人存进来') + '\n' + lines.join('\n'),
+                near,
+                actions: [{ label: '复制', run: () => copyText(lines.join('\n')) }],
+            });
+            return;
         }
         if (r.count !== undefined && !r.text) toast(this.ctx.shadow, `${item.label}: ${r.count} 个目标`, 2000);
     }
@@ -649,7 +696,7 @@ export class Runner {
 function r0(x) { return x; }
 
 function publicSettings(s) {
-    return { comfy: s.comfy, output: s.output, video: s.video, ai: { device: s.ai.device, models: s.ai.models } };
+    return { comfy: s.comfy, output: s.output, video: s.video, ai: { device: s.ai.device, hub: s.ai.hub } };
 }
 
 function fmt(r) {

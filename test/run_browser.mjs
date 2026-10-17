@@ -1,8 +1,8 @@
 // 页面级验证：起静态服务器（带 hf 权重代理）+ Chrome for Testing，
 // 跑内容脚本包（工具栏/拖拽/算子链/取帧）、AI 宿主（vendor + slimSAM/YuNet/swin2SR 真实推理）、
 // 以及设置页（普通网页 + chrome 桩，逐个点按钮）。
-// 用法：node test/run_browser.mjs [--ai] [--options] [--only=sr|sam|face|vlm|script|options]
-//      环境变量 AI_WAIT / OPT_WAIT = 轮询次数
+// 用法：node test/run_browser.mjs [--ai] [--options] [--only=sr|sam|face|vlm|script|options|warm|faceid|ms]
+//      环境变量 AI_WAIT / OPT_WAIT = 轮询次数；MS_TASKS=sam,sr,tags,depth,face 指定 --only=ms 要验的源
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -137,7 +137,7 @@ const server = http.createServer(serveStatic);
 await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'mtb-browser-'));
-const proc = spawn(BROWSER, ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', `--remote-debugging-port=${CDP}`, `--user-data-dir=${profile}`, '--no-first-run', '--autoplay-policy=no-user-gesture-required', '--window-size=1500,1000', 'about:blank'], { stdio: 'ignore' });
+const proc = spawn(BROWSER, ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', `--remote-debugging-port=${CDP}`, `--user-data-dir=${profile}`, '--no-first-run', '--autoplay-policy=no-user-gesture-required', '--window-size=1920,1080', 'about:blank'], { stdio: 'ignore' });
 let cdp = null;
 for (let i = 0; i < 90; i++) { await wait(300); try { cdp = await Cdp.connect(CDP); break; } catch (e) { /* 等启动 */ } }
 if (!cdp) { console.log(JSON.stringify({ fatal: 'CDP 不可达' })); process.exit(1); }
@@ -224,11 +224,17 @@ const fold = await cdp.ev(page, `(async()=>{
   const after=[...wrap.querySelectorAll('button.btn')].length;
   const pinned=[...wrap.querySelectorAll('button.btn')].map(b=>b.textContent.trim());
   const more=[...wrap.querySelectorAll('button.btn')].find(b=>b.classList.contains('more'));
-  const out={before, after, pinned, hasMore:!!more, menuShown:false, items:[], panelOk:false, closedAfter:false, menuHit:false};
+  const out={before, after, pinned, hasMore:!!more, menuShown:false, items:[], panelOk:false, closedAfter:false, menuHit:false, menuUnderMore:false, stayOnChrome:false};
   if(more){
     more.click(); await new Promise(x=>setTimeout(x,250));
     const menu=wrap.querySelector('.menu');
     out.menuShown=!!(menu&&menu.classList.contains('show'));
+    if(menu&&menu.classList.contains('show')){
+      const mb=more.getBoundingClientRect(), mt=menu.getBoundingClientRect();
+      // 菜单要贴着「⋯ 更多」正下方，不是整条工具栏的左端
+      out.menuUnderMore = mt.top >= mb.bottom - 2 && (Math.abs(mt.left-mb.left) < 8 || Math.abs(mt.right-mb.right) < 8);
+      out.menuGeo={dxLeft:Math.round(mt.left-mb.left), dxRight:Math.round(mt.right-mb.right), gapTop:Math.round(mt.top-mb.bottom)};
+    }
     out.items=[...(menu?menu.querySelectorAll('.mi'):[])].map(x=>x.textContent.trim());
     const mr=menu&&menu.querySelector('.mi');
     if(mr){ const q=mr.getBoundingClientRect(); out.menuHit=document.elementFromPoint(q.left+q.width/2,q.top+q.height/2) ? (document.getElementById('mtb-root').contains(document.elementFromPoint(q.left+q.width/2,q.top+q.height/2))) : false;
@@ -241,6 +247,21 @@ const fold = await cdp.ev(page, `(async()=>{
           const d=g.getImageData(0,0,4,1).data; out.panelOk = d[0]===0 && d[12]===255; break; } }
       out.closedAfter = !(menu.classList.contains('show')); }
   }
+  // 指针移到工具栏上、但已经离开图片：栏子不能消失（否则右边的按钮根本点不到）
+  {
+    const img2=document.getElementById('big'), r2=img2.getBoundingClientRect();
+    document.dispatchEvent(new MouseEvent('mouseover',{clientX:r2.left+r2.width/2,clientY:r2.top+r2.height/2,bubbles:true,composed:true}));
+    await new Promise(x=>setTimeout(x,700));
+    const btns=[...wrap.querySelectorAll('button.btn')];
+    const outside=btns.find(b=>{const q=b.getBoundingClientRect(); return q.right>r2.right+4 || q.left<r2.left-4 || q.bottom>r2.bottom+4;});
+    if(outside){
+      const q=outside.getBoundingClientRect();
+      document.dispatchEvent(new MouseEvent('mousemove',{clientX:q.left+q.width/2,clientY:q.top+q.height/2,bubbles:true,composed:true}));
+      await new Promise(x=>setTimeout(x,1200));   // 跨过两次 300ms 轮询
+      out.stayOnChrome = wrap.classList.contains('show');
+      out.stayBtn = outside.textContent.trim();
+    }
+  }
   const s2=JSON.parse(JSON.stringify(M.state.settings));
   s2.tools.invert.collapsed = false;
   await new Promise(r=>chrome.storage.local.set({mtbSettings:s2}, r));
@@ -248,6 +269,8 @@ const fold = await cdp.ev(page, `(async()=>{
 })()`);
 step('折叠 ▾ 下拉：常驻变少、菜单能开且能命中、菜单项真执行并自动收起',
     !!(fold.hasMore && fold.menuShown && !fold.pinned.some((t) => /反色/.test(t)) && fold.items.some((t) => /反色/.test(t)) && fold.menuHit && fold.panelOk && fold.closedAfter), { fold });
+step('菜单开在「⋯ 更多」正下方（不是整条工具栏左端）', !!fold.menuUnderMore, { geo: fold.menuGeo });
+step('指针移到超出图片的工具栏按钮上，栏子不消失', !!fold.stayOnChrome, { btn: fold.stayBtn });
 
 const chain = await cdp.ev(page, `(async()=>{
   const shadow=document.getElementById('mtb-root').shadowRoot;
@@ -347,12 +370,107 @@ step('视频控制：倍速/逐帧/静音/循环真的改到元素上，站点�
         && !vidCtl.speed.missing && !vidCtl.loop.missing && !vidCtl.seek.missing && !vidCtl.mute.missing), { vidCtl });
 }
 
+// 过程日志全部进右侧悬浮日志窗：工具栏按钮旁边不许再出现状态文字
+const progSplit = await cdp.ev(page, `(async()=>{
+  const shadow=document.getElementById('mtb-root').shadowRoot;
+  const fire=(type,extra)=>chrome.runtime.sendMessage(Object.assign({action:'mtbEvent', type}, extra));
+  const dock=shadow.querySelector('.logbox');
+  const texts=()=>[...(dock?dock.querySelectorAll('.ln .tx'):[])].map((x)=>x.textContent.trim());
+  fire('modelProgress', { warmFor:'vlm', phase:'download', loaded:1, total:100, text:'download 1/100' });
+  await new Promise(r=>setTimeout(r,300));
+  const afterDownload=texts().some((t)=>/download 1\\/100/.test(t));
+  fire('aiProgress', { text:'推理中…' });
+  await new Promise(r=>setTimeout(r,300));
+  const afterAi=texts().some((t)=>/推理中/.test(t));
+  fire('aiProgress', { text:'' });
+  await new Promise(r=>setTimeout(r,300));
+  return {
+    afterDownload, afterAi,
+    shown: !!(dock && dock.classList.contains('show')),
+    busy: !!(dock && dock.querySelector('.ln.busy')),
+    chip: !!shadow.querySelector('.wrap .status'),
+    last: texts().slice(-1)[0] || null,
+  };
+})()`);
+step('下载/推理日志进右侧悬浮窗，结束后不再挂着进行中，按钮旁无状态条',
+    !!(progSplit.afterDownload && progSplit.afterAi && progSplit.shown && !progSplit.busy && !progSplit.chip), { progSplit });
+
+const logDockRows = await cdp.ev(page, `(async()=>{
+  const M=window.__mtb, shadow=document.getElementById('mtb-root').shadowRoot;
+  const dock=shadow.querySelector('.logbox');
+  const rows=()=>dock.querySelectorAll('.ln').length;
+  const before=rows();
+  M.toolbar.onLog('准备模型…');
+  await new Promise(r=>setTimeout(r,140));
+  const shown=dock.classList.contains('show'), busy=!!dock.querySelector('.ln.busy');
+  M.toolbar.onLog('推理中…');
+  await new Promise(r=>setTimeout(r,140));
+  const sameRow=rows()===before+1;          // 同一任务原地刷新，不该一行变多行
+  M.toolbar.onLog('');
+  await new Promise(r=>setTimeout(r,140));
+  const tx=[...dock.querySelectorAll('.ln .tx')].slice(-1)[0].textContent;
+  return { shown, busy, sameRow, timed:/·\\s*\\d+(\\.\\d+)?(s|ms)$/.test(tx), stillBusy:!!dock.querySelector('.ln.busy'), tx };
+})()`);
+step('日志窗：进行中原地刷一行、结束补耗时并去掉进行中',
+    !!(logDockRows.shown && logDockRows.busy && logDockRows.sameRow && logDockRows.timed && !logDockRows.stillBusy), { logDockRows });
+
+const lock = await cdp.ev(page, `(async()=>{
+  const shadow=document.getElementById('mtb-root').shadowRoot, wrap=shadow.querySelector('.wrap');
+  const el=document.getElementById('big'); el.scrollIntoView({block:'center'});
+  await new Promise(r=>setTimeout(r,150));
+  const q=el.getBoundingClientRect();
+  document.dispatchEvent(new MouseEvent('mouseover',{clientX:q.left+40,clientY:q.top+40,bubbles:true,composed:true}));
+  await new Promise(r=>setTimeout(r,700));
+  const a={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')};
+  // 同一张图内移动指针 + 强制重探 + 页面滚动：都不许让已经显示的工具栏自己挪
+  document.dispatchEvent(new MouseEvent('mousemove',{clientX:q.left+q.width/2,clientY:q.top+q.height/2,bubbles:true,composed:true}));
+  await new Promise(r=>setTimeout(r,300));
+  window.__mtb.refresh();
+  window.scrollTo(0,100);
+  await new Promise(r=>setTimeout(r,600));
+  const b={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')};
+  window.scrollTo(0,0);
+  // 指针离开媒体 → 收起；再悬停另一张图 → 按新图重新锚定
+  document.dispatchEvent(new MouseEvent('mouseover',{clientX:2,clientY:2,bubbles:true,composed:true}));
+  await new Promise(r=>setTimeout(r,450));
+  const hidden=!wrap.classList.contains('show');
+  const other=document.getElementById('over'); other.scrollIntoView({block:'center'});
+  await new Promise(r=>setTimeout(r,150));
+  const o=other.getBoundingClientRect();
+  document.dispatchEvent(new MouseEvent('mouseover',{clientX:o.left+o.width/2,clientY:o.top+o.height/2,bubbles:true,composed:true}));
+  await new Promise(r=>setTimeout(r,700));
+  const c={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show'),hit:window.__mtb.state.media&&window.__mtb.state.media.el.id};
+  return { a,b,c,hidden };
+})()`);
+step('工具栏显示后就锁位：移动/重探/滚动都不动，收起再弹出才重新锚定',
+    !!(lock.a.show && lock.b.show && lock.b.l === lock.a.l && lock.b.t === lock.a.t && lock.hidden && lock.c.show && lock.c.hit === 'over'), { lock });
+
+const layer = await cdp.ev(page, `(async()=>{
+  const hitAt=async(id,fx,fy)=>{
+    const el=document.getElementById(id); el.scrollIntoView({block:'center'});
+    await new Promise(r=>setTimeout(r,150));
+    const q=el.getBoundingClientRect();
+    const x=fx==='c'?q.left+q.width/2:q.left+fx, y=fy==='c'?q.top+q.height/2:q.top+fy;
+    document.dispatchEvent(new MouseEvent('mouseover',{clientX:x,clientY:y,bubbles:true,composed:true}));
+    await new Promise(r=>setTimeout(r,700));
+    const m=window.__mtb.state.media;
+    return m ? (m.el.id||m.el.tagName) : null;
+  };
+  return {
+    onTop: await hitAt('over','c','c'),               // 压在上面的小图
+    onBottomOnly: await hitAt('under',20,380),        // 只属于下面那张大图的范围
+    peTop: await hitAt('toppe','c','c'),              // pointer-events:none 的最上层图
+  };
+})()`);
+step('只命中最上层图片：压在上面的图优先，pointer-events:none 也算最上层',
+    layer.onTop === 'over' && layer.onBottomOnly === 'under' && layer.peTop === 'toppe', { layer });
+
 const contentErrors = cdp.pageErrors().filter((e) => !/favicon|404 \(Not Found\)/i.test(e));
 step('内容脚本阶段无页面异常', contentErrors.length === 0, { errors: contentErrors.slice(0, 6) });
 
 // ============================================ 2) AI 宿主与真实模型
 if (DO_AI) {
-    const url = `http://127.0.0.1:${PORT}/test/harness_ai.html${ONLY ? '?only=' + ONLY : ''}`;
+    const url = `http://127.0.0.1:${PORT}/test/harness_ai.html${ONLY ? '?only=' + ONLY : ''}${ONLY === 'ms' && process.env.MS_TASKS ? '&tasks=' + process.env.MS_TASKS : ''}${process.env.VP ? '&vp=' + process.env.VP : ''}`;
     try { fs.writeFileSync(PLOG, ''); } catch (e) { /* ignore */ }
     const ap = await cdp.open(url);
     const LIMIT = process.env.AI_WAIT ? parseInt(process.env.AI_WAIT, 10) : 320;

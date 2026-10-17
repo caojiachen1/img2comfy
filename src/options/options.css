@@ -116,3 +116,18 @@ button.mt.active { background: var(--accent); color: #fff; border-color: var(--a
 .rtfiles .ok { color: #5ce08a; }
 .rtfiles .miss { color: #ffb454; }
 .rtfiles .bad { color: #ff6b6b; }
+
+/* 模型逐个下载 */
+.models .m { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 6px 0; border-bottom: 1px dashed rgba(255,255,255,.08); font-size: 12.5px; }
+.models .mid { color: #9fb4c7; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; display: inline-block; vertical-align: bottom; }
+.models .st { color: #9fb4c7; margin-right: 8px; }
+.mbar { grid-column: 1 / -1; height: 5px; background: rgba(255,255,255,.1); border-radius: 3px; overflow: hidden; }
+.mbar i { display: block; height: 100%; width: 0; background: #5ce08a; transition: width .25s; }
+
+/* 人脸库 */
+#faceGallery .faces { margin-top: 6px; }
+#faceGallery .f { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,.08); font-size: 12.5px; }
+#faceGallery .f .nm { flex: 0 0 auto; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#faceGallery .f .hint { flex: 1; }
+#faceGallery .gthr { display: block; margin-top: 8px; font-size: 12.5px; }
+#faceGallery .gthr input { width: 72px; }

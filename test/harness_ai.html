@@ -124,6 +124,137 @@ const base = location.origin + '/';
         } catch (e) { if (e && e.__skip) { /* 照片源缺失，已单独记为跳过 */ } else step('YuNet 人脸模型可推理', false, { err: String(e.message || e).slice(0, 400), sess: window.__sessInfo || null, ms: Date.now() - t0 }); }
     }
 
+    if (only === 'warm') {
+        // 真走 AiEngine.warm：下载进度必须带 download 标记与 warmFor，
+        // 设置页才知道刷哪一行，工具栏才知道下载进度不该显示在按钮旁边。
+        const { AiEngine } = await import('/src/common/ai/index.js');
+        const events = [];
+        const ai = {
+            hub: 'custom', hubCustom: location.origin + '/proxy/hf', device: 'wasm', dtype: 'fp32',
+            faceModelUrl: location.origin + '/test/media/yunet.onnx', maxDim: 640, faceConfidence: 0.3, downloadBudgetMB: 0,
+        };
+        const engine = new AiEngine({ vendorBase: '/vendor', onEvent: () => { }, onProgress: (p) => events.push({ ...p }) });
+        let res = null, err = null;
+        try {
+            await engine.prepare(ai);
+            engine.confirmBudget(true);
+            res = await engine.task('warm', { kind: 'face', ai });
+        } catch (e) { err = String(e.message || e).slice(0, 300); }
+        const dl = events.filter((e) => e.download);
+        const ui = events.filter((e) => !e.download);
+        step('warm 真跑一次：模型下载并加载', !err && !!(res && res.ok && res.ran), { res, err, n: events.length });
+        step('下载进度带 download:true 且 warmFor 指向该行（设置页归属）', dl.length > 0 && dl.every((e) => e.warmFor === 'face'), { dl: dl.map((e) => `${e.phase} ${e.loaded}/${e.total}`).slice(0, 4) });
+        step('推理阶段不是下载；确认预算 true 一次放行全部模型；收尾 warmFor 归零',
+            ui.length > 0 && engine.confirmedAll === true && engine.warmFor === null, { ui: ui.map((e) => e.phase).slice(0, 6), confirmedAll: engine.confirmedAll, warmFor: engine.warmFor });
+    }
+
+    if (only === 'faceid') {
+        // 整条 digiKam 同款链路：SCRFD 检测 → 5 点对齐 → w600k 向量 → 与本地人脸库比余弦。
+        // 模型走本地文件（网页里直连 hf-mirror 会被 CORS 挡），推理是真的。
+        const { AiEngine } = await import('/src/common/ai/index.js');
+        const { unpackVector, hasLandmarks } = await import('/src/common/ai/face.js');
+        const ai = {
+            hub: 'custom', hubCustom: location.origin + '/proxy/hf', device: 'wasm', dtype: 'fp32',
+            faceModelUrl: location.origin + '/test/media/det_500m.onnx',
+            faceEmbedUrl: location.origin + '/test/media/w600k_mbf.onnx',
+            faceConfidence: 0.5, faceMatchThreshold: 0.4, maxDim: 1024, downloadBudgetMB: 0,
+        };
+        const engine = new AiEngine({ vendorBase: '/vendor', onEvent: () => { }, onProgress: () => { } });
+        const loadPhoto = async (file) => {
+            const el = new Image();
+            el.src = location.origin + '/test/media/' + file;
+            await el.decode();
+            const c = document.createElement('canvas');
+            c.width = el.naturalWidth; c.height = el.naturalHeight;
+            c.getContext('2d', { willReadFrequently: true }).drawImage(el, 0, 0);
+            const id = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, c.width, c.height);
+            return { width: id.width, height: id.height, data: new Uint8ClampedArray(id.data), el };
+        };
+        const shrinkTo = async (photo, k) => {
+            const w = Math.round(photo.width * k), h = Math.round(photo.height * k);
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            c.getContext('2d', { willReadFrequently: true }).drawImage(photo.el, 0, 0, w, h);
+            const id = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h);
+            return { width: w, height: h, data: new Uint8ClampedArray(id.data) };
+        };
+        await engine.prepare(ai);
+        const lena = await loadPhoto('face_lena.jpg');
+        const messi = await loadPhoto('face_messi5.jpg');
+
+        const reg = await engine.task('faceRegister', { px: lena, ai });
+        step('登记人脸：真跑 SCRFD+对齐+识别，拿到 512 维向量与合理的框', reg.dim === 512 && typeof reg.vector === 'string' && reg.vector.length > 500
+            && !!reg.box && reg.box.width / reg.box.height > 0.4 && reg.box.width / reg.box.height < 1.8, { dim: reg.dim, box: reg.box, b64: (reg.vector || '').length });
+
+        const gallery = [{ id: 'g1', name: '莉娜', vector: reg.vector, dim: 512 }];
+        const me = await engine.task('recognize', { px: lena, ai, gallery });
+        step('认得出登记过的人：名字标在脸上且相似度 ≥0.9', me.count >= 1 && me.faces[0].name === '莉娜' && me.faces[0].sim >= 0.9, { faces: me.faces, named: me.named });
+
+        const other = await engine.task('recognize', { px: messi, ai, gallery });
+        step('陌生人不被认成登记的人：匹配 0 且最高相似度低于阈值', other.named === 0 && other.faces.every((f) => (f.sim ?? 1) < other.threshold), { faces: other.faces, threshold: other.threshold });
+
+        const small = await shrinkTo(lena, 0.55);
+        const scaled = await engine.task('recognize', { px: small, ai, gallery });
+        step('缩到 55% 仍认得同一个人（对齐与向量对尺度不敏感）', scaled.count >= 1 && scaled.faces[0].name === '莉娜' && scaled.faces[0].sim >= 0.6, { faces: scaled.faces });
+
+        const empty = await engine.task('recognize', { px: lena, ai, gallery: [] });
+        step('空库只框不命名：sim 为空、overlay 仍带框', empty.count >= 1 && empty.named === 0 && empty.faces[0].sim === null && empty.overlay.length === empty.count, { count: empty.count, overlay: empty.overlay.length });
+        const v = unpackVector(reg.vector);
+        step('人脸库向量可往返（base64 存设置、比对时解回）', v.length === 512 && Math.abs(Math.hypot(...v) - 1) < 1e-3, { len: v.length, norm: +Math.hypot(...v).toFixed(5) });
+        step('检出的人脸都带 5 个特征点（对齐靠它）', me.faces.every((f) => hasLandmarks(f)), { first: me.faces[0] && Object.keys(me.faces[0].landmarks || {}) });
+    }
+
+    if (only === 'ms') {
+        // 真从自己的 ModelScope 仓库（cjc1887415157/*）下载并推理：ModelScope 的 resolve 直链带
+        // Access-Control-Allow-Origin:*，所以普通网页宿主可以直连，不必再走测试服务器的权重代理。
+        const { AiEngine } = await import('/src/common/ai/index.js');
+        const tasks = (new URLSearchParams(location.search).get('tasks') || 'sam,sr,tags,depth,face').split(',');
+        const vp = new URLSearchParams(location.search).get('vp');
+        const ai = {
+            hub: 'modelscope', device: 'wasm', dtype: 'q4', maxDim: 512, downloadBudgetMB: 0,
+            samPreset: 'slimsam', srPreset: 'swin2sr-light-x2', tagsPreset: 'mobilenetv4',
+            depthPreset: 'depth-anything-small', faceModel: 'scrfd-500m', faceEmbedModel: 'w600k-mbf',
+            faceConfidence: 0.5, faceMatchThreshold: 0.4, ...(vp ? { vlmPreset: vp } : {}),
+        };
+        const evs = [];
+        const engine = new AiEngine({ vendorBase: '/vendor', onEvent: (t, d) => { if (/vlm/.test(t)) evs.push({ t, d }); }, onProgress: () => { } });
+        await engine.prepare(ai);
+        const run = async (name, payload) => {
+            const t0 = performance.now();
+            try { const r = await engine.task(name, { ...payload, ai }); return { name, ok: true, ms: Math.round(performance.now() - t0), r }; }
+            catch (e) { return { name, ok: false, err: String(e && e.stack || e.message || e).split('\n').slice(0, 9).join(' | ').slice(0, 900) }; }
+        };
+        if (tasks.includes('sam')) {
+            const x = await run('samPick', { px, points: [[64, 64]], labels: [1] });
+            step('SAM 抠图：从自建 ModelScope 镜像下载 slimSAM 并真出遮罩', x.ok && !!x.r.masks && !!x.r.overlay, { ms: x.ms, masks: x.r && x.r.masks?.length, err: x.err });
+        }
+        if (tasks.includes('sr')) {
+            const x = await run('superResolve', { px });
+            step('AI 超分：从自建镜像下载 Swin2SR 并放大一倍', x.ok && !!x.r.image && x.r.image.width >= px.width * 1.5, { ms: x.ms, out: x.r && x.r.image && (x.r.image.width + 'x' + x.r.image.height), err: x.err });
+        }
+        if (tasks.includes('tags')) {
+            const x = await run('tags', { px, topK: 3 });
+            step('标签分类：从自建镜像下载 MobileNetV4，且 topK 真的生效（snake_case 参数名坑）', x.ok && Array.isArray(x.r.labels) && x.r.labels.length === 3, { ms: x.ms, n: x.r && x.r.labels?.length, top: x.r && x.r.labels?.slice(0, 2), err: x.err });
+        }
+        if (tasks.includes('zeroshot')) {
+            const x = await run('tags', { px, preset: 'clip-zero-shot', candidateLabels: ['一张测试图', '一只猫', '风景照片'] });
+            step('CLIP 零样本：默认档位真出候选标签（曾经被 ?.map 静默吞成空数组）', x.ok && Array.isArray(x.r.labels) && x.r.labels.length === 3, { ms: x.ms, labels: x.r && x.r.labels, err: x.err });
+        }
+        if (tasks.includes('depth')) {
+            const x = await run('depth', { px });
+            step('深度图：从自建镜像下载 Depth-Anything 并出图', x.ok && !!x.r.image, { ms: x.ms, out: x.r && x.r.image && (x.r.image.width + 'x' + x.r.image.height), err: x.err });
+        }
+        if (tasks.includes('vlm')) {
+            const x = await run('describe', { px, maxNewTokens: 12 });
+            step('多模态看图说话：Qwen3-VL q4 从自建镜像整条下载并出文（用户报的 Failed to fetch 就在这条链上）',
+                x.ok && typeof x.r.text === 'string' && x.r.text.length > 0, { err: x.err, engine: x.r && x.r.engine, cps: Array.from(String(x.r.text || '')).slice(0, 24).map((c) => c.codePointAt(0)), text: x.r && String(x.r.text).slice(0, 50), ms: x.ms, evs: evs.map((e) => `${e.t}:${String(e.d && (e.d.error || e.d.task)).slice(0, 70)}`) });
+        }
+        if (tasks.includes('face')) {
+            const det = await run('face', { px: await (async () => { const el = new Image(); el.src = location.origin + '/test/media/face_lena.jpg'; await el.decode(); const c = document.createElement('canvas'); c.width = el.naturalWidth; c.height = el.naturalHeight; c.getContext('2d', { willReadFrequently: true }).drawImage(el, 0, 0); const id = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, c.width, c.height); return { width: id.width, height: id.height, data: new Uint8ClampedArray(id.data) }; })() });
+            step('人脸检测：SCRFD 权重从自建 mtb-face 仓库取到并检出人脸', det.ok && det.r.count >= 1, { ms: det.ms, faces: det.r && det.r.count, backend: det.r && det.r.backend, err: det.err });
+        }
+    }
+
     if (only === 'vlm') {
         const { VlmRunner } = await import('/src/common/ai/vlm.js');
         const cv2 = document.createElement('canvas'); cv2.width = 320; cv2.height = 200;
