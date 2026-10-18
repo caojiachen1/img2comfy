@@ -186,7 +186,7 @@ export async function renderPreviewToolbar() {
         wrap.appendChild(more);
     }
     const gear = document.createElement('button');
-    gear.className = 'btn';
+    gear.className = 'btn gear';
     gear.innerHTML = '<span class="ic">⚙️</span>';
     gear.onclick = () => { $('#stageLog').textContent = '⚙️ 打开设置（真实页面里会跳设置页）'; };
     wrap.appendChild(gear);
@@ -216,8 +216,21 @@ function positionPreview() {
         case 'right-edge': top = (mr.height - h) / 2; left = mr.width - w - m; break;
         default: top = m; left = mr.width - w - m;
     }
-    wrap.style.left = (left + (t.offsetX | 0)) + 'px';
-    wrap.style.top = (top + (t.offsetY | 0)) + 'px';
+    left += t.offsetX | 0;
+    top += t.offsetY | 0;
+    // 工具栏可能比示例图还宽：夹到滚动区可视范围，避免只露出右半截
+    const sr = $('#scroller').getBoundingClientRect();
+    if (sr.width > 0) {
+        const pad = 8;
+        const minLeft = sr.left - mr.left + pad;
+        const maxLeft = sr.right - mr.left - w - pad;
+        const minTop = sr.top - mr.top + pad;
+        const maxTop = sr.bottom - mr.top - h - pad;
+        left = maxLeft >= minLeft ? Math.max(minLeft, Math.min(left, maxLeft)) : minLeft;
+        top = maxTop >= minTop ? Math.max(minTop, Math.min(top, maxTop)) : minTop;
+    }
+    wrap.style.left = left + 'px';
+    wrap.style.top = top + 'px';
 }
 
 let dragBound = false;
@@ -240,14 +253,11 @@ function bindPreviewDrag(host, wrap) {
     });
     host.addEventListener('pointerup', (e) => {
         if (!s) return;
-        const media = previewMedia === 'video' ? $('#sampleVideo') : $('#sampleImg');
-        const mr = media.getBoundingClientRect();
         const wr = wrap.getBoundingClientRect();
         const t = S.settings.toolbar;
-        // 把拖到的位置反解成 anchor + offset，与真实页面的计算方式一致
-        const base = basePos(t.anchor, mr, wr);
-        S.settings.toolbar.offsetX = Math.round(wr.left - base.left);
-        S.settings.toolbar.offsetY = Math.round(wr.top - base.top);
+        // 按「本次真正移动了多少」累加偏移：预览被舞台边缘夹住时不会凭空多出偏移量
+        S.settings.toolbar.offsetX = Math.round((t.offsetX || 0) + wr.left - s.l);
+        S.settings.toolbar.offsetY = Math.round((t.offsetY || 0) + wr.top - s.t);
         S.settings.toolbar.dragMoved = true;
         S.settings.toolbar.anchorOffset = 'custom';
         wrap.classList.remove('dragging');
@@ -256,23 +266,6 @@ function bindPreviewDrag(host, wrap) {
         syncForm();
         toast(`位置：${anchorName(t.anchor)} + 偏移 ${S.settings.toolbar.offsetX},${S.settings.toolbar.offsetY}`);
     });
-}
-
-function basePos(anchor, mr, wr) {
-    const m = 8, w = wr.width, h = wr.height;
-    const map = {
-        'top-left': [mr.left + m, mr.top + m],
-        'top-right': [mr.right - w - m, mr.top + m],
-        'bottom-left': [mr.left + m, mr.bottom - h - m],
-        'bottom-right': [mr.right - w - m, mr.bottom - h - m],
-        center: [mr.left + (mr.width - w) / 2, mr.top + (mr.height - h) / 2],
-        'top-edge': [mr.left + (mr.width - w) / 2, mr.top + m],
-        'bottom-edge': [mr.left + (mr.width - w) / 2, mr.bottom - h - m],
-        'left-edge': [mr.left + m, mr.top + (mr.height - h) / 2],
-        'right-edge': [mr.right - w - m, mr.top + (mr.height - h) / 2],
-    };
-    const [l, t] = map[anchor] || map['top-right'];
-    return { left: l, top: t };
 }
 
 async function setupPreviewMedia() {
