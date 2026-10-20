@@ -45,6 +45,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
     STATE.settings = s;
     if (toolbar) toolbar.applySettings(s);
     if (runner) runner.ctx.settings = s;
+    if (prober) {
+        prober.opts.minImgSize = s.toolbar.minImgSize;
+        prober.opts.skipThumbnails = s.toolbar.skipThumbnails !== false;
+    }
     refresh(true);
 });
 
@@ -112,18 +116,19 @@ async function boot(s) {
         },
         stopPick: () => { STATE.picker.stop(); STATE.pickActive = false; },
         pickActive: () => STATE.pickActive,
-        refreshProbe: () => { if (STATE.media) toolbar.position(STATE.media.displayRect); },
+        refreshProbe: repositionToolbar,
         lastFaces: [], lastMasks: [],
     });
 
     toolbar.onClick = (item, btn, e) => runner.dispatch(item, btn, e);
     toolbar.onMoved = () => positionLayers();
 
-    prober = makeProber({ minImgSize: s.toolbar.minImgSize });
+    prober = makeProber({ minImgSize: s.toolbar.minImgSize, skipThumbnails: s.toolbar.skipThumbnails !== false });
 
     document.addEventListener('mouseover', onOver, true);
     document.addEventListener('mousemove', onMove, { passive: true });
-    window.addEventListener('scroll', onScroll, { passive: true });
+    // 滚动事件不从元素冒泡：不加 capture 就收不到微博/x.com 那种内层容器的滚动
+    window.addEventListener('scroll', onScroll, { passive: true, capture: true });
     window.addEventListener('resize', () => refresh(true));
     document.addEventListener('fullscreenchange', () => { attachToActiveLayer(rootInfo.host); refresh(true); });
     document.addEventListener('keydown', onKeyDown, true);
@@ -147,13 +152,24 @@ function onMove(e) {
     STATE.lastMouse.x = e.clientX; STATE.lastMouse.y = e.clientY;
     if (toolbar?.dragging || STATE.pickActive) return;
     if (STATE.settings.toolbar.showOn === 'hover-key') return;
-    if (STATE.settings.toolbar.showOn === 'always') { if (STATE.media) toolbar.position(STATE.media.displayRect); return; }
+    if (STATE.settings.toolbar.showOn === 'always') { repositionToolbar(); return; }
     if (!wrapVisible()) { probeAndShow(e.clientX, e.clientY); return; }
     if (e.target?.closest?.('#mtb-root')) return;
     refresh(false);
 }
 
-function onScroll() { if (STATE.media) { STATE.media.displayRect = STATE.media.el.getBoundingClientRect(); toolbar.position(STATE.media.displayRect); positionLayers(); } }
+function onScroll() { repositionToolbar(); }
+
+// 滚动/布局会让图片离开原来的屏幕位置：重新量一次矩形，工具栏按锚点跟着走
+function repositionToolbar() {
+    if (!STATE.media?.el) return;
+    if (!STATE.media.el.isConnected) { refresh(true); return; }   // 查看器换掉图片节点了：立刻重探，别等 300ms 心跳
+    const r = STATE.media.el.getBoundingClientRect();
+    if (!r.width || !r.height) return;   // 虚拟列表把图片摘掉后矩形全 0，别把工具栏甩到左上角
+    STATE.media.displayRect = r;
+    toolbar.position(r);
+    positionLayers();
+}
 
 function onKeyDown(e) {
     const mode = STATE.settings.toolbar.showOn;
@@ -218,7 +234,7 @@ function showForMedia() {
     if (!items.length) return hideToolbar();
     const sig = items.map((i) => i.id + (i.label || '') + (i.icon || '') + (i.collapsed ? 'v' : '-')).join('|') + '#' + STATE.settings.toolbar.theme + STATE.settings.toolbar.iconMode + STATE.settings.toolbar.layout + STATE.settings.toolbar.scale + STATE.settings.toolbar.maxTools;
     if (toolbar.signature !== sig) { toolbar.signature = sig; toolbar.render(items, mediaType); }
-    toolbar.show(m.displayRect);
+    toolbar.show(m.displayRect, true);   // 换到这张图：按它的矩形立刻落位（按钮多少变了也要重新对齐）
     positionLayers();
     attachToActiveLayer(document.getElementById('mtb-root'));
     if (STATE.temp) { /* 上一步结果作为当前源 */ }

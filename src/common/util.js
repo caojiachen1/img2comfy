@@ -80,6 +80,35 @@ export function sanitizeFilename(name, max = 120) {
     return s;
 }
 
+// 内容指纹（采样 FNV-1a + 长度）：判断「同名的是不是同一张图」，不用把整张图算一遍
+export function bytesFingerprint(bytes) {
+    const n = bytes ? bytes.length : 0;
+    let h = 0x811c9dc5;
+    const step = n > 65536 ? Math.floor(n / 65536) : 1;
+    for (let i = 0; i < n; i += step) { h ^= bytes[i]; h = Math.imul(h, 0x01000193) >>> 0; }
+    return n + ':' + h.toString(16);
+}
+
+// ComfyUI 的 /upload/image 带 overwrite:true，同名不同内容会互相盖掉（用户报的「只剩最后一张」）。
+// 同一张图重复发还是复用同名，只有内容不同才加 _2/_3 序号。
+export function uniqueUploadName(used, filename, fingerprint) {
+    const seen = used.get(filename);
+    if (seen === undefined) { used.set(filename, fingerprint); return filename; }
+    if (seen === fingerprint) return filename;
+    const dot = String(filename).lastIndexOf('.');
+    const base = dot > 0 ? String(filename).slice(0, dot) : String(filename);
+    const ext = dot > 0 ? String(filename).slice(dot) : '';
+    for (let i = 2; i < 1000; i++) {
+        const cand = `${base}_${i}${ext}`;
+        const s = used.get(cand);
+        if (s === undefined) { used.set(cand, fingerprint); return cand; }
+        if (s === fingerprint) return cand;
+    }
+    const tail = `${base}_${Date.now().toString(36)}${ext}`;
+    used.set(tail, fingerprint);
+    return tail;
+}
+
 export function extFromMime(mime) {
     const m = String(mime || '').toLowerCase();
     if (m.includes('png')) return 'png';

@@ -265,6 +265,12 @@ export function mountToolbar({ shadow, settings }) {
     return { wrap, mask, box };
 }
 
+// 同一张图被滚动/布局挪动（1px 容差防抖动）
+function rectMoved(a, r) {
+    return !a || Math.abs(a.top - r.top) > 1 || Math.abs(a.left - r.left) > 1
+        || Math.abs(a.width - r.width) > 1 || Math.abs(a.height - r.height) > 1;
+}
+
 export class Toolbar {
     constructor({ wrap, settings, onDragEnd }) {
         this.wrap = wrap;
@@ -531,21 +537,24 @@ export class Toolbar {
         this.placed = { x: cx + ox, y: cy + oy };
     }
 
-    // rect = 媒体元素在视口中的矩形。位置只在「首次显示」与「手动拖拽」时定，
-    // 已经显示着的时候换图、滚动、探测刷新都不会让它自己挪。
+    // rect = 媒体元素在视口中的矩形。只要矩形变了就重新锚定：滚动/布局把图挪走、
+    // 或指针换到另一张图，工具栏都得贴着图走；矩形没变就不动，免得心跳重探把它原地抖出来。
+    // 认矩形不认元素身份：大图查看器常在加载原图时换掉 <img> 节点，按节点认会永久冻在旧锚点上。
     position(rect, force = false) {
         if (!rect) return;
         this.currentTarget = rect;
-        if (force || !this.lock) this.lock = this.anchorPoint(rect);
+        if (force || rectMoved(this.lockRect, rect)) {
+            this.lock = this.anchorPoint(rect);
+            this.lockRect = { top: rect.top, left: rect.left, width: rect.width, height: rect.height };
+        }
         this.placeAt(this.lock.x, this.lock.y);
         if (this.menuOpen) this.placeMenu();
         if (this.onMoved) this.onMoved(rect);
     }
 
-    show(rect) {
-        if (!this.wrap.classList.contains('show')) this.lock = null;   // 重新弹出才按当前媒体锚定
+    show(rect, force = false) {
         this.wrap.classList.add('show');
-        this.position(rect);
+        this.position(rect, force);
     }
 
     hide() {
@@ -553,6 +562,7 @@ export class Toolbar {
         this.currentTarget = null;
         this.lock = null;
         this.placed = null;
+        this.lockRect = null;
     }
 }
 

@@ -3,11 +3,17 @@
 
 import { migrateSettings, DEFAULT_SETTINGS } from './src/common/registry.js';
 import { ensureBuiltins } from './src/common/builtin-scripts.js';
-import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl } from './src/common/util.js';
+import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
 let hostMode = null; // 'offscreen' | 'tab'
+let galleryBatch = null;
+// 按标签页存「已经采到过哪些图」：面板是 action popup，用户一点网页它就关了，
+// 下次打开是新文档、内存里的累加全丢 —— 于是「每开一次都少一大堆」。
+const galleryCache = new Map();
+const GALLERY_CACHE_MAX_ITEMS = 1500;
+const GALLERY_CACHE_TTL = 6 * 60 * 60 * 1000;
 
 chrome.runtime.onInstalled.addListener(() => {
     chrome.storage.local.get(['mtbSettings', 'comfyConfig'], (data) => {
@@ -198,6 +204,59 @@ const HANDLERS = {
 
     sendImageToComfyUI: async (req, sender) => comfySend(req, sender),
 
+    startGalleryBatch: async (req) => {
+        if (galleryBatch && galleryBatch.running) return { ok: false, error: '已有一个批量发送任务在进行' };
+        const items = (Array.isArray(req.items) ? req.items : []).slice(0, 500)
+            .filter((x) => x && typeof x.url === 'string' && x.url);
+        if (!items.length) return { ok: false, error: '没有可发送的图片' };
+        galleryBatch = {
+            running: true, cancel: false, canceled: false,
+            autoQueue: !!req.autoQueue, pageUrl: String(req.pageUrl || ''),
+            items, index: 0, ok: 0, fail: 0,
+            currentUrl: '', currentLabel: '', error: '', results: [],
+            startedAt: Date.now(), finishedAt: 0,
+        };
+        runGalleryBatch();
+        return { ok: true };
+    },
+
+    galleryBatchState: async () => ({ ok: true, state: publicGalleryBatch() }),
+
+    cancelGalleryBatch: async () => {
+        if (galleryBatch && galleryBatch.running) galleryBatch.cancel = true;
+        return { ok: true, state: publicGalleryBatch() };
+    },
+
+    galleryCacheGet: async (req) => {
+        const id = Number(req && req.tabId);
+        const e = galleryCache.get(id);
+        if (!e) return { ok: true, entry: null };
+        if (Date.now() - e.at > GALLERY_CACHE_TTL) { galleryCache.delete(id); return { ok: true, entry: null }; }
+        return { ok: true, entry: e };
+    },
+
+    galleryCachePut: async (req) => {
+        const id = Number(req && req.tabId);
+        const entry = req && req.entry;
+        if (!id || !entry || !Array.isArray(entry.groups)) return { ok: false, error: '缺少 tabId 或 groups' };
+        const groups = [];
+        let n = 0;
+        for (const g of entry.groups) {
+            const items = (g && Array.isArray(g.items)) ? g.items : [];
+            if (!items.length) continue;
+            if (n + items.length > GALLERY_CACHE_MAX_ITEMS) {
+                const left = GALLERY_CACHE_MAX_ITEMS - n;
+                if (left > 0) { groups.push({ ...g, items: items.slice(0, left) }); n += left; }
+                break;
+            }
+            groups.push(g); n += items.length;
+        }
+        galleryCache.set(id, { at: Date.now(), meta: entry.meta || null, groups });
+        return { ok: true, items: n, groups: groups.length };
+    },
+
+    galleryCacheClear: async (req) => { galleryCache.delete(Number(req && req.tabId)); return { ok: true }; },
+
     closeHost: async () => {
         try { if (hostMode === 'offscreen') await chrome.offscreen.closeDocument(); } catch (e) { /* 没有文档 */ }
         if (hostTabId != null) { await chrome.tabs.remove(hostTabId).catch(() => {}); hostTabId = null; }
@@ -206,12 +265,74 @@ const HANDLERS = {
     },
 };
 
-chrome.tabs.onRemoved.addListener((id) => { if (id === hostTabId) { hostTabId = null; hostMode = null; } });
+chrome.tabs.onRemoved.addListener((id) => { galleryCache.delete(id); if (id === hostTabId) { hostTabId = null; hostMode = null; } });
 
-// 工具栏图标没有 popup，点击直接开设置页
-chrome.action.onClicked.addListener(() => {
-    chrome.runtime.openOptionsPage();
+// 换页/重新加载就清掉这个标签页的采集缓存，否则会把上一页的图混进当前页
+chrome.tabs.onUpdated.addListener((id, changeInfo) => {
+    if (changeInfo.status === 'loading' || typeof changeInfo.url === 'string') galleryCache.delete(id);
 });
+
+// 「本页图片」批量发送：跑在后台，弹窗/页面关掉也不会中断队列。
+function publicGalleryBatch() {
+    if (!galleryBatch) return null;
+    const b = galleryBatch;
+    return {
+        running: b.running, canceled: b.canceled, autoQueue: b.autoQueue, pageUrl: b.pageUrl,
+        total: b.items.length, index: b.index, ok: b.ok, fail: b.fail,
+        currentUrl: b.currentUrl, currentLabel: b.currentLabel, error: b.error,
+        startedAt: b.startedAt, finishedAt: b.finishedAt,
+        results: b.results.slice(-500),
+    };
+}
+
+function broadcastGallery(payload) {
+    try {
+        chrome.runtime.sendMessage({ action: 'galleryEvent', ...payload }).catch(() => {});
+    } catch (e) { /* 弹窗已经关闭，没有接收方 */ }
+}
+
+async function runGalleryBatch() {
+    const b = galleryBatch;
+    if (!b) return;
+    // MV3 SW 空闲 30s 会被回收；批量期间每 20s 调一次扩展 API 续命
+    const keepAlive = setInterval(() => { try { chrome.runtime.getPlatformInfo().catch(() => {}); } catch (e) { /* ignore */ } }, 20000);
+    try {
+        for (let i = 0; i < b.items.length; i++) {
+            if (b.cancel) { b.canceled = true; break; }
+            const it = b.items[i];
+            b.index = i;
+            b.currentUrl = it.url;
+            b.currentLabel = it.label || '';
+            broadcastGallery({ type: 'progress', ...publicGalleryBatch() });
+            let res;
+            try {
+                res = await comfySend({ imgSrc: it.url, pageUrl: it.pageUrl || b.pageUrl, autoQueue: b.autoQueue, filename: it.filename }, null);
+            } catch (e) {
+                res = { ok: false, error: String((e && e.message) || e) };
+            }
+            const ok = !!(res && res.ok);
+            if (ok) b.ok++; else b.fail++;
+            b.results.push({ url: it.url, ok, error: ok ? '' : String((res && res.error) || '发送失败') });
+            b.currentUrl = '';
+            b.currentLabel = '';
+            b.index = i + 1;
+            broadcastGallery({ type: 'item', ...publicGalleryBatch() });
+            if (!ok && /连不上 ComfyUI|没有找到打开的 ComfyUI 标签页/.test(String((res && res.error) || ''))) {
+                b.error = 'ComfyUI 连接失败，已停止';
+                break;
+            }
+        }
+    } catch (e) {
+        b.error = String((e && e.message) || e);
+    } finally {
+        clearInterval(keepAlive);
+        b.running = false;
+        b.finishedAt = Date.now();
+        b.currentUrl = '';
+        b.currentLabel = '';
+        broadcastGallery({ type: 'done', ...publicGalleryBatch() });
+    }
+}
 
 async function offscreenAlive() {
     // hasDocument 在部分内核上不存在；getContexts 是更可靠的问法。返回 null 表示问不出来。
@@ -331,6 +452,9 @@ function deepMerge(base, patch) {
 
 // ---------------------------------------------------------- ComfyUI
 
+// 本次后台生命周期内用过的上传名 → 内容指纹，避免同名不同图互相覆盖
+const comfyNames = new Map();
+
 async function comfySend(req, sender) {
     const data = await chrome.storage.local.get(['mtbSettings']);
     const settings = migrateSettings(data.mtbSettings || DEFAULT_SETTINGS);
@@ -345,7 +469,11 @@ async function comfySend(req, sender) {
         blob = new Blob([r.bytes], { type: r.mime });
     } else throw new Error('既没有 dataUrl 也没有图片地址');
 
-    const filename = sanitizeFilename(req.filename || (blob.type.includes('jpeg') ? 'web_image.jpg' : 'web_image.png'));
+    // 没传 filename 时绝不能用一个固定常量：ComfyUI 那边 overwrite:true 会让后一张盖掉前一张
+    const ext = extFromMime(blob.type);
+    const wanted = sanitizeFilename(req.filename || `web_${Date.now().toString(36)}.${ext}`);
+    const named = /\.(?:png|jpe?g|webp|gif|avif|bmp|tif|svg)$/i.test(wanted) ? wanted : `${wanted}.${ext}`;
+    const filename = uniqueUploadName(comfyNames, named, bytesFingerprint(new Uint8Array(await blob.arrayBuffer())));
     let last = null;
     const folders = cfg.uploadFolders || 'both';
     const targets = folders === 'both' ? ['input', 'output'] : [folders];

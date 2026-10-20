@@ -22,7 +22,8 @@
     "type": "module"
   },
   "action": {
-    "default_title": "打开 Media Hover Toolbar 设置"
+    "default_title": "本页图片（批量发送到 ComfyUI）",
+    "default_popup": "gallery.html"
   },
   "options_ui": {
     "page": "options.html",

@@ -228,19 +228,28 @@ const logFx = await cdp.ev(fx, `(()=>{
 step('日志窗：过程日志落在右侧悬浮窗里，工具栏按钮旁没有状态条',
     !!(logFx.exists && logFx.shown && logFx.lines.length >= 1 && !logFx.chip && logFx.dockW > 100), { logFx });
 
-// 位置锁定：已经显示着的工具栏，滚动页面不会让它自己挪（旧实现加 scrollX/Y，一滚就往下飞）
+// 滚动跟随：工具栏得贴着图片走，不能钉在老地方和图片脱开。
+// 真扩展的内容脚本在 isolated world，这里拿不到 window.__mtb，只能从 DOM 侧量。
+// 后台页会推迟派发 scroll、并把定时器节流到 1s 一档，所以先 bringToFront，再轮询等它追上（别写死等待时长）。
+await cdp.send('Page.bringToFront', {}, fx).catch(() => {});
 const lockFx = await cdp.ev(fx, `(async()=>{
   const wrap=document.getElementById('mtb-root').shadowRoot.querySelector('.wrap');
-  const a={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top)};
+  const img=document.getElementById('big');
+  const pos=()=>({l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')});
+  const top=()=>Math.round(img.getBoundingClientRect().top);
+  const a=pos(); const at=top(); const sy0=Math.round(window.scrollY);
   window.scrollTo(0,100);
-  await new Promise(r=>setTimeout(r,700));
-  const b={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')};
+  let b=null, sy=0;
+  for(let i=0;i<16;i++){ await new Promise(r=>setTimeout(r,150)); b=pos(); sy=Math.round(window.scrollY); if(b.show && Math.abs(b.t-(a.t-(sy-sy0)))<=2) break; }
+  const bt=top();
   window.scrollTo(0,0);
-  await new Promise(r=>setTimeout(r,400));
-  return {a,b};
+  let c=null;
+  for(let i=0;i<16;i++){ await new Promise(r=>setTimeout(r,150)); c=pos(); if(c.show && Math.abs(c.t-a.t)<=2) break; }
+  return { a, b, c, sy: sy - sy0, shift: at-bt, followed: !!(b && b.show && sy - sy0 > 50 && Math.abs(b.t-(a.t-(sy-sy0))) <= 2),
+    backHome: !!(c && c.show && Math.abs(c.t-a.t) <= 2) };
 })()`);
-step('真扩展里滚动页面后工具栏不自己移动位置',
-    !!(lockFx.b && lockFx.b.show && lockFx.b.l === lockFx.a.l && lockFx.b.t === lockFx.a.t), { lockFx });
+step('真扩展里滚动页面：工具栏跟着图片走，滚回顶部也回到原位',
+    !!(lockFx && lockFx.a.show && lockFx.followed && lockFx.backHome), { lockFx });
 
 const drag = await cdp.ev(fx, `(async()=>{
   const host=document.getElementById('mtb-root'), wrap=host.shadowRoot.querySelector('.wrap');
@@ -556,6 +565,10 @@ step('逐按钮扫描：按钮宽度可见（面板不塌形）', sweep.every((s
         }
         step('起名确认后写进人脸库（chrome.storage 里 512 维 base64 向量）', !!(okClick.ok && stored && stored.name === '莉娜' && stored.dim === 512 && stored.vlen > 500), { okClick, stored });
 
+        // 上一步「登记人脸」的结果面板还压在图片上：不关掉的话探测器会认为图片被遮住，
+        // 工具栏一收 currentTarget 就是 null，识别结果的框根本没地方画
+        await cdp.ev(fx, `document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))`);
+        await wait(400);
         await hoverFace();
         const recClick = await realClick('认出是谁');
         let verdict = null;

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>本页图片 · Media Hover Toolbar</title>
+<link rel="stylesheet" href="src/options/options.css">
+<link rel="stylesheet" href="src/gallery/gallery.css">
+</head>
+<body class="gallery-page">
+<header class="g-header">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3.2"/><circle cx="8.4" cy="9.4" r="1.5" fill="currentColor" stroke="none"/><path d="M4.6 17.2l4.1-4.1a1.9 1.9 0 0 1 2.7 0l2.9 2.9"/><path d="M13.4 19.2H20"/></svg></span>
+    本页图片 <small id="pageTitle">正在读取当前页面…</small>
+  </div>
+  <div class="hdr-actions">
+    <span class="g-site" id="siteInfo"></span>
+    <label class="g-view" title="只列屏幕上下各一屏内的图；关掉则列出这个页面已经加载的全部图"><input type="checkbox" id="onlyView">只看屏幕附近</label>
+    <button id="btnWide" title="下拉面板最宽只能 800px，点这里用接近全屏的大窗打开">⤢ 大窗</button>
+    <button id="btnRefresh" title="重新扫描当前页面">刷新</button>
+    <button id="btnSettings" class="primary" title="打开 Media Hover Toolbar 设置">设置</button>
+  </div>
+</header>
+
+<main class="g-main">
+  <div class="g-summary" id="summary">正在扫描当前网页…</div>
+  <div class="g-groups" id="groups"></div>
+  <div class="g-loading" id="loading"><span class="g-spin"></span><span id="loadingText">正在扫描图片…</span></div>
+  <div class="g-empty" id="empty" hidden>
+    <div class="g-empty-ic">🖼</div>
+    <h2 id="emptyTitle">这个页面没有找到可用的图片</h2>
+    <p id="emptyText">图片可能还没加载完；滚一下页面再点“刷新”。</p>
+  </div>
+</main>
+
+<footer class="g-foot">
+  <div class="g-progress" id="progress" hidden><i id="progressBar"></i></div>
+  <div class="g-foot-row">
+    <label class="g-check g-all"><input type="checkbox" id="selAll"> 全选</label>
+    <button id="btnInvert">反选</button>
+    <button id="btnClear">清空</button>
+    <span class="g-sel" id="selCount">已选 0 张</span>
+    <span class="sp"></span>
+    <span class="g-hint g-comfy" id="comfyInfo"></span>
+    <span class="g-hint" id="status"></span>
+    <button id="btnCancel" class="danger" hidden>停止</button>
+    <button id="btnSend">发送到 ComfyUI</button>
+    <button id="btnSendRun" class="primary">发送并排队执行</button>
+  </div>
+</footer>
+
+<div class="g-lightbox" id="lightbox" hidden>
+  <button class="g-lb-btn g-lb-close" id="lbClose" title="关闭（Esc）">✕</button>
+  <button class="g-lb-btn g-lb-prev" id="lbPrev" title="上一张（←）">‹</button>
+  <img id="lbImg" alt="">
+  <button class="g-lb-btn g-lb-next" id="lbNext" title="下一张（→）">›</button>
+  <div class="g-lb-meta" id="lbMeta"></div>
+</div>
+
+<div class="g-boot" id="bootMask"><span class="g-spin"></span><span>正在按窗口大小排好三列网格…</span></div>
+
+<div id="toast" class="toast"></div>
+<script type="module" src="src/gallery/gallery.mjs"></script>
+</body>
+</html>

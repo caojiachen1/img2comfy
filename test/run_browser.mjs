@@ -421,15 +421,30 @@ const lock = await cdp.ev(page, `(async()=>{
   const q=el.getBoundingClientRect();
   document.dispatchEvent(new MouseEvent('mouseover',{clientX:q.left+40,clientY:q.top+40,bubbles:true,composed:true}));
   await new Promise(r=>setTimeout(r,700));
-  const a={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')};
-  // 同一张图内移动指针 + 强制重探 + 页面滚动：都不许让已经显示的工具栏自己挪
+  const pos=()=>({l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')});
+  const a=pos(); const at=Math.round(el.getBoundingClientRect().top);
+  // 同一张图内移动指针 + 强制重探：图片没挪，栏也不许自己抖
   document.dispatchEvent(new MouseEvent('mousemove',{clientX:q.left+q.width/2,clientY:q.top+q.height/2,bubbles:true,composed:true}));
   await new Promise(r=>setTimeout(r,300));
   window.__mtb.refresh();
+  await new Promise(r=>setTimeout(r,250));
+  const still=pos();
+  // 页面滚动：栏要贴着图片走。只等 150ms，抢在 300ms 心跳重新探测之前读
   window.scrollTo(0,100);
-  await new Promise(r=>setTimeout(r,600));
-  const b={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show')};
+  await new Promise(r=>setTimeout(r,150));
+  const b=pos(); const bt=Math.round(el.getBoundingClientRect().top);
   window.scrollTo(0,0);
+  await new Promise(r=>setTimeout(r,250));
+  const back=pos();
+  // 大图查看器加载原图时常把 <img> 换成新节点：指针不动、只滚动，也必须继续贴着图走
+  const swap=el.cloneNode(true); el.replaceWith(swap);
+  await new Promise(r=>setTimeout(r,500));
+  const a2=pos(); const t2=Math.round(swap.getBoundingClientRect().top);
+  window.scrollTo(0,100);
+  await new Promise(r=>setTimeout(r,150));
+  const b2=pos(); const t2b=Math.round(swap.getBoundingClientRect().top);
+  window.scrollTo(0,0);
+  await new Promise(r=>setTimeout(r,250));
   // 指针离开媒体 → 收起；再悬停另一张图 → 按新图重新锚定
   document.dispatchEvent(new MouseEvent('mouseover',{clientX:2,clientY:2,bubbles:true,composed:true}));
   await new Promise(r=>setTimeout(r,450));
@@ -439,11 +454,16 @@ const lock = await cdp.ev(page, `(async()=>{
   const o=other.getBoundingClientRect();
   document.dispatchEvent(new MouseEvent('mouseover',{clientX:o.left+o.width/2,clientY:o.top+o.height/2,bubbles:true,composed:true}));
   await new Promise(r=>setTimeout(r,700));
-  const c={l:parseFloat(wrap.style.left),t:parseFloat(wrap.style.top),show:wrap.classList.contains('show'),hit:window.__mtb.state.media&&window.__mtb.state.media.el.id};
-  return { a,b,c,hidden };
+  const c=Object.assign(pos(), { hit: window.__mtb.state.media && window.__mtb.state.media.el.id });
+  return { a, still, b, back, c, hidden, shift: at-bt, swapped: { a2, b2, shift: t2-t2b },
+    noJitter: !!(still.show && still.l === a.l && still.t === a.t),
+    followed: !!(b.show && Math.abs((b.t-a.t)+(at-bt)) <= 2),
+    swappedFollows: !!(b2.show && Math.abs((b2.t-a2.t)+(t2-t2b)) <= 2),
+    backHome: Math.abs(back.t-a.t) <= 2 };
 })()`);
-step('工具栏显示后就锁位：移动/重探/滚动都不动，收起再弹出才重新锚定',
-    !!(lock.a.show && lock.b.show && lock.b.l === lock.a.l && lock.b.t === lock.a.t && lock.hidden && lock.c.show && lock.c.hit === 'over'), { lock });
+step('工具栏：同图内移动/重探不抖、滚动贴着图片走、查看器换图片节点后滚动仍跟随、换图重新锚定',
+    !!(lock.a.show && lock.noJitter && lock.shift > 50 && lock.followed && lock.swappedFollows && lock.backHome
+        && lock.hidden && lock.c.show && lock.c.hit === 'over'), { lock });
 
 const layer = await cdp.ev(page, `(async()=>{
   const hitAt=async(id,fx,fy)=>{

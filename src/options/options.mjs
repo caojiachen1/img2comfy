@@ -49,6 +49,7 @@ const BINDINGS = [
     ['toolbar.iconMode', 'iconMode'], ['toolbar.theme', 'theme'], ['toolbar.anchor', 'anchor'],
     ['toolbar.offsetX', 'offsetX', 'num'], ['toolbar.offsetY', 'offsetY', 'num'],
     ['toolbar.maxTools', 'maxTools', 'num'], ['toolbar.minImgSize', 'minImgSize', 'num'],
+    ['toolbar.skipThumbnails', 'skipThumbnails', 'bool'],
     ['toolbar.hideDelay', 'hideDelay', 'num'], ['toolbar.gap', 'gap', 'num'], ['toolbar.radius', 'radius', 'num'],
     ['toolbar.scale', 'scale', 'num'], ['toolbar.opacity', 'opacity', 'num'],
 ];
@@ -68,7 +69,8 @@ export function syncForm() {
         const el = $('#' + id);
         if (!el) continue;
         const v = getPath(S.settings, path);
-        el.value = kind === 'num' ? String(v ?? '') : (v ?? '');
+        if (kind === 'bool') el.checked = !!v;
+        else el.value = kind === 'num' ? String(v ?? '') : (v ?? '');
     }
     $('#scaleV').textContent = Number(S.settings.toolbar.scale).toFixed(2) + 'x';
     $('#opacityV').textContent = Math.round(S.settings.toolbar.opacity * 100) + '%';
@@ -84,7 +86,7 @@ function bindFormEvents() {
         const el = $('#' + id);
         if (!el) continue;
         const h = () => {
-            let v = el.value;
+            let v = kind === 'bool' ? !!el.checked : el.value;
             if (kind === 'num') v = parseFloat(v) || 0;
             setPath(S.settings, path, v);
             if (path === 'toolbar.anchor') { setPath(S.settings, 'toolbar.anchorOffset', null); }

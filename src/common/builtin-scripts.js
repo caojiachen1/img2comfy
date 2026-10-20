@@ -53,9 +53,11 @@ return { toast: ctx.params.autoQueue ? '已发送并排队' : '已发送到 Comf
         entry: 'body',
         hint: '内置示例②：同上，但 autoQueue=true 会触发 Queue Prompt',
         code: `// 内置示例②：发送并立即排队执行（autoQueue）
+// filename 一定要传，而且要每张都不同：ComfyUI 收到同名文件会覆盖掉上一张，批量执行就只剩最后一张。
 const r = await ctx.comfySend({
   dataUrl: ctx.dataUrl,
   imgSrc: ctx.dataUrl ? null : ctx.media.src,
+  filename: ctx.util.sanitizeFilename((ctx.media.kind === 'video' ? 'frame_' : 'web_') + Date.now() + '.' + (ctx.dataUrl ? 'png' : 'jpg')),
   autoQueue: true,
 });
 return r.ok ? { toast: '已发送并排队执行' } : { toast: '执行失败: ' + r.error, isError: true };`,

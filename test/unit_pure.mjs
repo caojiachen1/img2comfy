@@ -8,7 +8,8 @@ import * as CV from '../src/common/cv.js';
 import { STEPS, runChain } from '../src/common/steps.js';
 import { buildToolbar, migrateSettings, DEFAULT_SETTINGS, TOOLS, DEFAULT_COLLAPSED } from '../src/common/registry.js';
 import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.js';
-import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64 } from '../src/common/util.js';
+import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64, bytesFingerprint, uniqueUploadName, extFromMime } from '../src/common/util.js';
+import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial } from '../src/common/gallery.js';
 
 let pass = 0, fail = 0;
 const notes = [];
@@ -409,6 +410,25 @@ console.log('== util ==');
     ok('formatBytes', formatBytes(1536) === '1.5 KB' && formatBytes(5 * 1048576).endsWith('MB'));
     ok('ratioText', ratioText(1920, 1080) === '16:9');
     ok('sanitizeFilename 合并连续非法字符', sanitizeFilename('a:b*c?.png') === 'a_b_c_.png', sanitizeFilename('a:b*c?.png'));
+    {
+        const used = new Map();
+        const a = bytesFingerprint(new Uint8Array([1, 2, 3, 4]));
+        const b = bytesFingerprint(new Uint8Array([1, 2, 3, 5]));
+        ok('ComfyUI 上传名：同名同图复用、同名不同图加序号，不再互相覆盖',
+            uniqueUploadName(used, 'web.png', a) === 'web.png'
+            && uniqueUploadName(used, 'web.png', a) === 'web.png'
+            && uniqueUploadName(used, 'web.png', b) === 'web_2.png'
+            && uniqueUploadName(used, 'web.png', b) === 'web_2.png'
+            && uniqueUploadName(used, 'web.png', bytesFingerprint(new Uint8Array([9]))) === 'web_3.png'
+            && uniqueUploadName(used, 'noext', a) === 'noext'
+            && uniqueUploadName(used, 'noext', b) === 'noext_2',
+            [...used.keys()]);
+        ok('内容指纹：长度或内容不同就不同名，采样不会因为大图而撞车',
+            a !== b && a === bytesFingerprint(new Uint8Array([1, 2, 3, 4]))
+            && bytesFingerprint(new Uint8Array(10)) !== bytesFingerprint(new Uint8Array(11))
+            && bytesFingerprint(null).startsWith('0:')
+            && extFromMime('image/jpeg') === 'jpg' && extFromMime('image/webp') === 'webp');
+    }
     const b64 = bytesToBase64(new Uint8Array([1, 2, 253, 254, 255]));
     ok('base64 往返', base64ToBytes(b64).join(',') === '1,2,253,254,255');
     ok('sniffMime png', sniffMime(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])) === 'image/png');
@@ -559,6 +579,46 @@ console.log('== face（识别数学）==');
         return listOf(flat) === flat && JSON.stringify(listOf([flat])) === JSON.stringify(flat)
             && listOf({ labels: flat }) === flat && listOf(null).length === 0;
     })());
+}
+
+// ---- 本页图片（批量发送窗口） ----
+{
+    ok('微博图 URL：orj360/thumb/mw690 升级到 large',
+        upgradeWeiboImageUrl('https://wx1.sinaimg.cn/orj360/abc.jpg') === 'https://wx1.sinaimg.cn/large/abc.jpg'
+        && upgradeWeiboImageUrl('https://tvax2.sinaimg.cn/thumb150/abc.jpg') === 'https://tvax2.sinaimg.cn/large/abc.jpg'
+        && upgradeWeiboImageUrl('https://wx3.sinaimg.cn/mw690/abc.jpg') === 'https://wx3.sinaimg.cn/large/abc.jpg',
+        upgradeWeiboImageUrl('https://wx1.sinaimg.cn/orj360/abc.jpg'));
+    ok('微博图 URL：large 不重复改、头像 crop 路径不动、非微博原样',
+        upgradeWeiboImageUrl('https://wx1.sinaimg.cn/large/abc.jpg') === 'https://wx1.sinaimg.cn/large/abc.jpg'
+        && upgradeWeiboImageUrl('https://tvax1.sinaimg.cn/crop.0.0.1080.1080.1024/abc.jpg') === 'https://tvax1.sinaimg.cn/crop.0.0.1080.1080.1024/abc.jpg'
+        && upgradeWeiboImageUrl('https://example.com/orj360/abc.jpg') === 'https://example.com/orj360/abc.jpg');
+    ok('微博图 URL：wap/tw/square/bmiddle/auto-webkit 等变体也升 large',
+        ['wap180', 'tw420', 'square', 'bmiddle', 'middle2', 'auto-webkit', 'thumb980', 'orj360']
+            .every((v) => upgradeWeiboImageUrl(`https://wx1.sinaimg.cn/${v}/abc.jpg`) === 'https://wx1.sinaimg.cn/large/abc.jpg'));
+    ok('微博图 URL：不像尺寸目录的路径段不乱改（/m/wallpaper/、深层路径、坏 URL）',
+        upgradeWeiboImageUrl('https://h5.sinaimg.cn/m/wallpaper/abc.jpg') === 'https://h5.sinaimg.cn/m/wallpaper/abc.jpg'
+        && upgradeWeiboImageUrl('https://wx1.sinaimg.cn/abc.jpg') === 'https://wx1.sinaimg.cn/abc.jpg'
+        && upgradeWeiboImageUrl('') === ''
+        && upgradeWeiboImageUrl('not a url') === 'not a url');
+    ok('微博图去重：不同 sinaimg 域名的同一 path 视为同一张',
+        imageDedupeKey('https://wx1.sinaimg.cn/orj360/abc.jpg') === imageDedupeKey('https://tvax2.sinaimg.cn/large/abc.jpg')
+        && imageDedupeKey('https://example.com/a.jpg#x') === imageDedupeKey('https://example.com/a.jpg'));
+    ok('微博域名判定：weibo.com / m.weibo.cn 命中，伪装域名不命中',
+        isWeiboHost('weibo.com') && isWeiboHost('m.weibo.cn') && isWeiboHost('weibo.cn') && !isWeiboHost('weibo.com.evil.com') && !isWeiboHost('notweibo.com'));
+    ok('账号头像首字母', accountInitial('张三') === '张' && accountInitial('alice') === 'A' && accountInitial('') === '?');
+    ok('尺寸档位：卡片 mw690 / 查看器 mw2000 / 原图 large，非档位段与 crop 不动',
+        weiboImageTierUrl('https://wx1.sinaimg.cn/orj360/abc.jpg', 'card') === 'https://wx1.sinaimg.cn/mw690/abc.jpg'
+        && weiboImageTierUrl('https://wx1.sinaimg.cn/orj360/abc.jpg', 'full') === 'https://wx1.sinaimg.cn/mw2000/abc.jpg'
+        && weiboImageTierUrl('https://wx1.sinaimg.cn/large/abc.jpg', 'card') === 'https://wx1.sinaimg.cn/mw690/abc.jpg'
+        && weiboImageTierUrl('https://wx2.sinaimg.cn/tw420/abc.gif', 'card') === 'https://wx2.sinaimg.cn/mw690/abc.gif'
+        && weiboImageTierUrl('https://tvax1.sinaimg.cn/crop.0.0.1080.1080.180/abc.jpg', 'card') === 'https://tvax1.sinaimg.cn/crop.0.0.1080.1080.180/abc.jpg'
+        && weiboImageTierUrl('https://h5.sinaimg.cn/m/wallpaper/abc.jpg', 'full') === 'https://h5.sinaimg.cn/m/wallpaper/abc.jpg'
+        && weiboImageTierUrl('https://example.com/a.jpg', 'card') === 'https://example.com/a.jpg'
+        && weiboImageTierUrl('', 'card') === '');
+    ok('缩略图开关默认开，迁移补默认且尊重用户关闭',
+        DEFAULT_SETTINGS.toolbar.skipThumbnails === true
+        && migrateSettings({ version: 2, toolbar: {} }).toolbar.skipThumbnails === true
+        && migrateSettings({ version: 2, toolbar: { skipThumbnails: false } }).toolbar.skipThumbnails === false);
 }
 
 __summary();

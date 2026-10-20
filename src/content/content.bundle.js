@@ -92,6 +92,73 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
         return null;
     }
 
+    // —— 缩略图抑制 ——
+    // 只收起「能点开大图的缩略图」的工具栏（微博九宫格、点开 lightbox 的网格图等）。
+    // 判定必须保守：大图、查看器里的图、不可点开的普通插图都继续出按钮，别破坏「有图就有按钮」。
+    const VIEWER_ATTRS = '[data-lightbox],[data-fancybox],[data-gallery],[data-photoswipe],[data-zoom],[aria-modal="true"],[role="dialog"]';
+    const VIEWER_CLASS = /(?:lightbox|viewer|photo-?view|image-?view|zoom-?view|fancybox|photoswipe|modal|overlay|gallery-?view|preview-?mask)/i;
+    const WEIBO_HOST = /(^|\.)weibo\.(com|cn)$/i;
+
+    function inViewerChrome(el) {
+        let node = el, hops = 0;
+        while (node && node.nodeType === 1 && hops < 12) {
+            try {
+                const cs = getComputedStyle(node);
+                if (node.matches?.('dialog[open], [aria-modal="true"], [role="dialog"]')) return true;
+                if ((cs.position === 'fixed' || cs.position === 'absolute') && VIEWER_CLASS.test(String(node.id || '') + ' ' + String(node.className || ''))) return true;
+                if (cs.position === 'fixed') {
+                    const r = node.getBoundingClientRect();
+                    const z = parseInt(cs.zIndex, 10);
+                    if (r.width >= innerWidth * .65 && r.height >= innerHeight * .45 && (!Number.isFinite(z) || z >= 10)) return true;
+                }
+            } catch (e) { /* ignore */ }
+            node = node.parentElement; hops++;
+        }
+        return false;
+    }
+
+    function hasViewerTrigger(el) {
+        let node = el, hops = 0;
+        while (node && node.nodeType === 1 && hops < 8) {
+            try {
+                if (node.matches?.(VIEWER_ATTRS)) return true;
+                if (getComputedStyle(node).cursor === 'zoom-in') return true;
+                if (node.tagName === 'A') {
+                    const href = node.getAttribute('href') || '';
+                    if (/^(?:javascript:|#)/i.test(href)) return true;
+                    if (/\.(?:jpe?g|png|webp|avif|gif|bmp)(?:[?#]|$)/i.test(href)) return true;
+                    if (/(?:photo|image|img|pic|picture|zoom|lightbox|preview|viewer|gallery|media)/i.test(href)) return true;
+                    if (/(?:^|\/)p\//i.test(href)) return true;
+                }
+            } catch (e) { /* ignore */ }
+            node = node.parentElement; hops++;
+        }
+        return false;
+    }
+
+    function isSuppressedThumbnail(c) {
+        if (c.kind === 2) return false;                      // 视频不参与
+        const rect = c.el.getBoundingClientRect();
+        const longSide = Math.max(rect.width, rect.height);
+        if (longSide < 40) return false;
+        const src = c.srcOverride || c.el.currentSrc || c.el.src || '';
+        // 已经是 large/original 原图（典型是查看器）就不算缩略图
+        if (/\/(?:large|original|mw2000)\//i.test(src)) return false;
+        if (inViewerChrome(c.el)) return false;
+        const weibo = WEIBO_HOST.test(location.hostname);
+        if (c.kind === 1) {
+            // background-image 容器拿不到原始尺寸，只做保守的小图判定
+            if (longSide > 320) return false;
+            return weibo || hasViewerTrigger(c.el);
+        }
+        const nw = c.natural?.width || 0, nh = c.natural?.height || 0;
+        if (!nw || !nh) return false;
+        const scale = Math.max(nw / Math.max(1, rect.width), nh / Math.max(1, rect.height));
+        if (scale < 1.5) return false;
+        if (longSide > (weibo ? 380 : 460)) return false;
+        return weibo || hasViewerTrigger(c.el);
+    }
+
     function findMediaAtPoint(x, y) {
         const stack = document.elementsFromPoint(x, y);
         const candidates = [];
@@ -181,6 +248,7 @@ function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}) {
         for (const c of pool) if (c.kind === undefined) c.kind = 0;
         // 只认最上层那张：被压在下面的图片永远不该弹出工具栏
         const best = pickTopLayer(pool);
+        if (opts.skipThumbnails !== false && isSuppressedThumbnail(best)) return null;
         return {
             el: best.el,
             src: best.srcOverride,
@@ -557,6 +625,12 @@ function mountToolbar({ shadow, settings }) {
     return { wrap, mask, box };
 }
 
+// 同一张图被滚动/布局挪动（1px 容差防抖动）
+function rectMoved(a, r) {
+    return !a || Math.abs(a.top - r.top) > 1 || Math.abs(a.left - r.left) > 1
+        || Math.abs(a.width - r.width) > 1 || Math.abs(a.height - r.height) > 1;
+}
+
 class Toolbar {
     constructor({ wrap, settings, onDragEnd }) {
         this.wrap = wrap;
@@ -823,21 +897,24 @@ class Toolbar {
         this.placed = { x: cx + ox, y: cy + oy };
     }
 
-    // rect = 媒体元素在视口中的矩形。位置只在「首次显示」与「手动拖拽」时定，
-    // 已经显示着的时候换图、滚动、探测刷新都不会让它自己挪。
+    // rect = 媒体元素在视口中的矩形。只要矩形变了就重新锚定：滚动/布局把图挪走、
+    // 或指针换到另一张图，工具栏都得贴着图走；矩形没变就不动，免得心跳重探把它原地抖出来。
+    // 认矩形不认元素身份：大图查看器常在加载原图时换掉 <img> 节点，按节点认会永久冻在旧锚点上。
     position(rect, force = false) {
         if (!rect) return;
         this.currentTarget = rect;
-        if (force || !this.lock) this.lock = this.anchorPoint(rect);
+        if (force || rectMoved(this.lockRect, rect)) {
+            this.lock = this.anchorPoint(rect);
+            this.lockRect = { top: rect.top, left: rect.left, width: rect.width, height: rect.height };
+        }
         this.placeAt(this.lock.x, this.lock.y);
         if (this.menuOpen) this.placeMenu();
         if (this.onMoved) this.onMoved(rect);
     }
 
-    show(rect) {
-        if (!this.wrap.classList.contains('show')) this.lock = null;   // 重新弹出才按当前媒体锚定
+    show(rect, force = false) {
         this.wrap.classList.add('show');
-        this.position(rect);
+        this.position(rect, force);
     }
 
     hide() {
@@ -845,6 +922,7 @@ class Toolbar {
         this.currentTarget = null;
         this.lock = null;
         this.placed = null;
+        this.lockRect = null;
     }
 }
 
@@ -1258,6 +1336,35 @@ function sanitizeFilename(name, max = 120) {
     return s;
 }
 
+// 内容指纹（采样 FNV-1a + 长度）：判断「同名的是不是同一张图」，不用把整张图算一遍
+function bytesFingerprint(bytes) {
+    const n = bytes ? bytes.length : 0;
+    let h = 0x811c9dc5;
+    const step = n > 65536 ? Math.floor(n / 65536) : 1;
+    for (let i = 0; i < n; i += step) { h ^= bytes[i]; h = Math.imul(h, 0x01000193) >>> 0; }
+    return n + ':' + h.toString(16);
+}
+
+// ComfyUI 的 /upload/image 带 overwrite:true，同名不同内容会互相盖掉（用户报的「只剩最后一张」）。
+// 同一张图重复发还是复用同名，只有内容不同才加 _2/_3 序号。
+function uniqueUploadName(used, filename, fingerprint) {
+    const seen = used.get(filename);
+    if (seen === undefined) { used.set(filename, fingerprint); return filename; }
+    if (seen === fingerprint) return filename;
+    const dot = String(filename).lastIndexOf('.');
+    const base = dot > 0 ? String(filename).slice(0, dot) : String(filename);
+    const ext = dot > 0 ? String(filename).slice(dot) : '';
+    for (let i = 2; i < 1000; i++) {
+        const cand = `${base}_${i}${ext}`;
+        const s = used.get(cand);
+        if (s === undefined) { used.set(cand, fingerprint); return cand; }
+        if (s === fingerprint) return cand;
+    }
+    const tail = `${base}_${Date.now().toString(36)}${ext}`;
+    used.set(tail, fingerprint);
+    return tail;
+}
+
 function extFromMime(mime) {
     const m = String(mime || '').toLowerCase();
     if (m.includes('png')) return 'png';
@@ -1409,7 +1516,7 @@ function pick(obj, keys) {
     return out;
 }
 
-return { "MB": (typeof MB === 'undefined' ? undefined : MB), "clamp": (typeof clamp === 'undefined' ? undefined : clamp), "lerp": (typeof lerp === 'undefined' ? undefined : lerp), "isNum": (typeof isNum === 'undefined' ? undefined : isNum), "toNum": (typeof toNum === 'undefined' ? undefined : toNum), "toInt": (typeof toInt === 'undefined' ? undefined : toInt), "deepMerge": (typeof deepMerge === 'undefined' ? undefined : deepMerge), "isObj": (typeof isObj === 'undefined' ? undefined : isObj), "clone": (typeof clone === 'undefined' ? undefined : clone), "uid": (typeof uid === 'undefined' ? undefined : uid), "formatBytes": (typeof formatBytes === 'undefined' ? undefined : formatBytes), "formatDuration": (typeof formatDuration === 'undefined' ? undefined : formatDuration), "sanitizeFilename": (typeof sanitizeFilename === 'undefined' ? undefined : sanitizeFilename), "extFromMime": (typeof extFromMime === 'undefined' ? undefined : extFromMime), "mimeFromExt": (typeof mimeFromExt === 'undefined' ? undefined : mimeFromExt), "baseNameFromUrl": (typeof baseNameFromUrl === 'undefined' ? undefined : baseNameFromUrl), "filenameFromUrl": (typeof filenameFromUrl === 'undefined' ? undefined : filenameFromUrl), "fillTemplate": (typeof fillTemplate === 'undefined' ? undefined : fillTemplate), "fillTemplateRaw": (typeof fillTemplateRaw === 'undefined' ? undefined : fillTemplateRaw), "debounce": (typeof debounce === 'undefined' ? undefined : debounce), "sleep": (typeof sleep === 'undefined' ? undefined : sleep), "bytesToBase64": (typeof bytesToBase64 === 'undefined' ? undefined : bytesToBase64), "base64ToBytes": (typeof base64ToBytes === 'undefined' ? undefined : base64ToBytes), "dataUrlToBytes": (typeof dataUrlToBytes === 'undefined' ? undefined : dataUrlToBytes), "bytesToDataUrl": (typeof bytesToDataUrl === 'undefined' ? undefined : bytesToDataUrl), "sniffMime": (typeof sniffMime === 'undefined' ? undefined : sniffMime), "ratioText": (typeof ratioText === 'undefined' ? undefined : ratioText), "escapeHtml": (typeof escapeHtml === 'undefined' ? undefined : escapeHtml), "normRect": (typeof normRect === 'undefined' ? undefined : normRect), "pick": (typeof pick === 'undefined' ? undefined : pick) };
+return { "MB": (typeof MB === 'undefined' ? undefined : MB), "clamp": (typeof clamp === 'undefined' ? undefined : clamp), "lerp": (typeof lerp === 'undefined' ? undefined : lerp), "isNum": (typeof isNum === 'undefined' ? undefined : isNum), "toNum": (typeof toNum === 'undefined' ? undefined : toNum), "toInt": (typeof toInt === 'undefined' ? undefined : toInt), "deepMerge": (typeof deepMerge === 'undefined' ? undefined : deepMerge), "isObj": (typeof isObj === 'undefined' ? undefined : isObj), "clone": (typeof clone === 'undefined' ? undefined : clone), "uid": (typeof uid === 'undefined' ? undefined : uid), "formatBytes": (typeof formatBytes === 'undefined' ? undefined : formatBytes), "formatDuration": (typeof formatDuration === 'undefined' ? undefined : formatDuration), "sanitizeFilename": (typeof sanitizeFilename === 'undefined' ? undefined : sanitizeFilename), "bytesFingerprint": (typeof bytesFingerprint === 'undefined' ? undefined : bytesFingerprint), "uniqueUploadName": (typeof uniqueUploadName === 'undefined' ? undefined : uniqueUploadName), "extFromMime": (typeof extFromMime === 'undefined' ? undefined : extFromMime), "mimeFromExt": (typeof mimeFromExt === 'undefined' ? undefined : mimeFromExt), "baseNameFromUrl": (typeof baseNameFromUrl === 'undefined' ? undefined : baseNameFromUrl), "filenameFromUrl": (typeof filenameFromUrl === 'undefined' ? undefined : filenameFromUrl), "fillTemplate": (typeof fillTemplate === 'undefined' ? undefined : fillTemplate), "fillTemplateRaw": (typeof fillTemplateRaw === 'undefined' ? undefined : fillTemplateRaw), "debounce": (typeof debounce === 'undefined' ? undefined : debounce), "sleep": (typeof sleep === 'undefined' ? undefined : sleep), "bytesToBase64": (typeof bytesToBase64 === 'undefined' ? undefined : bytesToBase64), "base64ToBytes": (typeof base64ToBytes === 'undefined' ? undefined : base64ToBytes), "dataUrlToBytes": (typeof dataUrlToBytes === 'undefined' ? undefined : dataUrlToBytes), "bytesToDataUrl": (typeof bytesToDataUrl === 'undefined' ? undefined : bytesToDataUrl), "sniffMime": (typeof sniffMime === 'undefined' ? undefined : sniffMime), "ratioText": (typeof ratioText === 'undefined' ? undefined : ratioText), "escapeHtml": (typeof escapeHtml === 'undefined' ? undefined : escapeHtml), "normRect": (typeof normRect === 'undefined' ? undefined : normRect), "pick": (typeof pick === 'undefined' ? undefined : pick) };
 })();
 __M["src/common/imgops/geometry.js"] = (function(){
 // 重采样与几何变换：全部在像素数组上完成，不经 canvas，保证可单测与跨上下文一致。
@@ -5246,6 +5353,7 @@ const DEFAULT_SETTINGS = {
         showKey: 'Alt',
         hideDelay: 120,
         minImgSize: 200,
+        skipThumbnails: true,        // 能点开大图的缩略图（微博九宫格等）不弹，查看器大图才弹
         maxTools: 0,                 // 0=不限制，超出折叠到 +
         animation: true,
         zIndex: 2147483647,
@@ -5481,9 +5589,11 @@ return { toast: ctx.params.autoQueue ? '已发送并排队' : '已发送到 Comf
         entry: 'body',
         hint: '内置示例②：同上，但 autoQueue=true 会触发 Queue Prompt',
         code: `// 内置示例②：发送并立即排队执行（autoQueue）
+// filename 一定要传，而且要每张都不同：ComfyUI 收到同名文件会覆盖掉上一张，批量执行就只剩最后一张。
 const r = await ctx.comfySend({
   dataUrl: ctx.dataUrl,
   imgSrc: ctx.dataUrl ? null : ctx.media.src,
+  filename: ctx.util.sanitizeFilename((ctx.media.kind === 'video' ? 'frame_' : 'web_') + Date.now() + '.' + (ctx.dataUrl ? 'png' : 'jpg')),
   autoQueue: true,
 });
 return r.ok ? { toast: '已发送并排队执行' } : { toast: '执行失败: ' + r.error, isError: true };`,
@@ -5610,6 +5720,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
     STATE.settings = s;
     if (toolbar) toolbar.applySettings(s);
     if (runner) runner.ctx.settings = s;
+    if (prober) {
+        prober.opts.minImgSize = s.toolbar.minImgSize;
+        prober.opts.skipThumbnails = s.toolbar.skipThumbnails !== false;
+    }
     refresh(true);
 });
 
@@ -5677,18 +5791,19 @@ async function boot(s) {
         },
         stopPick: () => { STATE.picker.stop(); STATE.pickActive = false; },
         pickActive: () => STATE.pickActive,
-        refreshProbe: () => { if (STATE.media) toolbar.position(STATE.media.displayRect); },
+        refreshProbe: repositionToolbar,
         lastFaces: [], lastMasks: [],
     });
 
     toolbar.onClick = (item, btn, e) => runner.dispatch(item, btn, e);
     toolbar.onMoved = () => positionLayers();
 
-    prober = makeProber({ minImgSize: s.toolbar.minImgSize });
+    prober = makeProber({ minImgSize: s.toolbar.minImgSize, skipThumbnails: s.toolbar.skipThumbnails !== false });
 
     document.addEventListener('mouseover', onOver, true);
     document.addEventListener('mousemove', onMove, { passive: true });
-    window.addEventListener('scroll', onScroll, { passive: true });
+    // 滚动事件不从元素冒泡：不加 capture 就收不到微博/x.com 那种内层容器的滚动
+    window.addEventListener('scroll', onScroll, { passive: true, capture: true });
     window.addEventListener('resize', () => refresh(true));
     document.addEventListener('fullscreenchange', () => { attachToActiveLayer(rootInfo.host); refresh(true); });
     document.addEventListener('keydown', onKeyDown, true);
@@ -5712,13 +5827,24 @@ function onMove(e) {
     STATE.lastMouse.x = e.clientX; STATE.lastMouse.y = e.clientY;
     if (toolbar?.dragging || STATE.pickActive) return;
     if (STATE.settings.toolbar.showOn === 'hover-key') return;
-    if (STATE.settings.toolbar.showOn === 'always') { if (STATE.media) toolbar.position(STATE.media.displayRect); return; }
+    if (STATE.settings.toolbar.showOn === 'always') { repositionToolbar(); return; }
     if (!wrapVisible()) { probeAndShow(e.clientX, e.clientY); return; }
     if (e.target?.closest?.('#mtb-root')) return;
     refresh(false);
 }
 
-function onScroll() { if (STATE.media) { STATE.media.displayRect = STATE.media.el.getBoundingClientRect(); toolbar.position(STATE.media.displayRect); positionLayers(); } }
+function onScroll() { repositionToolbar(); }
+
+// 滚动/布局会让图片离开原来的屏幕位置：重新量一次矩形，工具栏按锚点跟着走
+function repositionToolbar() {
+    if (!STATE.media?.el) return;
+    if (!STATE.media.el.isConnected) { refresh(true); return; }   // 查看器换掉图片节点了：立刻重探，别等 300ms 心跳
+    const r = STATE.media.el.getBoundingClientRect();
+    if (!r.width || !r.height) return;   // 虚拟列表把图片摘掉后矩形全 0，别把工具栏甩到左上角
+    STATE.media.displayRect = r;
+    toolbar.position(r);
+    positionLayers();
+}
 
 function onKeyDown(e) {
     const mode = STATE.settings.toolbar.showOn;
@@ -5783,7 +5909,7 @@ function showForMedia() {
     if (!items.length) return hideToolbar();
     const sig = items.map((i) => i.id + (i.label || '') + (i.icon || '') + (i.collapsed ? 'v' : '-')).join('|') + '#' + STATE.settings.toolbar.theme + STATE.settings.toolbar.iconMode + STATE.settings.toolbar.layout + STATE.settings.toolbar.scale + STATE.settings.toolbar.maxTools;
     if (toolbar.signature !== sig) { toolbar.signature = sig; toolbar.render(items, mediaType); }
-    toolbar.show(m.displayRect);
+    toolbar.show(m.displayRect, true);   // 换到这张图：按它的矩形立刻落位（按钮多少变了也要重新对齐）
     positionLayers();
     attachToActiveLayer(document.getElementById('mtb-root'));
     if (STATE.temp) { /* 上一步结果作为当前源 */ }

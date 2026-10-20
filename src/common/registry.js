@@ -126,6 +126,7 @@ export const DEFAULT_SETTINGS = {
         showKey: 'Alt',
         hideDelay: 120,
         minImgSize: 200,
+        skipThumbnails: true,        // 能点开大图的缩略图（微博九宫格等）不弹，查看器大图才弹
         maxTools: 0,                 // 0=不限制，超出折叠到 +
         animation: true,
         zIndex: 2147483647,

@@ -88,6 +88,73 @@ export function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}
         return null;
     }
 
+    // —— 缩略图抑制 ——
+    // 只收起「能点开大图的缩略图」的工具栏（微博九宫格、点开 lightbox 的网格图等）。
+    // 判定必须保守：大图、查看器里的图、不可点开的普通插图都继续出按钮，别破坏「有图就有按钮」。
+    const VIEWER_ATTRS = '[data-lightbox],[data-fancybox],[data-gallery],[data-photoswipe],[data-zoom],[aria-modal="true"],[role="dialog"]';
+    const VIEWER_CLASS = /(?:lightbox|viewer|photo-?view|image-?view|zoom-?view|fancybox|photoswipe|modal|overlay|gallery-?view|preview-?mask)/i;
+    const WEIBO_HOST = /(^|\.)weibo\.(com|cn)$/i;
+
+    function inViewerChrome(el) {
+        let node = el, hops = 0;
+        while (node && node.nodeType === 1 && hops < 12) {
+            try {
+                const cs = getComputedStyle(node);
+                if (node.matches?.('dialog[open], [aria-modal="true"], [role="dialog"]')) return true;
+                if ((cs.position === 'fixed' || cs.position === 'absolute') && VIEWER_CLASS.test(String(node.id || '') + ' ' + String(node.className || ''))) return true;
+                if (cs.position === 'fixed') {
+                    const r = node.getBoundingClientRect();
+                    const z = parseInt(cs.zIndex, 10);
+                    if (r.width >= innerWidth * .65 && r.height >= innerHeight * .45 && (!Number.isFinite(z) || z >= 10)) return true;
+                }
+            } catch (e) { /* ignore */ }
+            node = node.parentElement; hops++;
+        }
+        return false;
+    }
+
+    function hasViewerTrigger(el) {
+        let node = el, hops = 0;
+        while (node && node.nodeType === 1 && hops < 8) {
+            try {
+                if (node.matches?.(VIEWER_ATTRS)) return true;
+                if (getComputedStyle(node).cursor === 'zoom-in') return true;
+                if (node.tagName === 'A') {
+                    const href = node.getAttribute('href') || '';
+                    if (/^(?:javascript:|#)/i.test(href)) return true;
+                    if (/\.(?:jpe?g|png|webp|avif|gif|bmp)(?:[?#]|$)/i.test(href)) return true;
+                    if (/(?:photo|image|img|pic|picture|zoom|lightbox|preview|viewer|gallery|media)/i.test(href)) return true;
+                    if (/(?:^|\/)p\//i.test(href)) return true;
+                }
+            } catch (e) { /* ignore */ }
+            node = node.parentElement; hops++;
+        }
+        return false;
+    }
+
+    function isSuppressedThumbnail(c) {
+        if (c.kind === 2) return false;                      // 视频不参与
+        const rect = c.el.getBoundingClientRect();
+        const longSide = Math.max(rect.width, rect.height);
+        if (longSide < 40) return false;
+        const src = c.srcOverride || c.el.currentSrc || c.el.src || '';
+        // 已经是 large/original 原图（典型是查看器）就不算缩略图
+        if (/\/(?:large|original|mw2000)\//i.test(src)) return false;
+        if (inViewerChrome(c.el)) return false;
+        const weibo = WEIBO_HOST.test(location.hostname);
+        if (c.kind === 1) {
+            // background-image 容器拿不到原始尺寸，只做保守的小图判定
+            if (longSide > 320) return false;
+            return weibo || hasViewerTrigger(c.el);
+        }
+        const nw = c.natural?.width || 0, nh = c.natural?.height || 0;
+        if (!nw || !nh) return false;
+        const scale = Math.max(nw / Math.max(1, rect.width), nh / Math.max(1, rect.height));
+        if (scale < 1.5) return false;
+        if (longSide > (weibo ? 380 : 460)) return false;
+        return weibo || hasViewerTrigger(c.el);
+    }
+
     function findMediaAtPoint(x, y) {
         const stack = document.elementsFromPoint(x, y);
         const candidates = [];
@@ -177,6 +244,7 @@ export function makeProber({ minImgSize = 200, wrapSelector = '#mtb-root' } = {}
         for (const c of pool) if (c.kind === undefined) c.kind = 0;
         // 只认最上层那张：被压在下面的图片永远不该弹出工具栏
         const best = pickTopLayer(pool);
+        if (opts.skipThumbnails !== false && isSuppressedThumbnail(best)) return null;
         return {
             el: best.el,
             src: best.srcOverride,
