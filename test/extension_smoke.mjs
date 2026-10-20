@@ -588,6 +588,28 @@ step('逐按钮扫描：按钮宽度可见（面板不塌形）', sweep.every((s
     }
 }
 
+// 扩展重载之后，页面里那份内容脚本就成了僵尸（端口随旧扩展一起销毁）。用户就是在这里撞到
+// "Uncaught Error: Extension context invalidated" 的：点齿轮这类一次性动作必须自己兜住，
+// 换成「刷新页面」提示。必须放在所有真功能步骤之后 —— runtime.reload 会把扩展整个换掉。
+const errMark = cdp.pageErrors().length;
+await cdp.ev(swSess, `chrome.runtime.reload(); true`).catch(() => { /* SW 会被带走，属预期 */ });
+await wait(2600);
+const gearDead = await cdp.ev(fx, `(async()=>{
+  const root=document.getElementById('mtb-root'); const s=root&&root.shadowRoot;
+  const gear=s?s.querySelector('button.btn.gear'):null;
+  if(!s) return {noShadow:true};
+  const before=s.querySelectorAll('.toast').length;
+  if(gear) gear.click();
+  await new Promise(r=>setTimeout(r,700));
+  const list=[...s.querySelectorAll('.toast')];
+  const shown=list.filter((t)=>t.classList.contains('show')).map((t)=>t.textContent);
+  return {clicked:!!gear, grew:s.querySelectorAll('.toast').length>before, shown};
+})()`);
+const deadErr = cdp.pageErrors().slice(errMark).filter((e) => /Extension context invalidated/.test(e));
+step('扩展重载后点齿轮不甩未捕获异常，改说「刷新页面」',
+    !!(gearDead && gearDead.clicked && gearDead.shown.some((t) => /扩展已更新/.test(t)) && deadErr.length === 0),
+    { gearDead, deadErr });
+
 report.pageErrors = cdp.pageErrors().slice(0, 15);
 console.log('\n=== 页面错误（去重） ===');
 console.log(report.pageErrors.length ? report.pageErrors.join('\n') : '（无）');

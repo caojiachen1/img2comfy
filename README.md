@@ -297,7 +297,7 @@ src/gallery/*                 采集注入函数 collect.mjs + 批量窗口逻�
 src/common/gallery.js         微博图 URL 升级/去重键/域名判定等纯函数
 vendor/                       transformers.js + onnxruntime-web + QuickJS wasm（setup-vendor.mjs 生成，已 gitignore）
 scripts/                      build-content / setup-vendor / check-imports
-test/                         unit_pure（215 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
+test/                         unit_pure（220 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
                               gallery_probe（有头，本页图片/批量发送）、cdp.mjs、旧的 run_headless + harness + cors_server
 ```
 
@@ -309,7 +309,7 @@ test/                         unit_pure（215 条）、run_browser + harness_pag
 
 ## 五、已知边界（如实记录）
 
-- 端到端验证覆盖到：215 条算法单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+- 端到端验证覆盖到：220 条算法单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
   slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）、
   多模态也跑通了真推理（`qwen3vl-2b` q4f16 约 490s、`smolvlm2-256m` 约 146s 出答案）。
   GB 级权重在 CPU 模式下仍然很慢，建议 GPU + `q4`；断流写坏的半截缓存会在建会话时炸成
@@ -325,4 +325,8 @@ test/                         unit_pure（215 条）、run_browser + harness_pag
   命中数均为 **0**——jinja 是 AST 解释器，不生成 JS 代码，所以**没有 unsafe-eval 时 VLM 照常可用**。
   唯一需要 eval 的是用户自定义脚本，现在改为在 wasm 里跑 QuickJS 解释器（`src/common/script-vm.js`），
   因此 manifest 里既没有 `sandbox` 页也没有放松 CSP；设置页的「语法检查」同样经宿主转发给 QuickJS 编译。
+- 在 edge://extensions 里**重载扩展之后，已经打开的网页里那份内容脚本是僵尸**（它的 runtime 端口随旧扩展一起销毁），
+  没法自愈，唯一出路是刷新页面。所以内容脚本的一次性动作（点齿轮开设置、拖位置、开标签）都走 `bgSend()`：
+  先 `extAlive()` 探活、再兜住同步抛出的 `Extension context invalidated`，统一提示「扩展已更新…请按 F5 刷新页面后再用」，
+  不让它冒成未捕获异常。
 - 用户脚本不能直接操作页面 DOM（只能经 `ctx.overlay/panel`），这是刻意的安全边界。

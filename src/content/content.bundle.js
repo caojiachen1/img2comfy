@@ -5681,6 +5681,7 @@ const { Runner, copyText } = __M["src/content/runner.mjs"];
 const { buildToolbar, migrateSettings, DEFAULT_SETTINGS } = __M["src/common/registry.js"];
 const { ensureBuiltins } = __M["src/common/builtin-scripts.js"];
 const { captureVideoFrame } = __M["src/content/frame.js"];
+const { extAlive, friendlyError, DEAD_TEXT } = __M["src/common/ext-state.js"];
 
 const STATE = {
     settings: null,
@@ -5702,6 +5703,30 @@ let runner = null;
 let boxLayer = null;
 let maskLayer = null;
 let shadow = null;
+
+// 扩展在 edge://extensions 里重载（或更新）之后，页面里这份内容脚本就成了僵尸：它的 runtime 端口
+// 随旧扩展一起销毁，之后任何 sendMessage 都会同步抛 "Extension context invalidated"。
+// 齿轮、拖工具栏这类一次性点击最容易撞到，不能把天书甩成未捕获异常 —— 统一换成「刷新页面」指令。
+function deadToast() {
+    if (shadow) toast(shadow, DEAD_TEXT, 5000, true);
+}
+
+async function bgSend(req) {
+    if (!extAlive()) { deadToast(); return { ok: false, dead: true, error: DEAD_TEXT }; }
+    try {
+        const res = await new Promise((resolve) => {
+            chrome.runtime.sendMessage(req, (r) => {
+                const err = chrome.runtime.lastError;
+                resolve(err ? { ok: false, error: err.message } : r);
+            });
+        });
+        return res;
+    } catch (e) {
+        const f = friendlyError(e);
+        if (f.dead) deadToast();
+        return { ok: false, error: f.text, dead: f.dead };
+    }
+}
 
 chrome.runtime.sendMessage({ action: 'getState' }, (res) => {
     if (chrome.runtime.lastError) { return; }
@@ -5758,7 +5783,7 @@ async function boot(s) {
     STATE.picker = new Picker({ shadow, settings: s });
     toolbar = new Toolbar({ wrap, settings: s, onDragEnd: persistToolbarOffsets });
     toolbar.onLog = (text) => logDock.status(text);
-    toolbar.onOpenSettings = () => chrome.runtime.sendMessage({ action: 'openOptions' });
+    toolbar.onOpenSettings = () => { bgSend({ action: 'openOptions' }); };
     toolbar.itemBuilder = (s, mediaType) => buildToolbar(s, mediaType || 'image');
 
     runner = new Runner({
@@ -5778,7 +5803,7 @@ async function boot(s) {
         }),
         runToolById: (id, over) => { const it = toolbar.items.find((x) => x.id === id) || { id, label: id, action: { type: 'comfy', autoQueue: /run/.test(id) } }; runner.dispatch(it); },
         patchSettings: async (patch) => {
-            const res = await chrome.runtime.sendMessage({ action: 'patchSettings', patch });
+            const res = await bgSend({ action: 'patchSettings', patch });
             // storage.onChanged 会把新设置推回来，这里只兜住失败
             if (res && res.ok === false) console.warn('[mtb] 写设置失败', res.error);
             return res;
@@ -5938,7 +5963,8 @@ function positionLayers() {
 
 async function persistToolbarOffsets(t) {
     const patch = { toolbar: { offsetX: Math.round(t.offsetX), offsetY: Math.round(t.offsetY), anchorOffset: 'custom', anchor: t.anchor, dragMoved: true } };
-    await chrome.runtime.sendMessage({ action: 'patchSettings', patch });
+    const res = await bgSend({ action: 'patchSettings', patch });
+    if (res && res.dead) return;
     toast(shadow, `位置已保存（相对${anchorName(t.anchor)} 偏移 ${Math.round(t.offsetX)},${Math.round(t.offsetY)}）`, 2200);
 }
 
@@ -5951,7 +5977,8 @@ async function ensureHost() {
     if (STATE.hostOk) return true;
     if (STATE.hostTried && Date.now() - STATE.hostTried < 4000) throw new Error('AI 宿主仍在启动中，请 3 秒后再试');
     STATE.hostTried = Date.now();
-    const r = await chrome.runtime.sendMessage({ action: 'ensureHost' });
+    const r = await bgSend({ action: 'ensureHost' });
+    if (r && r.dead) throw new Error(DEAD_TEXT);
     if (!r || !r.ok) throw new Error('无法启动 AI 宿主：' + (r?.error || '未知错误'));
     STATE.hostOk = true;
     return true;
@@ -5985,7 +6012,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg?.action === 'mtbHostEvent' && msg.type === 'toolUi') {
         const p = msg.payload || {};
-        if (p.action === 'openTab') chrome.runtime.sendMessage({ action: 'openTab', url: p.url });
+        if (p.action === 'openTab') bgSend({ action: 'openTab', url: p.url });
         if (p.action === 'toast') toast(shadow, p.text, 2600, p.isError);
         if (p.action === 'panel' && p.spec) panel?.show({
             title: p.spec.title, dataUrl: p.spec.dataUrl || null, text: p.spec.text || null,
