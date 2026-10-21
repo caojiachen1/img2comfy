@@ -656,6 +656,29 @@ step('内层滚动容器里滚过的帖子不算回收节点（容器 scrollTop 
         && cres.groups.every((g) => !/回收/.test(String(g.label)))),
     { scroll: cstate, got: cres && cres.total, groups: cres && cres.groups.map((g) => [String(g.label).slice(0, 12), g.items.length]), dropHist: cres && cres.dropHist });
 if (scrollerTabId) await cdp.ev(swSess, `chrome.tabs.remove(${scrollerTabId}).then(()=>true)`).catch(() => {});
+// 组内「反选」：只翻转这一条微博的勾选，别的组一条不动（用户要的是发过几张之后能把剩下的挑出来）
+const invScope = await cdp.ev(gallery, `(async()=>{
+  const gs=[...document.querySelectorAll('.g-group:not(.g-junk)')];
+  const selIn=(g)=>[...g.querySelectorAll('.g-card')].filter(c=>c.classList.contains('sel')).length;
+  gs[0].querySelector('.g-group-head input[type=checkbox]').click();
+  gs[1].querySelector('.g-group-head input[type=checkbox]').click();
+  await new Promise(r=>setTimeout(r,250));
+  const before={a:selIn(gs[0]),b:selIn(gs[1]),total:document.querySelectorAll('.g-card.sel').length};
+  gs[0].querySelector('.g-group-inv').click();
+  await new Promise(r=>setTimeout(r,250));
+  const after={a:selIn(gs[0]),b:selIn(gs[1]),total:document.querySelectorAll('.g-card.sel').length,
+    count:document.querySelector('#selCount').textContent};
+  gs[0].querySelector('.g-group-inv').click();
+  await new Promise(r=>setTimeout(r,250));
+  const back={a:selIn(gs[0]),total:document.querySelectorAll('.g-card.sel').length};
+  return {before,after,back,hasInv:gs.every((g)=>!!g.querySelector('.g-group-inv'))};
+})()`);
+step('组内反选只翻转这一条微博：别组不动，再点一次能翻回来',
+    !!(invScope && invScope.hasInv && invScope.before.a === 9 && invScope.before.b === 9 && invScope.before.total === 18
+        && invScope.after.a === 0 && invScope.after.b === 9 && invScope.after.total === 9 && /9/.test(invScope.after.count)
+        && invScope.back.a === 9 && invScope.back.total === 18), invScope);
+await cdp.ev(gallery, `document.querySelector('#btnClear').click()`);
+await wait(200);
 await cdp.ev(gallery, `(()=>{const c=document.querySelector('#selAll');c.click();return c.checked})()`);
 await wait(250);
 const sel = await cdp.ev(gallery, `({text:document.querySelector('#selCount').textContent, cards:document.querySelectorAll('.g-card.sel').length})`);
@@ -675,6 +698,44 @@ step('假 ComfyUI 收到 36 次上传 / 36 次排队', counters.uploads === 36 &
 step('上传文件名带上序号且互不重复', counters.filenames.length === 36 && new Set(counters.filenames).size === 36 && counters.filenames.every((n) => /^mtb_/.test(n)), { names: counters.filenames.slice(0, 3) });
 // 只有真正发给 ComfyUI 才拉 large 原图（浏览阶段一张都不该拉，见前面那条档位断言）
 step('发送时才取 large 原图（36 张）', (counters.tiers.large || 0) >= 36, counters.tiers);
+
+// 用户的真实场景：一条九宫格先发了 3 张，点一下组里的「反选」就要把这条里剩下没发的 6 张选中。
+// 发送成功的卡片勾不会掉，所以「组内翻转」正好等于「取消已发送、选中未发送」
+const invPart = await cdp.ev(gallery, `(async()=>{
+  document.querySelector('#btnClear').click();
+  await new Promise(r=>setTimeout(r,200));
+  const g=document.querySelector('.g-group:not(.g-junk)');
+  const cs=[...g.querySelectorAll('.g-card')];
+  cs.slice(0,3).forEach((c)=>c.click());
+  await new Promise(r=>setTimeout(r,250));
+  return {picked:cs.filter((c)=>c.classList.contains('sel')).length,
+    total:document.querySelectorAll('.g-card.sel').length};
+})()`);
+await cdp.ev(gallery, `document.querySelector('#btnSend').click()`);
+let sent3 = null;
+for (let i = 0; i < 120; i++) {
+    sent3 = await cdp.ev(gallery, `({status:document.querySelector('#status').textContent, sent:document.querySelectorAll('.g-card.sent').length, running:!document.querySelector('#btnCancel').hidden})`);
+    if (sent3 && /完成|停止/.test(sent3.status)) break;
+    await wait(250);
+}
+const invAfter = await cdp.ev(gallery, `(async()=>{
+  const g=document.querySelector('.g-group:not(.g-junk)');
+  const cs=[...g.querySelectorAll('.g-card')];
+  const sentStillSel=cs.filter((c)=>c.classList.contains('sent')&&c.classList.contains('sel')).length;
+  g.querySelector('.g-group-inv').click();
+  await new Promise(r=>setTimeout(r,250));
+  return {sentStillSel,
+    nowSel:cs.filter((c)=>c.classList.contains('sel')).length,
+    sentNowSel:cs.filter((c)=>c.classList.contains('sent')&&c.classList.contains('sel')).length,
+    unsentNowSel:cs.filter((c)=>!c.classList.contains('sent')&&c.classList.contains('sel')).length,
+    otherGroups:document.querySelectorAll('.g-card.sel').length};
+})()`);
+step('发过几张后点组内反选：选中的正好是这条里没发过的那几张',
+    !!(invPart && invPart.picked === 3 && invPart.total === 3 && sent3 && sent3.sent === 3 && !sent3.running
+        && invAfter.sentStillSel === 3 && invAfter.nowSel === 6 && invAfter.sentNowSel === 0
+        && invAfter.unsentNowSel === 6 && invAfter.otherGroups === 6), { invPart, sent3, invAfter });
+await cdp.ev(gallery, `document.querySelector('#btnClear').click()`);
+await wait(200);
 
 // 工具栏那条路：脚本不传 filename 时后台必须给出唯一名，否则 overwrite:true 让后一张盖掉前一张
 const legacy = await cdp.ev(swSess, `(async()=>{
@@ -859,6 +920,41 @@ step('打开面板不跳：遮罩盖住撑尺寸的过程，揭开后卡片宽�
         && /^\d+px$/.test(bootWatch.pin) && bootWatch.firstW > 100 && bootWatch.changed === 0
         && bootWatch.cols === 3 && bootWatch.card === bootWatch.firstW), bootWatch);
 await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>Promise.all(ts.filter(t=>(t.url||'').includes('gallery.html?tabId=${tabId}')).map(t=>chrome.tabs.remove(t.id)))).then(()=>true)`).catch(() => { /* 关不掉就算了 */ });
+
+// 退出面板再打开，勾的还必须在那儿：popup 每次都是新文档，所以勾选只能靠后台按标签页存的那份
+const selTabA = await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${tabId}`);
+await cdp.send('Emulation.setDeviceMetricsOverride', { width: 800, height: 600, deviceScaleFactor: 1, mobile: false }, selTabA);
+let readyA = null;
+for (let i = 0; i < 40; i++) {
+    readyA = await cdp.ev(selTabA, `({cards:document.querySelectorAll('.g-card').length,mask:!!(document.getElementById('bootMask')||{hidden:true}).hidden})`);
+    if (readyA && readyA.cards === 36 && readyA.mask) break;
+    await wait(300);
+}
+const markA = await cdp.ev(selTabA, `(async()=>{
+  const cs=[...document.querySelectorAll('.g-group:not(.g-junk) .g-card')].slice(0,3);
+  cs.forEach((c)=>c.click());
+  await new Promise(r=>setTimeout(r,800));
+  return {keys:cs.map((c)=>c.dataset.key), sel:document.querySelectorAll('.g-card.sel').length,
+    count:document.querySelector('#selCount').textContent};
+})()`);
+// 连面板一起关掉（等同用户点网页把 popup 收起），再重新打开一个全新文档
+await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>Promise.all(ts.filter(t=>(t.url||'').includes('gallery.html?tabId=${tabId}')).map(t=>chrome.tabs.remove(t.id)))).then(()=>true)`).catch(() => { /* 关不掉就算了 */ });
+await wait(500);
+const selTabB = await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${tabId}`);
+await cdp.send('Emulation.setDeviceMetricsOverride', { width: 800, height: 600, deviceScaleFactor: 1, mobile: false }, selTabB);
+let backB = null;
+for (let i = 0; i < 40; i++) {
+    backB = await cdp.ev(selTabB, `(()=>({cards:document.querySelectorAll('.g-card').length,
+      sel:[...document.querySelectorAll('.g-card.sel')].map((c)=>c.dataset.key),
+      count:document.querySelector('#selCount').textContent}))()`);
+    if (backB && backB.cards === 36 && backB.sel.length > 0) break;
+    await wait(300);
+}
+step('退出图片面板再打开：之前勾选的三张仍然是勾选状态',
+    !!(readyA && readyA.cards === 36 && markA && markA.sel === 3 && /已选 3/.test(markA.count)
+        && backB && backB.cards === 36 && backB.sel.length === 3
+        && backB.sel.every((k) => markA.keys.includes(k)) && /已选 3/.test(backB.count)),
+    { readyA, markA, backB });
 
 const summary = dump();
 console.log('\n=== 汇总 ===\n' + JSON.stringify(summary, null, 1));

@@ -28,6 +28,7 @@ const S = {
     byUrl: new Map(),
     groupEls: new Map(),
     batchState: new Map(),
+    selSaved: '',
     running: false,
     lbIndex: -1,
     lbList: [],
@@ -210,6 +211,7 @@ async function collect(keepSelection) {
         return;
     }
     applyData(data, keepSelection);
+    if (!keepSelection) await restoreSelection();
     saveToCache();
 }
 
@@ -233,6 +235,37 @@ function saveToCache() {
     };
     chrome.runtime.sendMessage({ action: 'galleryCachePut', tabId: S.tabId, entry: { meta, groups: S.raw.groups } })
         .catch(() => {});
+}
+
+/* 勾选状态按标签页存在后台：popup 一点网页就销毁，重开必须是「我勾的还勾着」。
+   条目键（<组键>|<图片去重键>）跨扫描稳定，所以按 key 恢复即可，不依赖第几张卡片 */
+const selSnapshot = () => [...S.selected].sort().join('\n');
+
+function saveSelectionToBg() {
+    if (!S.tabId || S.running) return;
+    const snap = selSnapshot();
+    if (snap === S.selSaved) return;
+    // 不发定时器：用户点完就可能立刻去点网页把 popup 收掉，定时器会被一起销毁、这一下就丢
+    S.selSaved = snap;
+    chrome.runtime.sendMessage({
+        action: 'gallerySelPut', tabId: S.tabId,
+        pageUrl: (S.data && S.data.pageUrl) || '',
+        keys: snap ? snap.split('\n') : [],
+    }).catch(() => {});
+}
+
+async function restoreSelection() {
+    if (!S.tabId) return;
+    let res = null;
+    try { res = await chrome.runtime.sendMessage({ action: 'gallerySelGet', tabId: S.tabId }); } catch (e) { return; }
+    const keys = res && Array.isArray(res.keys) ? res.keys : [];
+    if (!keys.length) return;
+    // 换过页面就不许把上一页的勾选搬过来（后台也会清，这里再挡一道）
+    if (res.pageUrl && S.data && S.data.pageUrl && res.pageUrl !== S.data.pageUrl) return;
+    const want = new Set(keys);
+    S.selected = new Set(S.flat.filter((it) => want.has(it.key)).map((it) => it.key));
+    S.selSaved = selSnapshot();
+    refreshSelectionUI();
 }
 
 async function scanOnce() {
@@ -494,7 +527,25 @@ function renderGroups() {
         };
         checkLabel.title = '选中/取消这条内容的全部图片';
         checkLabel.append(check);
-        head.append(avatar, title, sp, checkLabel);
+
+        // 用户要的是「这条九宫格发过几张，点一下就把剩下没发的选中」：发送成功后勾不会掉，
+        // 所以组内翻转就等价于「取消已发送、选中未发送」，而且只影响这一条微博
+        const inv = document.createElement('button');
+        inv.className = 'g-group-inv';
+        inv.type = 'button';
+        inv.textContent = '反选';
+        inv.title = '只翻转这条内容的勾选：刚发送过的取消，剩下没发送的选中';
+        inv.onclick = () => {
+            if (S.running) return;
+            for (const it of g.items) {
+                if (S.selected.has(it.key)) S.selected.delete(it.key);
+                else S.selected.add(it.key);
+            }
+            refreshSelectionUI();
+        };
+        head.append(avatar, title, sp);
+        if (!g.junk) head.append(inv);
+        head.append(checkLabel);
 
         const grid = document.createElement('div');
         grid.className = 'g-grid';
@@ -526,7 +577,7 @@ function renderGroups() {
 
         sec.append(head, grid);
         box.appendChild(sec);
-        S.groupEls.set(g.key, { group: g, check });
+        S.groupEls.set(g.key, { group: g, check, inv });
     }
     ensureGroupsObserver();
     fitLayout();
@@ -867,13 +918,15 @@ function refreshSelectionUI() {
     $('#btnSend').disabled = S.running || n === 0;
     $('#btnSendRun').disabled = S.running || n === 0;
     $('#btnRefresh').disabled = S.running;
-    for (const { group, check } of S.groupEls.values()) {
+    for (const { group, check, inv } of S.groupEls.values()) {
         const cnt = group.items.reduce((m, it) => m + (S.selected.has(it.key) ? 1 : 0), 0);
         check.checked = cnt > 0 && cnt === group.items.length;
         check.indeterminate = cnt > 0 && cnt < group.items.length;
         check.disabled = S.running;
+        if (inv) inv.disabled = S.running;
     }
     $('#btnCancel').hidden = !S.running;
+    saveSelectionToBg();
 }
 
 function stateLabel(state, info) {

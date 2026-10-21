@@ -12,7 +12,10 @@ let galleryBatch = null;
 // 按标签页存「已经采到过哪些图」：面板是 action popup，用户一点网页它就关了，
 // 下次打开是新文档、内存里的累加全丢 —— 于是「每开一次都少一大堆」。
 const galleryCache = new Map();
+// 勾选状态也要跨 popup 存活：面板一点网页就销毁，重开后用户要看到的是「我刚才勾的那几张还勾着」
+const gallerySel = new Map();
 const GALLERY_CACHE_MAX_ITEMS = 1500;
+const GALLERY_SEL_MAX_KEYS = 3000;
 const GALLERY_CACHE_TTL = 6 * 60 * 60 * 1000;
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -255,7 +258,23 @@ const HANDLERS = {
         return { ok: true, items: n, groups: groups.length };
     },
 
-    galleryCacheClear: async (req) => { galleryCache.delete(Number(req && req.tabId)); return { ok: true }; },
+    galleryCacheClear: async (req) => { galleryCache.delete(Number(req && req.tabId)); gallerySel.delete(Number(req && req.tabId)); return { ok: true }; },
+
+    gallerySelGet: async (req) => {
+        const id = Number(req && req.tabId);
+        const e = gallerySel.get(id);
+        if (!e) return { ok: true, keys: [], pageUrl: '' };
+        if (Date.now() - e.at > GALLERY_CACHE_TTL) { gallerySel.delete(id); return { ok: true, keys: [], pageUrl: '' }; }
+        return { ok: true, keys: e.keys, pageUrl: e.pageUrl };
+    },
+
+    gallerySelPut: async (req) => {
+        const id = Number(req && req.tabId);
+        if (!id || !Array.isArray(req.keys)) return { ok: false, error: '缺少 tabId 或 keys' };
+        if (!req.keys.length) { gallerySel.delete(id); return { ok: true, n: 0 }; }
+        gallerySel.set(id, { at: Date.now(), pageUrl: String(req.pageUrl || ''), keys: req.keys.slice(0, GALLERY_SEL_MAX_KEYS) });
+        return { ok: true, n: Math.min(req.keys.length, GALLERY_SEL_MAX_KEYS) };
+    },
 
     closeHost: async () => {
         try { if (hostMode === 'offscreen') await chrome.offscreen.closeDocument(); } catch (e) { /* 没有文档 */ }
@@ -265,11 +284,11 @@ const HANDLERS = {
     },
 };
 
-chrome.tabs.onRemoved.addListener((id) => { galleryCache.delete(id); if (id === hostTabId) { hostTabId = null; hostMode = null; } });
+chrome.tabs.onRemoved.addListener((id) => { galleryCache.delete(id); gallerySel.delete(id); if (id === hostTabId) { hostTabId = null; hostMode = null; } });
 
 // 换页/重新加载就清掉这个标签页的采集缓存，否则会把上一页的图混进当前页
 chrome.tabs.onUpdated.addListener((id, changeInfo) => {
-    if (changeInfo.status === 'loading' || typeof changeInfo.url === 'string') galleryCache.delete(id);
+    if (changeInfo.status === 'loading' || typeof changeInfo.url === 'string') { galleryCache.delete(id); gallerySel.delete(id); }
 });
 
 // 「本页图片」批量发送：跑在后台，弹窗/页面关掉也不会中断队列。
