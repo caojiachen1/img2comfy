@@ -210,15 +210,32 @@ function weiboFilterPage(arg) {
             const k = keyOf(it);
             if (k && !known.has(k)) { st.orig.push(it); known.add(k); }
         }
-        const desired = active
-            ? st.orig.filter((it) => { try { return match(it, f); } catch (e) { return true; } })
-            : st.orig.slice();
+        const keep = (it) => { try { return match(it, f); } catch (e) { return true; } };
+        const desired = active ? st.orig.filter(keep) : st.orig.slice();
         const cur = list.map(keyOf).join('|');
         const want = desired.map(keyOf).join('|');
         if (cur !== want) list.splice(0, list.length, ...desired);
         st.arr = list;
         st.href = href;
-        return { ok: true, total: st.orig.length, live: list.length, hidden: st.orig.length - desired.length };
+        // 给右下角的下拉列表用：被挡住的帖子摘要（最多 200 条，避免一次塞太多）
+        let items = [];
+        if (active) {
+            try {
+                items = st.orig.filter((it) => !keep(it)).slice(0, 200).map((it) => {
+                    const u = it.user || {};
+                    const uid = String(u.id || u.idstr || '');
+                    return {
+                        mid: keyOf(it),
+                        uid,
+                        name: String(u.screen_name || u.name || ''),
+                        date: day(it.created_at),
+                        text: strip(it.text || it.longText || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                        url: (uid && it.mblogid) ? `https://weibo.com/${uid}/${it.mblogid}` : (uid && it.mid ? `https://weibo.com/${uid}/${it.mid}` : ''),
+                    };
+                });
+            } catch (e) { items = []; }
+        }
+        return { ok: true, total: st.orig.length, live: list.length, hidden: st.orig.length - desired.length, items };
     } catch (e) {
         return { ok: false, error: String((e && e.message) || e) };
     }

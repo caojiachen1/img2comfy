@@ -221,12 +221,12 @@ function filterHtml() {
         { uid: '6000009006', name: '有音乐账号', body: `<p>一首歌</p><div class="_musicBox_abc_1" style="height:80px;background:#222">音乐</div>`, cls: '' },
     ];
     const items = [
-        { mid: '9001', created_at: 'Tue Oct 20 10:00:00 +0800 2026', text: '今天就随便聊聊，什么图都没有。' },
-        { mid: '9002', created_at: 'Tue Oct 20 10:01:00 +0800 2026', text: '两张图的日常', pic_ids: ['a', 'b'] },
-        { mid: '9003', created_at: 'Tue Oct 20 10:02:00 +0800 2026', text: '一段视频', page_info: { object_type: 'video' } },
-        { mid: '9004', created_at: 'Wed Oct 21 10:03:00 +0800 2026', text: '转发抽奖送周边', pic_ids: ['c'] },
-        { mid: '9005', created_at: 'Wed Oct 21 10:04:00 +0800 2026', text: '//@原作者 这条是转发的', retweeted_status: { mid: 'origin' }, pic_ids: ['d'] },
-        { mid: '9006', created_at: 'Wed Oct 21 10:05:00 +0800 2026', text: '一首歌', page_info: { object_type: 'music' } },
+        { mid: '9001', mblogid: 'P9001', user: { id: '6000009001', screen_name: '纯文字账号' }, created_at: 'Tue Oct 20 10:00:00 +0800 2026', text: '今天就随便聊聊，什么图都没有。' },
+        { mid: '9002', mblogid: 'P9002', user: { id: '6000009002', screen_name: '有图账号' }, created_at: 'Tue Oct 20 10:01:00 +0800 2026', text: '两张图的日常', pic_ids: ['a', 'b'] },
+        { mid: '9003', mblogid: 'P9003', user: { id: '6000009003', screen_name: '有视频账号' }, created_at: 'Tue Oct 20 10:02:00 +0800 2026', text: '一段视频', page_info: { object_type: 'video' } },
+        { mid: '9004', mblogid: 'P9004', user: { id: '6000009004', screen_name: '抽奖账号' }, created_at: 'Wed Oct 21 10:03:00 +0800 2026', text: '转发抽奖送周边', pic_ids: ['c'] },
+        { mid: '9005', mblogid: 'P9005', user: { id: '6000009005', screen_name: '转发账号' }, created_at: 'Wed Oct 21 10:04:00 +0800 2026', text: '//@原作者 这条是转发的', retweeted_status: { mid: 'origin' }, pic_ids: ['d'] },
+        { mid: '9006', mblogid: 'P9006', user: { id: '6000009006', screen_name: '有音乐账号' }, created_at: 'Wed Oct 21 10:05:00 +0800 2026', text: '一首歌', page_info: { object_type: 'music' } },
     ];
     const slots = posts.map((a, i) => `<div class="vue-recycle-scroller__item-view" style="position:absolute;left:0;right:0;top:0;height:${H}px;transform:translateY(${i * H}px) translateX(0px)">
   <article class="post card9 weibo-main ${a.cls}" data-mid="${items[i].mid}" style="height:${H - 12}px;overflow:hidden"><header>${authorHtml({ uid: a.uid, name: a.name })}
@@ -1033,6 +1033,16 @@ async function runWeiboFilterChecks() {
             && tabState.formVisible && tabState.imagesHidden
             && tabState.types === 'original:1,repost:1,text:1,image:1,video:1,music:1'), tabState);
 
+    const readDropdown = () => cdp.ev(filterPage, `(()=>{
+      const host=document.getElementById('mtb-filter-chip');
+      const s=host&&host.shadowRoot;
+      const chip=s&&s.querySelector('.chip');
+      const list=s&&s.querySelector('.list');
+      const rows=s?[...s.querySelectorAll('.rows .row')]:[];
+      return {chipHidden:chip?chip.hidden:null, listHidden:list?list.hidden:null,
+        rows:rows.map((r)=>({text:(r.querySelector('.txt')||{}).textContent||'',meta:(r.querySelector('.meta')||{}).textContent||'',href:r.getAttribute('href')||''}))};
+    })()`);
+    const clickChip = () => cdp.ev(filterPage, `(()=>{const h=document.getElementById('mtb-filter-chip');const s=h&&h.shadowRoot;const c=s&&s.querySelector('.chip');if(!c)return false;c.click();return true})()`);
     const readFeed = () => cdp.ev(filterPage, `(()=>{
       const slots=[...document.querySelectorAll('.vue-recycle-scroller__item-view')];
       const rows=slots.map((s)=>{const a=s.querySelector('article');const links=[...(a?a.querySelectorAll('header a'):[])];
@@ -1058,6 +1068,13 @@ async function runWeiboFilterChecks() {
             && /已隐藏 1 条/.test(first.status)
             && f1.hidden.length === 1 && /纯文字/.test(f1.hidden[0]) && f1.zeroed
             && f1.chip && f1.chip.hidden === false && /已隐藏 1 条/.test(f1.chip.text)), { f0, first: { status: first.status, site: first.stored.site }, f1 });
+
+    await clickChip();
+    await wait(300);
+    const d1 = await readDropdown();
+    step('点右下角提示条能展开被隐藏的微博列表（页面隐藏模式，带原文链接）',
+        !!(d1 && d1.chipHidden === false && d1.listHidden === false && d1.rows.length === 1
+            && /随便聊聊/.test(d1.rows[0].text) && /weibo\.com/.test(d1.rows[0].href)), d1);
 
     const second = await setForm(`(()=>{const d=document.querySelector('#wfFrom');d.value='2026-10-21';d.dispatchEvent(new Event('change',{bubbles:true}));})()`);
     const f2 = await readFeed();
@@ -1110,6 +1127,14 @@ async function runWeiboFilterChecks() {
       return {n, vis, domHidden:[...document.querySelectorAll('article')].filter((a)=>a.getAttribute('data-mtb-filtered')==='1').length};})()`);
     step('实验模式下 DOM 里只剩这 4 条，而且没有被我们自己加过 display:none（重排交给页面）',
         !!(rerendered && rerendered.n === 4 && rerendered.vis.join(',') === '9002,9003,9005,9006' && rerendered.domHidden === 0), rerendered);
+    const d2a = await readDropdown();
+    if (d2a && d2a.listHidden !== false) { await clickChip(); await wait(300); }
+    const d2 = await readDropdown();
+    step('实验模式下提示条列表列出被隐藏的两条（带作者/链接），可以点开看',
+        !!(d2 && d2.chipHidden === false && d2.listHidden === false && d2.rows.length === 2
+            && d2.rows.some((r) => /随便聊聊/.test(r.text)) && d2.rows.some((r) => /抽奖送周边/.test(r.text))
+            && d2.rows.every((r) => /weibo\.com/.test(r.href)) && d2.rows.every((r) => /账号/.test(r.meta))), d2);
+
     const expBack = await setForm(`(()=>{const c=document.querySelector('#wfExperimental');c.click();})()`);
     const backList = await readList();
     step('关掉实验模式：列表恢复成 6 条、退回页面隐藏（会留空位）',

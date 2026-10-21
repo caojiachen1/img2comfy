@@ -107,6 +107,26 @@ function fingerprint(f) {
     return [f.enabled ? 1 : 0, f.site, f.allSites ? 1 : 0, ['original', 'repost', 'text', 'image', 'video', 'music'].map((k) => (t[k] === false ? 0 : 1)).join(''), f.keywordMode, f.keywords.join('|'), f.dateFrom, f.dateTo].join('~');
 }
 
+// 非实验模式：被隐藏的帖子就在 DOM 里，直接按页面上的信息整理成列表
+function domHiddenItems() {
+    const out = [];
+    for (const el of postsOf(document)) {
+        if (el.getAttribute(HIDDEN_ATTR) !== '1') continue;
+        const links = [...el.querySelectorAll('header a')];
+        const name = links.find((a) => /_name_|_bolder_|_link_/.test(String(a.className)) && (a.textContent || '').trim());
+        const time = el.querySelector('[class*="_time_"]');
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        out.push({
+            name: name ? name.textContent.trim() : '',
+            date: '',
+            text,
+            url: time && time.href ? time.href : '',
+        });
+        if (out.length >= 200) break;
+    }
+    return out;
+}
+
 function ensureChipHost() {
     let host = document.getElementById('mtb-filter-chip');
     if (host) return host.shadowRoot;
@@ -116,17 +136,39 @@ function ensureChipHost() {
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
+        .box { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
         .chip {
-          display: flex; align-items: center; gap: 8px; padding: 7px 10px 7px 12px; border-radius: 999px;
+          display: flex; align-items: center; gap: 6px; padding: 7px 10px 7px 12px; border-radius: 999px;
           background: rgba(18, 21, 28, .92); color: #e8eef8; border: 1px solid rgba(255, 255, 255, .14);
           box-shadow: 0 6px 20px rgba(0, 0, 0, .35); font: 12px/1.4 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-          pointer-events: auto; backdrop-filter: blur(8px);
+          pointer-events: auto; backdrop-filter: blur(8px); cursor: pointer; user-select: none;
         }
         .chip[hidden] { display: none; }
+        .chip:hover { border-color: rgba(255, 255, 255, .3); }
+        .caret { color: #9fb0c7; font-size: 10px; }
         .x { all: unset; cursor: pointer; width: 18px; height: 18px; border-radius: 50%; text-align: center; line-height: 18px; color: #9fb0c7; }
         .x:hover { background: rgba(255, 255, 255, .12); color: #fff; }
+        .list {
+          pointer-events: auto; width: 360px; max-width: calc(100vw - 40px); max-height: 55vh; overflow: auto;
+          background: rgba(18, 21, 28, .97); color: #e8eef8; border: 1px solid rgba(255, 255, 255, .14);
+          border-radius: 12px; box-shadow: 0 10px 32px rgba(0, 0, 0, .45);
+          font: 12px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        }
+        .list[hidden] { display: none; }
+        .lh { position: sticky; top: 0; padding: 8px 12px; color: #9fb0c7; background: rgba(18, 21, 28, .98);
+          border-bottom: 1px solid rgba(255, 255, 255, .08); }
+        .lh b { color: #e8eef8; font-weight: 600; }
+        a.row { display: block; padding: 8px 12px; color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, .05); }
+        div.row { display: block; padding: 8px 12px; border-bottom: 1px solid rgba(255, 255, 255, .05); }
+        a.row:hover { background: rgba(255, 255, 255, .06); }
+        .meta { display: flex; gap: 8px; color: #8b97a8; font-size: 11px; margin-bottom: 3px; }
+        .txt { color: #dbe6f6; word-break: break-word; }
+        .empty { padding: 14px 12px; color: #8b97a8; }
       </style>
-      <div class="chip" hidden><span class="t"></span><button class="x" type="button" title="清除筛选（恢复显示全部微博）">✕</button></div>`;
+      <div class="box">
+        <div class="list" hidden><div class="lh">被筛选隐藏的微博 <b class="n"></b></div><div class="rows"></div></div>
+        <div class="chip" hidden><span class="t"></span><span class="caret">▾</span><button class="x" type="button" title="清除筛选（恢复显示全部微博）">✕</button></div>
+      </div>`;
     document.documentElement.appendChild(host);
     return shadow;
 }
@@ -136,7 +178,54 @@ export function mountWeiboFilter(settings) {
     const shadow = ensureChipHost();
     const chip = shadow.querySelector('.chip');
     const textEl = shadow.querySelector('.t');
-    const state = { filter: normalizeWeiboFilter(settings && settings.weiboFilter), sigs: new WeakMap(), hidden: 0, total: 0, timer: 0, seq: 0, pageMode: false, pageError: '' };
+    const caret = shadow.querySelector('.caret');
+    const listEl = shadow.querySelector('.list');
+    const rowsEl = shadow.querySelector('.rows');
+    const countEl = shadow.querySelector('.n');
+    const state = { filter: normalizeWeiboFilter(settings && settings.weiboFilter), sigs: new WeakMap(), hidden: 0, total: 0, timer: 0, seq: 0, pageMode: false, pageError: '', hiddenItems: [], listOpen: false };
+
+    const renderHiddenList = () => {
+        rowsEl.textContent = '';
+        const items = state.hiddenItems || [];
+        countEl.textContent = `${items.length}${items.length >= 200 ? '+' : ''} 条`;
+        if (!items.length) {
+            const empty = document.createElement('div');
+            empty.className = 'empty';
+            empty.textContent = '没有可列出的微博（可能是列表模式拿不到摘要）';
+            rowsEl.appendChild(empty);
+            return;
+        }
+        for (const it of items) {
+            const row = document.createElement(it.url ? 'a' : 'div');
+            row.className = 'row';
+            if (it.url) {
+                row.href = it.url;
+                row.target = '_blank';
+                row.rel = 'noopener';
+                row.title = it.url;
+            }
+            const meta = document.createElement('div');
+            meta.className = 'meta';
+            meta.textContent = [it.name || '未识别账号', it.date || ''].filter(Boolean).join(' · ');
+            const txt = document.createElement('div');
+            txt.className = 'txt';
+            txt.textContent = it.text || '（没有正文摘要）';
+            row.append(meta, txt);
+            rowsEl.appendChild(row);
+        }
+    };
+
+    const setListOpen = (open) => {
+        state.listOpen = !!open;
+        listEl.hidden = !state.listOpen;
+        caret.textContent = state.listOpen ? '▴' : '▾';
+        if (state.listOpen) renderHiddenList();
+    };
+    chip.addEventListener('click', (e) => {
+        if (e.target && e.target.classList && e.target.classList.contains('x')) return;
+        e.preventDefault();
+        setListOpen(!state.listOpen);
+    });
 
     const clearFilter = () => {
         try {
@@ -196,15 +285,22 @@ export function mountWeiboFilter(settings) {
         }
         state.hidden = hidden;
         state.total = total;
+        // 下拉列表的数据：实验模式用页面主世界带回来的摘要；普通模式从被隐藏的 DOM 里现读
+        state.hiddenItems = usePage
+            ? (Array.isArray(pageRes.items) ? pageRes.items : [])
+            : (active && hidden > 0 ? domHiddenItems() : []);
         chip.hidden = !(active && hidden > 0);
-        if (!chip.hidden) {
+        if (chip.hidden) {
+            if (state.listOpen) setListOpen(false);
+        } else {
             // 全被筛掉时给一句明确的出路，别让人以为页面坏了
             textEl.textContent = hidden === total && total > 0
-                ? `全部 ${total} 条都被筛掉了 · 点 ✕ 恢复显示`
+                ? `全部 ${total} 条都被筛掉了 · 点开查看`
                 : `已隐藏 ${hidden} 条 · ${usePage ? '实验模式 · ' : ''}${describeWeiboFilter(f)}`;
-            textEl.title = usePage
+            textEl.title = (usePage
                 ? '实验模式：改的是微博内部列表数据，微博改版后可能失效（刷新页面即可恢复）'
-                : '不满足筛选条件的微博已整条隐藏；✕ 可清除筛选';
+                : '不满足筛选条件的微博已整条隐藏') + '；点这条可展开被隐藏的微博，✕ 可清除筛选';
+            if (state.listOpen) renderHiddenList();
         }
         return { hidden, total, mode: usePage ? 'list' : 'dom', pageError: state.pageError };
     };
