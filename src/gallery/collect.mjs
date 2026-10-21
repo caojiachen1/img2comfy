@@ -456,6 +456,8 @@ export async function collectPageImages(options = {}) {
         const rect = img.getBoundingClientRect();
         const y = docTop(img);
         const sz = dbg ? { w: Math.round(rect.width), h: Math.round(rect.height), nw: img.naturalWidth, nh: img.naturalHeight } : null;
+        // 被微博筛选隐藏的整条微博：页面上已经当它没发过，面板里也不许出现它的图
+        if (img.closest('[data-mtb-filtered="1"]')) { note(img, 'filtered-post', sz); continue; }
         if (y < -800) { note(img, 'off-canvas-stash', sz); continue; }
         const attrW = parseFloat(img.getAttribute('width')) || 0;
         const attrH = parseFloat(img.getAttribute('height')) || 0;
@@ -495,6 +497,7 @@ export async function collectPageImages(options = {}) {
             if (++scanned > 1500) break;
             const rect = el.getBoundingClientRect();
             if (rect.width < 120 || rect.height < 120) continue;
+            if (el.closest('[data-mtb-filtered="1"]')) continue;
             const y = docTop(el);
             if (y < -800) continue;
             if (!styleVisible(el)) continue;

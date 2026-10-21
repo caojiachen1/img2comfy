@@ -21,7 +21,12 @@
   </div>
 </header>
 
-<main class="g-main">
+<nav class="g-tabs" id="gTabs">
+  <button type="button" data-panel="images" class="active">图片</button>
+  <button type="button" data-panel="filter">筛选微博</button>
+</nav>
+
+<main class="g-main" id="panelImages">
   <div class="g-summary" id="summary">正在扫描当前网页…</div>
   <div class="g-groups" id="groups"></div>
   <div class="g-loading" id="loading"><span class="g-spin"></span><span id="loadingText">正在扫描图片…</span></div>
@@ -31,6 +36,52 @@
     <p id="emptyText">图片可能还没加载完；滚一下页面再点“刷新”。</p>
   </div>
 </main>
+
+<section class="g-main g-filter" id="panelFilter" hidden>
+  <div class="wf-row">
+    <span class="wf-label">类型</span>
+    <div class="wf-chips">
+      <label><input type="checkbox" data-wf-type="original"> 原创</label>
+      <label><input type="checkbox" data-wf-type="repost"> 转发</label>
+      <i class="wf-sep"></i>
+      <label><input type="checkbox" data-wf-type="text"> 纯文字</label>
+      <label><input type="checkbox" data-wf-type="image"> 含图片</label>
+      <label><input type="checkbox" data-wf-type="video"> 含视频</label>
+      <label><input type="checkbox" data-wf-type="music"> 含音乐</label>
+    </div>
+  </div>
+  <div class="wf-row">
+    <span class="wf-label">关键字</span>
+    <span class="wf-search">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+      <input id="wfKeywords" type="text" placeholder="搜索微博内容（一行一个也行）" autocomplete="off">
+    </span>
+    <select id="wfKeywordMode" title="关键字怎么用"><option value="has">包含</option><option value="none">不含</option></select>
+  </div>
+  <div class="wf-row">
+    <span class="wf-label">时间</span>
+    <input type="date" id="wfFrom">
+    <span class="wf-to">到</span>
+    <input type="date" id="wfTo">
+    <span class="wf-hint">留空不限；时间读不出来的微博会保留</span>
+  </div>
+  <div class="wf-row">
+    <span class="wf-label">范围</span>
+    <label class="wf-chk"><input type="checkbox" id="wfAllSites"> 应用到所有微博网站</label>
+    <span class="wf-hint" id="wfSiteHint"></span>
+  </div>
+  <div class="wf-row wf-exp">
+    <span class="wf-label">实验</span>
+    <label class="wf-chk"><input type="checkbox" id="wfExperimental"> 让被筛掉的微博真正消失（前后紧连、不留空位）</label>
+  </div>
+  <p class="wf-warn">实验功能：需要直接改微博页面里的内部列表数据。微博改版后可能失效；极端情况下当前页面可能显示异常，按 F5 刷新即可恢复。默认关闭，失败会自动退回「只隐藏页面元素」。</p>
+  <div class="wf-foot">
+    <span id="wfStatus" class="wf-status">筛选会立刻生效，不用刷新</span>
+    <span class="sp"></span>
+    <button id="wfClear" type="button">清除筛选</button>
+  </div>
+  <p class="wf-note">勾上的类型才会显示（原创/转发二选一；纯文字=没有任何媒体）。被筛掉的微博整条消失、前后紧连，不留占位。</p>
+</section>
 
 <footer class="g-foot">
   <div class="g-progress" id="progress" hidden><i id="progressBar"></i></div>

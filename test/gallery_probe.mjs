@@ -206,6 +206,58 @@ header a{color:#8ab4ff;text-decoration:none;margin-right:6px}</style></head><bod
 </body></html>`;
 }
 
+// 微博信息流筛选：照真页面的虚拟列表复刻 —— 每条微博放在绝对定位的 .vue-recycle-scroller__item-view 槽里
+// （transform: translateY），只隐藏 article 会留下 300px 的空槽，正是用户说的「原地一块黑、把上下顶开」。
+// 6 条帖子：纯文字 / 有图 / 有视频 / 有图+抽奖 / 转发+有图 / 有音乐。
+function filterHtml() {
+    const H = 300;
+    const posts = [
+        // 底部操作条上的「转发」图标（woo-font--retweet）每条微博都有：它绝不能被当成「这条是转发」
+        { uid: '6000009001', name: '纯文字账号', body: '<p>今天就随便聊聊，什么图都没有。</p><i class="woo-font woo-font--retweet _retweetIcon_198pe_119"></i>', cls: '' },
+        { uid: '6000009002', name: '有图账号', body: '<p>两张图的日常</p>' + [901, 902].map((n) => `<img src="http://wx1.sinaimg.cn:${SITE}/orj360/${n}.png" width="200" height="200" alt="图${n}" style="width:200px;height:200px;background:#222">`).join(''), cls: '' },
+        { uid: '6000009003', name: '有视频账号', body: `<p>一段视频</p><div class="_videoBox_abcde_132" style="width:200px;height:120px;background:#222">视频</div>`, cls: '' },
+        { uid: '6000009004', name: '抽奖账号', body: `<p>转发抽奖送周边</p><img src="http://wx1.sinaimg.cn:${SITE}/orj360/904.png" width="200" height="200" alt="图904" style="width:200px;height:200px;background:#222">`, cls: '' },
+        { uid: '6000009005', name: '转发账号', body: `<p class="_reText_abc_48">//@原作者 这条是转发的</p><img src="http://wx1.sinaimg.cn:${SITE}/orj360/905.png" width="200" height="200" alt="图905" style="width:200px;height:200px;background:#222">`, cls: 'retweet _retweet_abc_86' },
+        { uid: '6000009006', name: '有音乐账号', body: `<p>一首歌</p><div class="_musicBox_abc_1" style="height:80px;background:#222">音乐</div>`, cls: '' },
+    ];
+    const items = [
+        { mid: '9001', created_at: 'Tue Oct 20 10:00:00 +0800 2026', text: '今天就随便聊聊，什么图都没有。' },
+        { mid: '9002', created_at: 'Tue Oct 20 10:01:00 +0800 2026', text: '两张图的日常', pic_ids: ['a', 'b'] },
+        { mid: '9003', created_at: 'Tue Oct 20 10:02:00 +0800 2026', text: '一段视频', page_info: { object_type: 'video' } },
+        { mid: '9004', created_at: 'Wed Oct 21 10:03:00 +0800 2026', text: '转发抽奖送周边', pic_ids: ['c'] },
+        { mid: '9005', created_at: 'Wed Oct 21 10:04:00 +0800 2026', text: '//@原作者 这条是转发的', retweeted_status: { mid: 'origin' }, pic_ids: ['d'] },
+        { mid: '9006', created_at: 'Wed Oct 21 10:05:00 +0800 2026', text: '一首歌', page_info: { object_type: 'music' } },
+    ];
+    const slots = posts.map((a, i) => `<div class="vue-recycle-scroller__item-view" style="position:absolute;left:0;right:0;top:0;height:${H}px;transform:translateY(${i * H}px) translateX(0px)">
+  <article class="post card9 weibo-main ${a.cls}" data-mid="${items[i].mid}" style="height:${H - 12}px;overflow:hidden"><header>${authorHtml({ uid: a.uid, name: a.name })}
+    <a class="_time_cssmod_33" href="http://weibo.com/${a.uid}/Pf${a.uid.slice(-3)}" title="${i < 3 ? '2026-10-20' : '2026-10-21'} 09:00">1小时前</a></header>${a.body}</article>
+</div>`).join('\n');
+    return `<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>信息流筛选测试</title>
+<style>body{background:#0d1016;color:#ddd;font:13px system-ui;margin:0;padding:20px}
+.post{background:#171b23;border:1px solid #2a3040;border-radius:10px;padding:12px;margin:6px;box-sizing:border-box}
+header a{color:#8ab4ff;text-decoration:none;margin-right:6px}
+.vue-recycle-scroller{position:relative;height:${posts.length * H}px}
+.vue-recycle-scroller__item-wrapper{position:relative}</style></head><body>
+<div class="vue-recycle-scroller"><div class="vue-recycle-scroller__item-wrapper">
+${slots}
+</div></div>
+<div id="app"></div>
+<script>
+// 实验模式会在页面主世界里找 #app._vnode.component.data.list —— 这里给一个同形状的假根，
+// 数组和目录里的帖子一一对应；__mtbRerender 模拟 Vue 收到数组变化后的重渲染。
+window.__mtbFeed = ${JSON.stringify(items)};
+document.getElementById('app')._vnode = { component: { type: { name: 'Home' }, data: { list: window.__mtbFeed }, subTree: null } };
+window.__mtbRerender = function () {
+    const ids = new Set(window.__mtbFeed.map(function (x) { return x.mid; }));
+    document.querySelectorAll('article[data-mid]').forEach(function (a) {
+        a.parentElement.style.display = ids.has(a.getAttribute('data-mid')) ? '' : 'none';
+    });
+    return ids.size;
+};
+</script>
+</body></html>`;
+}
+
 // 内层容器自己滚的信息流（x.com 那类）：滚过顶部的帖子 rect.top 是大负数，
 // 但它们的文档位置是正的 —— 回收节点判定必须把容器的 scrollTop 加回去，不然就把好图当回收帖误杀
 function scrollerHtml() {
@@ -243,6 +295,7 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
         res.end(u.searchParams.get('shapes') === '1' ? shapesHtml()
             : u.searchParams.get('fold') === '1' ? foldHtml()
+                : u.searchParams.get('filter') === '1' ? filterHtml()
                 : u.searchParams.get('scroller') === '1' ? scrollerHtml()
                     : u.searchParams.get('lazy') === '1' ? lazyHtml() : fixtureHtml(u.searchParams.get('extra') === 'weibo'));
         return;
@@ -955,6 +1008,183 @@ step('退出图片面板再打开：之前勾选的三张仍然是勾选状态',
         && backB && backB.cards === 36 && backB.sel.length === 3
         && backB.sel.every((k) => markA.keys.includes(k)) && /已选 3/.test(backB.count)),
     { readyA, markA, backB });
+
+async function runWeiboFilterChecks() {
+    const filterPage = await cdp.open(`http://${PAGE_HOST}:${SITE}/nine.html?filter=1`);
+    await wait(1600);
+    const filterTabIds = await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>(t.url||'').includes('filter=1')).map(t=>t.id))`);
+    const filterTabId = filterTabIds && filterTabIds[0];
+    const fp = await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${filterTabId}`);
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 800, height: 600, deviceScaleFactor: 1, mobile: false }, fp);
+    const tabState = await cdp.ev(fp, `(async()=>{
+      // 面板刚弹出来时模块可能还没执行完（tab 的 onclick 还没绑上），所以点完要确认真的切过去了再走
+      let ok=false;
+      for(let i=0;i<60;i++){const b=document.querySelector('#gTabs button[data-panel="filter"]');
+        if(b&&!b.disabled){b.click();await new Promise(r=>setTimeout(r,200));if(b.classList.contains('active')){ok=true;break;}}
+        await new Promise(r=>setTimeout(r,180));}
+      await new Promise(r=>setTimeout(r,400));
+      return {ok, tabs:[...document.querySelectorAll('#gTabs button')].map(x=>[x.textContent.trim(),x.classList.contains('active')]),
+        formVisible:!document.querySelector('#panelFilter').hidden, imagesHidden:document.querySelector('#panelImages').hidden,
+        types:[...document.querySelectorAll('[data-wf-type]')].map(x=>x.dataset.wfType+':'+(x.checked?1:0)).join(','),
+        status:document.querySelector('#wfStatus').textContent};
+    })()`).catch(() => null);
+    step('面板顶部有「图片 / 筛选微博」两个 tab，切过去就是微博原生样式的表单（类型默认全勾）',
+        !!(tabState && tabState.ok && tabState.tabs.length === 2 && tabState.tabs[1][1] === true
+            && tabState.formVisible && tabState.imagesHidden
+            && tabState.types === 'original:1,repost:1,text:1,image:1,video:1,music:1'), tabState);
+
+    const readFeed = () => cdp.ev(filterPage, `(()=>{
+      const slots=[...document.querySelectorAll('.vue-recycle-scroller__item-view')];
+      const rows=slots.map((s)=>{const a=s.querySelector('article');const links=[...(a?a.querySelectorAll('header a'):[])];
+        return {name:links[1]?links[1].textContent.trim():'', hidden:!!(a&&a.getAttribute('data-mtb-filtered')==='1'),
+          articleZero:!!!a||a.offsetHeight===0, top:Math.round(s.getBoundingClientRect().top)};});
+      const vis=slots.filter((s)=>getComputedStyle(s).display!=='none');
+      const gap=vis.length>1?Math.round(vis[1].getBoundingClientRect().top-vis[0].getBoundingClientRect().bottom):0;
+      const chipHost=document.getElementById('mtb-filter-chip');
+      const chip=chipHost&&chipHost.shadowRoot?chipHost.shadowRoot.querySelector('.chip'):null;
+      return {total:rows.length, hidden:rows.filter(r=>r.hidden).map(r=>r.name), shown:rows.filter(r=>!r.hidden).map(r=>r.name),
+        zeroed:rows.filter(r=>r.hidden).every(r=>r.articleZero), gap, chip:chip?{hidden:chip.hidden,text:chip.textContent}:null};
+    })()`);
+    const setForm = (js) => cdp.ev(fp, `(async()=>{${js};await new Promise(r=>setTimeout(r,650));
+      return {status:document.querySelector('#wfStatus').textContent,
+        stored:(await chrome.storage.local.get(['mtbSettings'])).mtbSettings.weiboFilter};})()`);
+
+    const f0 = await readFeed();
+    const first = await setForm(`document.querySelector('[data-wf-type="text"]').click()`);
+    const f1 = await readFeed();
+    step('取消「纯文字」立刻生效：那条整条 display:none、自身零高',
+        !!(f0 && f0.total === 6 && f0.hidden.length === 0
+            && first.stored.site === PAGE_HOST && first.stored.enabled === true
+            && /已隐藏 1 条/.test(first.status)
+            && f1.hidden.length === 1 && /纯文字/.test(f1.hidden[0]) && f1.zeroed
+            && f1.chip && f1.chip.hidden === false && /已隐藏 1 条/.test(f1.chip.text)), { f0, first: { status: first.status, site: first.stored.site }, f1 });
+
+    const second = await setForm(`(()=>{const d=document.querySelector('#wfFrom');d.value='2026-10-21';d.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+    const f2 = await readFeed();
+    step('时间从 2026-10-21 起：20 号发的都被挡，和「取消纯文字」叠加成 3 条',
+        !!(f2 && f2.hidden.length === 3 && f2.hidden.some((x) => /有图/.test(x)) && f2.hidden.some((x) => /有视频/.test(x))
+            && /已隐藏 3 条/.test(second.status) && f2.zeroed), { second: second.status, hidden: f2 && f2.hidden });
+
+    const third = await setForm(`(()=>{const k=document.querySelector('#wfKeywords');k.value='抽奖';k.dispatchEvent(new Event('input',{bubbles:true}));
+      const m=document.querySelector('#wfKeywordMode');m.value='none';m.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+    const f3 = await readFeed();
+    step('关键字「不含 抽奖」同样立刻生效，三个条件叠加成 4 条',
+        !!(f3 && f3.hidden.length === 4 && f3.hidden.some((x) => /抽奖/.test(x))
+            && /已隐藏 4 条/.test(third.status) && f3.zeroed), { third: third.status, hidden: f3 && f3.hidden });
+
+    // 底部操作条那条「转发图标」每条微博都有：取消「原创」只该挡掉真正原创的那几条，
+    // 绝不能因为图标类名带 retweet 就把所有帖子都当成转发（那样这一步会一条都藏不住）
+    const forth = await setForm(`document.querySelector('[data-wf-type="original"]').click()`);
+    const f4 = await readFeed();
+    step('取消「原创」只挡原创，转发那条留下（转发图标不算转发）',
+        !!(f4 && f4.hidden.length === 5 && f4.shown.length === 1 && /转发/.test(f4.shown[0])
+            && /已隐藏 5 条/.test(forth.status) && f4.zeroed), { forth: forth.status, hidden: f4 && f4.hidden, shown: f4 && f4.shown });
+
+    const cleared = await setForm(`document.querySelector('#wfClear').click()`);
+    const f5 = await readFeed();
+    step('清除筛选：六条全部回来、槽位恢复原样、提示条消失',
+        !!(f5 && f5.hidden.length === 0 && f5.shown.length === 6
+            && f5.chip && f5.chip.hidden === true && cleared.stored.enabled === false), { cleared: { enabled: cleared.stored.enabled, status: cleared.status }, f5 });
+
+    // 实验模式：后台把一段代码注入页面主世界，直接改微博自己的信息流数组（夹具里是 #app._vnode.component.data.list）。
+    // 这条路不碰 DOM，列表自己重排 → 被筛掉的帖子真的不存在，不留空位。失败会自动退回上面的页面隐藏。
+    const readList = () => cdp.ev(filterPage, `(()=>{
+      const g=document.getElementById('app');
+      const list=g&&g._vnode&&g._vnode.component&&g._vnode.component.data&&g._vnode.component.data.list;
+      return {len:list?list.length:-1, mids:list?list.map((x)=>String(x.mid)):[]};
+    })()`);
+    const setTypesForExp = await setForm(`(()=>{const t=document.querySelector('[data-wf-type="text"]');if(t.checked)t.click();
+      const k=document.querySelector('#wfKeywords');k.value='抽奖';k.dispatchEvent(new Event('input',{bubbles:true}));
+      const m=document.querySelector('#wfKeywordMode');m.value='none';m.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+    const expOff = await readList();
+    const expOn = await setForm(`(()=>{const c=document.querySelector('#wfExperimental');c.click();})()`);
+    const expList = await readList();
+    step('实验模式：页面内部列表里直接少了两条（9001 纯文字 / 9004 抽奖），不是靠藏 DOM',
+        !!(expOn.stored.experimental === true && /实验模式/.test(expOn.status)
+            && expOff && expOff.len === 6
+            && expList && expList.len === 4
+            && !expList.mids.includes('9001') && !expList.mids.includes('9004')
+            && expList.mids.join(',') === '9002,9003,9005,9006'), { expOn: { status: expOn.status, experimental: expOn.stored.experimental }, before: expOff, after: expList });
+    const rerendered = await cdp.ev(filterPage, `(()=>{const n=window.__mtbRerender&&window.__mtbRerender();
+      const vis=[...document.querySelectorAll('article[data-mid]')].filter((a)=>getComputedStyle(a.parentElement).display!=='none').map((a)=>a.getAttribute('data-mid'));
+      return {n, vis, domHidden:[...document.querySelectorAll('article')].filter((a)=>a.getAttribute('data-mtb-filtered')==='1').length};})()`);
+    step('实验模式下 DOM 里只剩这 4 条，而且没有被我们自己加过 display:none（重排交给页面）',
+        !!(rerendered && rerendered.n === 4 && rerendered.vis.join(',') === '9002,9003,9005,9006' && rerendered.domHidden === 0), rerendered);
+    const expBack = await setForm(`(()=>{const c=document.querySelector('#wfExperimental');c.click();})()`);
+    const backList = await readList();
+    step('关掉实验模式：列表恢复成 6 条、退回页面隐藏（会留空位）',
+        !!(expBack.stored.experimental === false && backList && backList.len === 6
+            && backList.mids.join(',') === '9001,9002,9003,9004,9005,9006'
+            && /页面隐藏/.test(expBack.status)), { status: expBack.status, list: backList });
+
+    // 用户报的 bug：单页应用里换到另一个微博页面（主页/分组），新列表被旧页面的帖子覆盖。
+    // 夹具里模拟一次 SPA 导航：换成一个全新的数组（不同 mid）+ 改 hash，再改一次条件触发重算。
+    const navSetup = await cdp.ev(filterPage, `(()=>{
+      const app=document.getElementById('app');
+      window.__mtbNav2=[
+        {mid:'9101',created_at:'Wed Oct 21 11:00:00 +0800 2026',text:'新页面纯文字'},
+        {mid:'9102',created_at:'Wed Oct 21 11:01:00 +0800 2026',text:'新页面有图',pic_ids:['n1']},
+        {mid:'9103',created_at:'Wed Oct 21 11:02:00 +0800 2026',text:'新页面视频',page_info:{object_type:'video'}},
+        {mid:'9104',created_at:'Wed Oct 21 11:03:00 +0800 2026',text:'新页面抽奖',pic_ids:['n2']},
+        {mid:'9105',created_at:'Wed Oct 21 11:04:00 +0800 2026',text:'新页面转发',retweeted_status:{mid:'o2'},pic_ids:['n3']},
+        {mid:'9106',created_at:'Wed Oct 21 11:05:00 +0800 2026',text:'新页面音乐',page_info:{object_type:'music'}}
+      ];
+      // 让目录里的帖子换成新页面的内容（模拟 Vue 重新渲染）
+      const arts=[...document.querySelectorAll('article[data-mid]')];
+      window.__mtbNav2.forEach((it,i)=>{const a=arts[i];if(!a)return;a.setAttribute('data-mid',it.mid);const p=a.querySelector('p');if(p)p.textContent=it.text;});
+      // 真页面切页后，上一个信息流的组件还挂在 Vue 树里，而且它的数组可能更长：
+      // 这里把旧列表多塞两条、作为「旧组件」挂进子树，逼实现必须靠「渲染出来的帖子」认当前列表
+      window.__mtbFeed.push({mid:'9007',created_at:'Wed Oct 21 09:00:00 +0800 2026',text:'旧页面遗留一',pic_ids:['x']},
+        {mid:'9008',created_at:'Wed Oct 21 09:01:00 +0800 2026',text:'旧页面遗留二',pic_ids:['y']});
+      const root=app._vnode.component;
+      root.subTree={children:[{component:{type:{name:'OldFeed'},data:{list:window.__mtbFeed},subTree:null}}]};
+      root.data.list = window.__mtbNav2;
+      location.hash = '#spa-second-page';
+      return {len:window.__mtbNav2.length,oldLen:window.__mtbFeed.length};
+    })()`);
+    const navOn = await setForm(`(()=>{const c=document.querySelector('#wfExperimental');if(!c.checked)c.click();
+      const v=document.querySelector('[data-wf-type="video"]');if(v.checked)v.click();})()`);
+    const navList = await cdp.ev(filterPage, `(()=>({len:window.__mtbNav2.length,mids:window.__mtbNav2.map((x)=>String(x.mid))}))()`);
+    step('换了微博页面（SPA 导航）后只按新页面的列表筛：旧页面（还挂在 Vue 树里、更长）一条都不许混进来',
+        !!(navSetup && navSetup.len === 6 && navSetup.oldLen === 8 && navOn.stored.experimental === true
+            && navList && navList.len === 3 && navList.mids.join(',') === '9102,9105,9106'), { navSetup, navList });
+    const navOff = await setForm(`(()=>{const c=document.querySelector('#wfExperimental');if(c.checked)c.click();})()`);
+    const navBack = await cdp.ev(filterPage, `(()=>({len:window.__mtbNav2.length,mids:window.__mtbNav2.map((x)=>String(x.mid))}))()`);
+    step('换页后关掉实验模式：新页面的 6 条原样回来（不会被上一页的快照污染或清空）',
+        !!(navOff.stored.experimental === false && navBack && navBack.len === 6
+            && navBack.mids.join(',') === '9101,9102,9103,9104,9105,9106'), navBack);
+    // 边界：换页之后、新页面还没被筛过就先把筛选关掉 —— 绝不能把新页面清空
+    const raceSetup = await cdp.ev(filterPage, `(()=>{
+      const app=document.getElementById('app');
+      window.__mtbNav3=[
+        {mid:'9201',created_at:'Wed Oct 21 12:00:00 +0800 2026',text:'第三个页面一',pic_ids:['z1']},
+        {mid:'9202',created_at:'Wed Oct 21 12:01:00 +0800 2026',text:'第三个页面二',pic_ids:['z2']}
+      ];
+      app._vnode.component.data.list = window.__mtbNav3;
+      location.hash = '#spa-third-page';
+      return window.__mtbNav3.length;
+    })()`);
+    const raceRes = await cdp.ev(fp, `chrome.runtime.sendMessage({action:'applyWeiboFilterPage',tabId:${filterTabId},filter:null,enabled:false})`);
+    const raceList = await cdp.ev(filterPage, `window.__mtbNav3.map((x)=>String(x.mid))`);
+    step('换页后第一次调用就是「关掉筛选」：新页面两条一条都不许被清掉',
+        !!(raceSetup === 2 && raceRes && raceRes.ok === true && Array.isArray(raceList)
+            && raceList.join(',') === '9201,9202'), { raceSetup, raceRes, raceList });
+
+    if (filterTabId) await cdp.ev(swSess, `chrome.tabs.remove(${filterTabId}).then(()=>true)`).catch(() => { /* 关不掉就算了 */ });
+    await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>Promise.all(ts.filter(t=>(t.url||'').includes('gallery.html?tabId=${filterTabId}')).map(t=>chrome.tabs.remove(t.id)))).then(()=>true)`).catch(() => { /* 关不掉就算了 */ });
+}
+
+if (WEIBO_HOST) await runWeiboFilterChecks();
+else {
+    // 站点门禁：微博筛选只该挂在微博域名下。先把条件开到最严，普通站点也必须一动不动、连提示条都不出现
+    await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+      s.weiboFilter={enabled:true,image:'yes',video:'any',keywordMode:'off',keywords:[]};await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    await wait(700);
+    const gate = await cdp.ev(page, `(()=>({chip:!!document.getElementById('mtb-filter-chip'),hidden:[...document.querySelectorAll('article')].filter((e)=>e.getAttribute('data-mtb-filtered')==='1').length}))()`);
+    step('非微博站点不挂信息流筛选（条件开到最严也不插提示条、不改任何帖子）', !!(gate && !gate.chip && gate.hidden === 0), gate);
+    await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+      s.weiboFilter={enabled:false,image:'any',video:'any',keywordMode:'off',keywords:[]};await chrome.storage.local.set({mtbSettings:s});return true})()`);
+}
 
 const summary = dump();
 console.log('\n=== 汇总 ===\n' + JSON.stringify(summary, null, 1));

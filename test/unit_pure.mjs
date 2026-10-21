@@ -621,5 +621,66 @@ console.log('== face（识别数学）==');
         && migrateSettings({ version: 2, toolbar: { skipThumbnails: false } }).toolbar.skipThumbnails === false);
 }
 
+console.log('== weibo-filter（信息流筛选判定）==');
+{
+    const wf = await import('../src/common/weibo-filter.js');
+    const on = { enabled: true, types: { original: true, repost: true, text: true, image: true, video: true, music: true } };
+    const post = (o) => ({ repost: false, hasImage: false, hasVideo: false, hasMusic: false, text: '', date: '', ...o });
+    ok('没启用时任何微博都显示（含空配置）',
+        wf.matchWeiboFilter(post({}), { ...on, enabled: false }) && wf.matchWeiboFilter(post({}), null));
+    ok('原创 / 转发 二选一：取消哪边就挡哪边',
+        !wf.matchWeiboFilter(post({ repost: false }), { ...on, types: { ...on.types, original: false } })
+        && !wf.matchWeiboFilter(post({ repost: true }), { ...on, types: { ...on.types, repost: false } })
+        && wf.matchWeiboFilter(post({ repost: true }), { ...on, types: { ...on.types, original: false } }));
+    ok('纯文字 / 含图片 / 含视频 / 含音乐 按命中的任一类型通过',
+        wf.matchWeiboFilter(post({ hasImage: true }), { ...on, types: { ...on.types, text: false } })
+        && !wf.matchWeiboFilter(post({ hasImage: true }), { ...on, types: { ...on.types, text: false, image: false, video: false, music: false } })
+        && !wf.matchWeiboFilter(post({}), { ...on, types: { ...on.types, text: false } })
+        && wf.matchWeiboFilter(post({}), { ...on, types: { ...on.types, image: false, video: false, music: false } }));
+    ok('有图又有视频时，只要勾了其中之一就显示',
+        wf.matchWeiboFilter(post({ hasImage: true, hasVideo: true }), { ...on, types: { ...on.types, text: false, image: false } }));
+    ok('关键字包含/不含都按整串子串匹配且不区分大小写',
+        wf.matchWeiboFilter(post({ text: '今天的 GIVEAWAY 抽奖' }), { ...on, keywordMode: 'has', keywords: ['giveaway'] })
+        && !wf.matchWeiboFilter(post({ text: '今天的 GIVEAWAY 抽奖' }), { ...on, keywordMode: 'none', keywords: ['giveaway'] })
+        && wf.matchWeiboFilter(post({ text: '普通日常' }), { ...on, keywordMode: 'none', keywords: ['giveaway'] }));
+    ok('关键字列表为空时关键字规则不生效',
+        wf.matchWeiboFilter(post({ text: '随便' }), { ...on, keywordMode: 'has', keywords: [] }));
+    ok('时间范围只看读得出的日期，读不出的保留',
+        wf.matchWeiboFilter(post({ date: '2026-10-20' }), { ...on, dateFrom: '2026-10-19', dateTo: '2026-10-21' })
+        && !wf.matchWeiboFilter(post({ date: '2026-10-18' }), { ...on, dateFrom: '2026-10-19' })
+        && !wf.matchWeiboFilter(post({ date: '2026-10-22' }), { ...on, dateTo: '2026-10-21' })
+        && wf.matchWeiboFilter(post({ date: '' }), { ...on, dateFrom: '2026-10-19', dateTo: '2026-10-21' }));
+    ok('splitKeywords 认换行/中英文逗号/分号/顿号，去空去重（大小写视作重复）',
+        JSON.stringify(wf.splitKeywords('抽奖\n代购, GIVEAWAY，代购；广告、  ')) === JSON.stringify(['抽奖', '代购', 'GIVEAWAY', '广告']));
+    ok('非法配置回落到默认值（类型默认全开，日期必须是 YYYY-MM-DD）',
+        (() => { const n = wf.normalizeWeiboFilter({ enabled: 1, types: { image: false }, keywordMode: 'xx', dateFrom: '2026/10/1', dateTo: '2026-10-5' });
+            return n.enabled === true && n.types.image === false && n.types.text === true && n.keywordMode === 'has'
+                && n.dateFrom === '' && n.dateTo === '2026-10-05'; })());
+    ok('作用范围：不勾「所有微博网站」时只认配置的那个站点',
+        wf.filterAppliesTo({ ...on, site: 'weibo.com' }, 'weibo.com')
+        && !wf.filterAppliesTo({ ...on, site: 'weibo.com' }, 'm.weibo.cn')
+        && wf.filterAppliesTo({ ...on, site: 'weibo.com', allSites: true }, 'm.weibo.cn')
+        && !wf.filterAppliesTo({ ...on, site: 'weibo.com', enabled: false }, 'weibo.com'));
+    ok('实验模式：直接从微博条目对象判类型（转发/图/视频/音乐/纯文字）',
+        (() => {
+            const repost = wf.weiboItemInfo({ text: 'hi', retweeted_status: { mid: 'x' } });
+            const pic = wf.weiboItemInfo({ text: 'hi', pic_ids: ['a'] });
+            const vid = wf.weiboItemInfo({ text: 'hi', page_info: { object_type: 'video' } });
+            const mus = wf.weiboItemInfo({ text: '分享歌曲' });
+            const plain = wf.weiboItemInfo({ text: '<b>hi</b>' });
+            return repost.repost && pic.hasImage && vid.hasVideo && mus.hasMusic && plain.text === 'hi' && !plain.hasImage && !plain.hasVideo;
+        })());
+    ok('实验模式：created_at 解析成本地日期，读不出就空串（不参与时间判断）',
+        wf.dateOfCreatedAt('Wed Oct 21 10:44:13 +0800 2026') === '2026-10-21'
+        && wf.dateOfCreatedAt('not a date') === '' && wf.dateOfCreatedAt('') === '');
+    ok('实验模式：matchWeiboItem 与页面判定同一套规则',
+        wf.matchWeiboItem({ text: '抽奖', pic_ids: ['a'] }, { ...on, keywordMode: 'none', keywords: ['抽奖'] }) === false
+        && wf.matchWeiboItem({ text: '日常', pic_ids: ['a'] }, { ...on, keywordMode: 'none', keywords: ['抽奖'] }) === true);
+    ok('describeWeiboFilter 能说清当前条件',
+        wf.describeWeiboFilter({ enabled: false }).includes('未启用')
+        && wf.describeWeiboFilter({ ...on, types: { ...on.types, repost: false }, keywordMode: 'none', keywords: ['抽奖'] }) === '不含转发 · 不含「抽奖」'
+        && wf.describeWeiboFilter(on).includes('没有条件'));
+}
+
 __summary();
 process.exit(fail ? 1 : 0);

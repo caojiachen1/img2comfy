@@ -5,6 +5,7 @@
 import { collectPageImages } from './collect.mjs';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial } from '../common/gallery.js';
 import { baseNameFromUrl, sanitizeFilename } from '../common/util.js';
+import { normalizeWeiboFilter, splitKeywords, describeWeiboFilter } from '../common/weibo-filter.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const truncate = (s, n = 90) => (String(s || '').length > n ? String(s).slice(0, n - 1) + '…' : String(s || ''));
@@ -29,6 +30,7 @@ const S = {
     groupEls: new Map(),
     batchState: new Map(),
     selSaved: '',
+    filterSite: '',
     running: false,
     lbIndex: -1,
     lbList: [],
@@ -65,6 +67,8 @@ function bindEvents() {
     $('#btnSettings').onclick = () => chrome.runtime.openOptionsPage();
     $('#btnWide').onclick = () => openWideWindow();
     $('#btnRefresh').onclick = async () => { await collect(true); await syncBatchState(); };
+    // tab 必须一开始就能点：面板刚打开、采集还没回来时点「筛选微博」不能白点
+    for (const b of document.querySelectorAll('#gTabs button')) b.onclick = () => { if (!b.disabled) switchTab(b.dataset.panel); };
     $('#onlyView').onchange = () => {
         S.onlyView = $('#onlyView').checked;
         if (S.full) applyData(S.full, true);
@@ -1145,6 +1149,121 @@ function toast(text, isErr = false, ms = 0) {
     el._t = setTimeout(() => el.classList.remove('show'), ms || (isErr ? 3600 : 2200));
 }
 
+
+/* ---------------- 顶部 tab + 微博筛选 ---------------- */
+function filterHost() {
+    try { return new URL((S.tab && S.tab.url) || '').hostname.toLowerCase(); } catch (e) { return ''; }
+}
+
+function modeText(r) {
+    const base = `已隐藏 ${r.hidden} 条 / 共 ${r.total} 条`;
+    return r.mode === 'list' ? `${base} · 实验模式（改微博内部列表，无空位）` : `${base} · 页面隐藏（会留空位）`;
+}
+
+function setWfStatus(text, ok) {
+    const el = $('#wfStatus');
+    el.textContent = text;
+    el.classList.toggle('ok', !!ok);
+}
+
+function syncFilterForm() {
+    const f = normalizeWeiboFilter((S.settings || {}).weiboFilter);
+    for (const el of document.querySelectorAll('[data-wf-type]')) el.checked = f.types[el.dataset.wfType] !== false;
+    $('#wfKeywords').value = f.keywords.join(' ');
+    $('#wfKeywordMode').value = f.keywordMode;
+    $('#wfFrom').value = f.dateFrom;
+    $('#wfTo').value = f.dateTo;
+    $('#wfAllSites').checked = f.allSites;
+    $('#wfExperimental').checked = f.experimental;
+    $('#wfSiteHint').textContent = f.allSites ? '对所有微博站点生效' : `只对当前站点生效（${S.filterSite || filterHost() || '未知'}）`;
+}
+
+function readFilterForm() {
+    const types = {};
+    for (const el of document.querySelectorAll('[data-wf-type]')) types[el.dataset.wfType] = el.checked;
+    return normalizeWeiboFilter({
+        enabled: true,
+        site: S.filterSite || filterHost(),
+        allSites: $('#wfAllSites').checked,
+        types,
+        keywordMode: $('#wfKeywordMode').value,
+        keywords: splitKeywords($('#wfKeywords').value),
+        dateFrom: $('#wfFrom').value,
+        dateTo: $('#wfTo').value,
+        experimental: !!$('#wfExperimental').checked,
+    });
+}
+
+async function pushFilter(filter) {
+    if (!S.tabId) { setWfStatus('没有可作用的网页'); return; }
+    try {
+        const r = await chrome.tabs.sendMessage(S.tabId, { action: 'mtbWeiboFilter', filter });
+        if (r && typeof r.hidden === 'number') setWfStatus(modeText(r), true);
+        else setWfStatus('已应用', true);
+        if (r && r.pageError) setWfStatus(`实验模式不可用，已退回页面隐藏（会留空位）：${r.pageError}`, false);
+    } catch (e) {
+        setWfStatus('网页里的脚本连不上：刷新网页后再试（刚重载扩展时旧脚本会失效）');
+    }
+}
+
+let wfTimer = 0;
+function onFilterFormChanged() {
+    const filter = readFilterForm();
+    S.settings.weiboFilter = filter;
+    clearTimeout(wfTimer);
+    wfTimer = setTimeout(() => {
+        chrome.runtime.sendMessage({ action: 'patchSettings', patch: { weiboFilter: filter } }).catch(() => {});
+        pushFilter(filter);
+    }, 120);
+}
+
+async function refreshFilterStatus() {
+    const f = normalizeWeiboFilter((S.settings || {}).weiboFilter);
+    if (!S.tabId) { setWfStatus('没有可作用的网页'); return; }
+    try {
+        const r = await chrome.tabs.sendMessage(S.tabId, { action: 'mtbWeiboStatus' });
+        if (r && r.applied) setWfStatus(modeText(r), true);
+        else if (f.enabled) setWfStatus(`已开启，但这条规则只作用于 ${f.site || '—'}，本页不生效`);
+        else setWfStatus('筛选会立刻生效，不用刷新');
+    } catch (e) { setWfStatus('网页里的脚本连不上：刷新网页后再试'); }
+}
+
+function switchTab(name) {
+    for (const b of document.querySelectorAll('#gTabs button')) b.classList.toggle('active', b.dataset.panel === name);
+    document.body.classList.toggle('tab-filter', name === 'filter');
+    $('#panelImages').hidden = name !== 'images';
+    $('#panelFilter').hidden = name !== 'filter';
+    if (name === 'images') fitLayout();
+    else refreshFilterStatus();
+}
+
+function initFilterTab() {
+    const host = filterHost();
+    S.filterSite = host;
+    const tabBtn = document.querySelector('#gTabs button[data-panel="filter"]');
+    if (!isWeiboHost(host)) {
+        tabBtn.disabled = true;
+        tabBtn.title = '微博筛选只支持 weibo.com / m.weibo.cn';
+        $('#wfStatus').textContent = '当前页面不是微博，筛选不可用';
+    }
+    syncFilterForm();
+    for (const el of document.querySelectorAll('#panelFilter input, #panelFilter select')) {
+        el.addEventListener('input', onFilterFormChanged);
+        el.addEventListener('change', onFilterFormChanged);
+    }
+    $('#wfAllSites').addEventListener('change', syncFilterForm);
+    $('#wfClear').onclick = () => {
+        const f = normalizeWeiboFilter({ enabled: false, site: S.filterSite || host });
+        S.settings.weiboFilter = f;
+        syncFilterForm();
+        chrome.runtime.sendMessage({ action: 'patchSettings', patch: { weiboFilter: f } }).catch(() => {});
+        pushFilter(f);
+    };
+    // 采集回来时用户可能已经切到筛选 tab 了，别硬掰回图片
+    const active = document.querySelector('#gTabs button.active');
+    switchTab(active ? active.dataset.panel : 'images');
+}
+
 (async function main() {
     const q = new URLSearchParams(location.search);
     S.wide = q.get('wide') === '1';
@@ -1165,5 +1284,6 @@ function toast(text, isErr = false, ms = 0) {
         return;
     }
     await collect(false);
+    initFilterTab();
     await syncBatchState();
 })();

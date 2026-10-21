@@ -5224,8 +5224,165 @@ async function copyText(t) {
 
 return { "Runner": (typeof Runner === 'undefined' ? undefined : Runner), "copyText": (typeof copyText === 'undefined' ? undefined : copyText), "toast": (typeof toast === 'undefined' ? undefined : toast), "toInt": (typeof toInt === 'undefined' ? undefined : toInt), "toNum": (typeof toNum === 'undefined' ? undefined : toNum) };
 })();
+__M["src/common/weibo-filter.js"] = (function(){
+// 微博信息流筛选：按「原创/转发 + 纯文字/含图片/含视频/含音乐 + 关键字 + 时间」决定一条微博显示还是隐藏。
+// 纯函数放这里，DOM 读取在 src/content/weibo-filter.mjs —— 这样判定语义能被单测钉住。
+
+const WEIBO_TYPES = ['original', 'repost', 'text', 'image', 'video', 'music'];
+
+const DEFAULT_WEIBO_FILTER = {
+    enabled: false,
+    site: '',            // 最近一次在哪个微博站点上配的（host）
+    allSites: false,     // 勾上就作用于所有微博站点
+    types: { original: true, repost: true, text: true, image: true, video: true, music: true },
+    keywordMode: 'has',  // has | none（关键字为空时整条规则不生效）
+    keywords: [],
+    dateFrom: '',
+    dateTo: '',
+    experimental: false,   // 实验：直接改微博内部列表数据，让被筛的帖子真的不存在（默认关，有风险）
+};
+
+const MAX_KEYWORDS = 50;
+const DAY_RE = /^(\d{4})-(\d{1,2})-(\d{1,2})$/;
+
+/** 「一行一个」输入框 → 数组：换行/中英文逗号/分号/顿号都当分隔，去掉空项与重复（不区分大小写） */
+function splitKeywords(text) {
+    const out = [];
+    const seen = new Set();
+    for (const raw of String(text || '').split(/[\n\r,，;；、]+/)) {
+        const k = raw.trim();
+        if (!k) continue;
+        const low = k.toLowerCase();
+        if (seen.has(low)) continue;
+        seen.add(low);
+        out.push(k);
+        if (out.length >= MAX_KEYWORDS) break;
+    }
+    return out;
+}
+
+function normDay(v) {
+    const m = DAY_RE.exec(String(v || '').trim());
+    if (!m) return '';
+    const [, y, mo, d] = m;
+    const pad = (x) => String(x).padStart(2, '0');
+    return `${y}-${pad(mo)}-${pad(d)}`;
+}
+
+function normalizeWeiboFilter(f) {
+    const src = f && typeof f === 'object' ? f : {};
+    const t = src.types && typeof src.types === 'object' ? src.types : {};
+    const types = {};
+    for (const k of WEIBO_TYPES) types[k] = t[k] !== false;
+    return {
+        enabled: !!src.enabled,
+        site: String(src.site || '').toLowerCase(),
+        allSites: !!src.allSites,
+        types,
+        keywordMode: src.keywordMode === 'none' ? 'none' : 'has',
+        keywords: Array.isArray(src.keywords) ? splitKeywords(src.keywords.join('\n')) : splitKeywords(src.keywords),
+        dateFrom: normDay(src.dateFrom),
+        dateTo: normDay(src.dateTo),
+        experimental: !!src.experimental,
+    };
+}
+
+/** 当前条件该不该作用在这个 host 上（不勾「所有微博网站」时只认配它的那个站点） */
+function filterAppliesTo(filter, host) {
+    const f = normalizeWeiboFilter(filter);
+    if (!f.enabled) return false;
+    if (f.allSites) return true;
+    return !!f.site && String(host || '').toLowerCase() === f.site;
+}
+
+/**
+ * 这条微博该不该显示。info 由页面侧读出：{repost, hasImage, hasVideo, hasMusic, text, date:'YYYY-MM-DD'|''}。
+ * 类型是「勾了的才要」：原创/转发二选一，纯文字/含图/含视频/含音乐按命中的任一类型通过。
+ */
+function matchWeiboFilter(info, filter) {
+    const f = normalizeWeiboFilter(filter);
+    if (!f.enabled) return true;
+    const v = info || {};
+    const wantOriginal = f.types.original, wantRepost = f.types.repost;
+    if (v.repost) {
+        if (!wantRepost) return false;
+    } else if (!wantOriginal) return false;
+    const hasImage = !!v.hasImage, hasVideo = !!v.hasVideo, hasMusic = !!v.hasMusic;
+    const textOnly = !hasImage && !hasVideo && !hasMusic;
+    const passMedia = (f.types.text && textOnly)
+        || (f.types.image && hasImage)
+        || (f.types.video && hasVideo)
+        || (f.types.music && hasMusic);
+    if (!passMedia) return false;
+    if (f.keywords.length) {
+        const text = String(v.text || '').toLowerCase();
+        const hit = f.keywords.some((k) => text.includes(k.toLowerCase()));
+        if (f.keywordMode === 'has' && !hit) return false;
+        if (f.keywordMode === 'none' && hit) return false;
+    }
+    if (f.dateFrom || f.dateTo) {
+        // 时间读不出来的帖子不参与时间判断（宁可多留，不误杀）
+        if (v.date) {
+            if (f.dateFrom && v.date < f.dateFrom) return false;
+            if (f.dateTo && v.date > f.dateTo) return false;
+        }
+    }
+    return true;
+}
+
+/** 面板/提示条上的一句话，说明当前生效的条件 */
+function describeWeiboFilter(filter) {
+    const f = normalizeWeiboFilter(filter);
+    if (!f.enabled) return '未启用';
+    const parts = [];
+    if (!f.types.original) parts.push('不含原创');
+    if (!f.types.repost) parts.push('不含转发');
+    const media = [['image', '含图片'], ['video', '含视频'], ['music', '含音乐'], ['text', '纯文字']]
+        .filter(([k]) => f.types[k]).map(([, label]) => label);
+    if (media.length < 4) parts.push(media.length ? '只看' + media.join('/') : '不看任何类型');
+    if (f.keywords.length) parts.push(`${f.keywordMode === 'has' ? '包含' : '不含'}「${f.keywords.slice(0, 3).join('、')}」${f.keywords.length > 3 ? '等 ' + f.keywords.length + ' 个' : ''}`);
+    if (f.dateFrom || f.dateTo) parts.push(`${f.dateFrom || '不限'} ~ ${f.dateTo || '至今'}`);
+    return parts.length ? parts.join(' · ') : '启用但没有条件（等同不筛）';
+}
+
+/* ---------------- 实验模式：直接判微博自己那份数据里的条目 ---------------- */
+
+/** 'Wed Oct 21 10:44:13 +0800 2026' / ISO / 时间戳 → 'YYYY-MM-DD'（读不出就空串） */
+function dateOfCreatedAt(v) {
+    if (v === undefined || v === null || v === '') return '';
+    const d = typeof v === 'number' ? new Date(v < 1e12 ? v * 1000 : v) : new Date(v);
+    if (Number.isNaN(d.getTime())) return '';
+    const pad = (x) => String(x).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 把微博条目对象（Home.data.list 里那种）翻成判定要的 info */
+function weiboItemInfo(item) {
+    const it = item || {};
+    const page = it.page_info || {};
+    const pageType = String(page.object_type || page.type || '').toLowerCase();
+    const text = String(it.text || it.longText || '').replace(/<[^>]+>/g, '');
+    const pics = !!(it.pic_ids && it.pic_ids.length) || !!it.pic_infos;
+    return {
+        repost: !!it.retweeted_status,
+        hasImage: pics,
+        hasVideo: pageType.includes('video') || !!(it.mix_media_info && /video/i.test(JSON.stringify(it.mix_media_info).slice(0, 400))),
+        hasMusic: pageType.includes('music') || /分享歌曲|网易云音乐|QQ音乐|酷狗音乐/.test(text),
+        text,
+        date: dateOfCreatedAt(it.created_at),
+    };
+}
+
+function matchWeiboItem(item, filter) {
+    return matchWeiboFilter(weiboItemInfo(item), filter);
+}
+
+return { "WEIBO_TYPES": (typeof WEIBO_TYPES === 'undefined' ? undefined : WEIBO_TYPES), "DEFAULT_WEIBO_FILTER": (typeof DEFAULT_WEIBO_FILTER === 'undefined' ? undefined : DEFAULT_WEIBO_FILTER), "splitKeywords": (typeof splitKeywords === 'undefined' ? undefined : splitKeywords), "normalizeWeiboFilter": (typeof normalizeWeiboFilter === 'undefined' ? undefined : normalizeWeiboFilter), "filterAppliesTo": (typeof filterAppliesTo === 'undefined' ? undefined : filterAppliesTo), "matchWeiboFilter": (typeof matchWeiboFilter === 'undefined' ? undefined : matchWeiboFilter), "describeWeiboFilter": (typeof describeWeiboFilter === 'undefined' ? undefined : describeWeiboFilter), "dateOfCreatedAt": (typeof dateOfCreatedAt === 'undefined' ? undefined : dateOfCreatedAt), "weiboItemInfo": (typeof weiboItemInfo === 'undefined' ? undefined : weiboItemInfo), "matchWeiboItem": (typeof matchWeiboItem === 'undefined' ? undefined : matchWeiboItem) };
+})();
 __M["src/common/registry.js"] = (function(){
 // 工具目录与默认设置。工具栏按钮、设置页清单、host 分发都以本文件为唯一真值。
+
+const { DEFAULT_WEIBO_FILTER } = __M["src/common/weibo-filter.js"];
 
 const ICONS = {
     copy: '📋', link: '🔗', download: '💾', open: '🗗', info: 'ℹ️', eye: '👁️',
@@ -5381,6 +5538,8 @@ const DEFAULT_SETTINGS = {
         disabledHosts: [],
         includeFrame: true,
     },
+    // 只作用于微博信息流：不满足条件的整条 display:none（跟没发过一样）
+    weiboFilter: { ...DEFAULT_WEIBO_FILTER, keywords: [] },
     ai: {
         enabled: true,
         device: 'auto',              // auto | webgpu | wasm
@@ -5672,6 +5831,264 @@ function structuredCloneSafe(v) {
 
 return { "CONTEXT_API_DOC": (typeof CONTEXT_API_DOC === 'undefined' ? undefined : CONTEXT_API_DOC), "BUILTIN_SCRIPTS": (typeof BUILTIN_SCRIPTS === 'undefined' ? undefined : BUILTIN_SCRIPTS), "BUILTIN_LINKS": (typeof BUILTIN_LINKS === 'undefined' ? undefined : BUILTIN_LINKS), "ensureBuiltins": (typeof ensureBuiltins === 'undefined' ? undefined : ensureBuiltins) };
 })();
+__M["src/content/weibo-filter.mjs"] = (function(){
+// 微博信息流筛选：不满足条件的微博整条 display:none。
+//
+// 已知限制（2026-10-21 真页面踩过）：帖子是绝对定位的虚拟列表
+//   article.woo-panel-main → div.wbpro-scroller-item → div.vue-recycle-scroller__item-view（transform: translateY(…px)）
+// 槽位坐标由 scroller 自己按累计高度算，只藏 article 会在原位置留一段空白（页面底色，看起来像"一块黑"）。
+// 试过「连槽隐藏 + 把后面的槽上移」：scroller 会不停用原始 translateY 覆盖回来，滚动时整页闪、甚至堆到顶部全黑，
+// 属于和虚拟列表的内部状态对打，已回退。所以现在只藏 article，空白保留 —— 稳定优先。
+
+const { matchWeiboFilter, normalizeWeiboFilter, describeWeiboFilter, filterAppliesTo } = __M["src/common/weibo-filter.js"];
+
+const POST_SEL = 'article, .card-wrap';
+const HIDDEN_ATTR = 'data-mtb-filtered';
+
+function isWeiboHost(host = location.hostname) {
+    return /(^|\.)weibo\.(com|cn)$/i.test(String(host || ''));
+}
+
+function hostOf(u) {
+    try { return new URL(u, location.href).hostname; } catch (e) { return ''; }
+}
+
+// 头像/表情/图标不算「有图片」：内容图才有资格满足筛选条件
+function isContentImage(img) {
+    const src = img.currentSrc || img.src || img.getAttribute('data-src') || '';
+    if (!src || /^data:image\/svg/i.test(src)) return false;
+    const host = hostOf(src);
+    if (/^tva\d*\.sinaimg\.cn$/i.test(host) || /^tvax\d*\.sinaimg\.cn$/i.test(host)) return false;
+    if (/\/crop\./i.test(src)) return false;
+    if (/face\.t\.sinajs\.cn/i.test(src)) return false;
+    if (/avatar|emoji|icon/i.test(String(img.className || ''))) return false;
+    const r = img.getBoundingClientRect();
+    const w = Math.max(r.width, img.naturalWidth || 0, parseFloat(img.getAttribute('width')) || 0);
+    const h = Math.max(r.height, img.naturalHeight || 0, parseFloat(img.getAttribute('height')) || 0);
+    if (w && h && Math.min(w, h) >= 60) return true;
+    return !!img.closest('[class*="picture"],[class*="Picture"],[class*="photo"],[class*="Photo"]');
+}
+
+function hasVideo(el) {
+    if (el.querySelector('video')) return true;
+    if (el.querySelector('[class*="videoBox"],[class*="video"],[class*="Video"],[class*="player"],[class*="Player"]')) return true;
+    return !!el.querySelector('a[href*="/tv/"]');
+}
+
+function hasMusic(el) {
+    if (el.querySelector('audio,[class*="music"],[class*="Music"],[class*="audio"],[class*="Audio"]')) return true;
+    return /分享歌曲|网易云音乐|QQ音乐|酷狗音乐|音乐推荐/.test(el.textContent || '');
+}
+
+// 转发：真页面是容器带「独立的 retweet 类」+ 正文 `wbpro-feed-reText`（2026-10-21 实测：
+// `retweet _retweet_ecgcn_86` / `_text_1h76l_2 _reText_1h76l_48 wbpro-feed-reText`）。
+// 两个坑都踩过：① 不能用正文里的「转发」两个字——那是底部按钮文案，每条微博都有；
+// ② 不能用 [class*="retweet"]——底部转发图标的类名是 `woo-font woo-font--retweet _retweetIcon_198pe_119`，
+// 每条原创都带，会把全站判成转发。所以只认独立类名 `.retweet` 和带下划线的 `_reText_`。
+function isRepost(el) {
+    return !!el.querySelector('.retweet, [class*="wbpro-feed-reText"], [class*="_reText_"]');
+}
+
+// 发布时间：真页面的 _time_ 链接带 title="2026-10-21 08:55"（绝对时间，最可靠）；
+// 没有就退回从「3分钟前 / 今天 12:30 / 10-18 / 2025-12-01」这类文案里猜。
+function postDate(el) {
+    const t = el.querySelector('[class*="_time_"],[class*="_time"]');
+    const title = t && (t.getAttribute('title') || '');
+    const m = /(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})/.exec(title);
+    if (m) return `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+    const text = t ? String(t.textContent || '').trim() : '';
+    const pad = (x) => String(x).padStart(2, '0');
+    const now = new Date();
+    const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    let mm;
+    if ((mm = /(\d{4})[-年/](\d{1,2})[-月/](\d{1,2})/.exec(text))) return `${mm[1]}-${pad(mm[2])}-${pad(mm[3])}`;
+    if ((mm = /^(\d{1,2})[-月](\d{1,2})/.exec(text))) return `${now.getFullYear()}-${pad(mm[1])}-${pad(mm[2])}`;
+    if (/刚刚|秒前/.test(text)) return ymd(now);
+    if ((mm = /(\d+)\s*分钟前/.exec(text))) return ymd(new Date(now - mm[1] * 60000));
+    if ((mm = /(\d+)\s*小时前/.exec(text))) return ymd(new Date(now - mm[1] * 3600000));
+    if (/昨天/.test(text)) return ymd(new Date(now - 86400000));
+    if (/今天/.test(text)) return ymd(now);
+    return '';
+}
+
+function postInfoOf(el) {
+    let hasImage = false;
+    for (const img of el.querySelectorAll('img')) {
+        if (isContentImage(img)) { hasImage = true; break; }
+    }
+    return {
+        repost: isRepost(el),
+        hasImage,
+        hasVideo: hasVideo(el),
+        hasMusic: hasMusic(el),
+        text: el.textContent || '',
+        date: postDate(el),
+    };
+}
+
+function signatureOf(info, fp) {
+    const text = String(info.text || '').replace(/\s+/g, ' ').trim();
+    return `${fp}|${info.repost ? 1 : 0}${info.hasImage ? 1 : 0}${info.hasVideo ? 1 : 0}${info.hasMusic ? 1 : 0}|${info.date}|${text.length}|${text.slice(0, 26)}|${text.slice(-18)}`;
+}
+
+function postsOf(root) {
+    const all = [...root.querySelectorAll(POST_SEL)];
+    return all.filter((el) => !all.some((o) => o !== el && o.contains(el)));
+}
+
+function fingerprint(f) {
+    const t = f.types || {};
+    return [f.enabled ? 1 : 0, f.site, f.allSites ? 1 : 0, ['original', 'repost', 'text', 'image', 'video', 'music'].map((k) => (t[k] === false ? 0 : 1)).join(''), f.keywordMode, f.keywords.join('|'), f.dateFrom, f.dateTo].join('~');
+}
+
+function ensureChipHost() {
+    let host = document.getElementById('mtb-filter-chip');
+    if (host) return host.shadowRoot;
+    host = document.createElement('div');
+    host.id = 'mtb-filter-chip';
+    host.style.cssText = 'all:initial;position:fixed;right:16px;bottom:16px;z-index:2147483646;pointer-events:none;';
+    const shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML = `
+      <style>
+        .chip {
+          display: flex; align-items: center; gap: 8px; padding: 7px 10px 7px 12px; border-radius: 999px;
+          background: rgba(18, 21, 28, .92); color: #e8eef8; border: 1px solid rgba(255, 255, 255, .14);
+          box-shadow: 0 6px 20px rgba(0, 0, 0, .35); font: 12px/1.4 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+          pointer-events: auto; backdrop-filter: blur(8px);
+        }
+        .chip[hidden] { display: none; }
+        .x { all: unset; cursor: pointer; width: 18px; height: 18px; border-radius: 50%; text-align: center; line-height: 18px; color: #9fb0c7; }
+        .x:hover { background: rgba(255, 255, 255, .12); color: #fff; }
+      </style>
+      <div class="chip" hidden><span class="t"></span><button class="x" type="button" title="清除筛选（恢复显示全部微博）">✕</button></div>`;
+    document.documentElement.appendChild(host);
+    return shadow;
+}
+
+function mountWeiboFilter(settings) {
+    if (!isWeiboHost()) return null;
+    const shadow = ensureChipHost();
+    const chip = shadow.querySelector('.chip');
+    const textEl = shadow.querySelector('.t');
+    const state = { filter: normalizeWeiboFilter(settings && settings.weiboFilter), sigs: new WeakMap(), hidden: 0, total: 0, timer: 0, seq: 0, pageMode: false, pageError: '' };
+
+    const clearFilter = () => {
+        try {
+            chrome.runtime.sendMessage({ action: 'patchSettings', patch: { weiboFilter: { enabled: false } } })
+                .catch(() => { /* 扩展刚重载时忽略 */ });
+        } catch (e) { /* 同上 */ }
+    };
+    shadow.querySelector('.x').addEventListener('click', clearFilter);
+
+    // 实验模式：让后台往页面主世界注入一段代码，直接改微博自己的信息流数组（列表会自己重排、不留空位）。
+    // 失败就退回「只隐藏页面元素」——那条路缩不会坏页面，只是留空位。
+    const pageFilterApply = async (filter, enabled) => {
+        try {
+            const r = await chrome.runtime.sendMessage({ action: 'applyWeiboFilterPage', filter, enabled });
+            return r || { ok: false, error: '后台没有响应' };
+        } catch (e) {
+            return { ok: false, error: String((e && e.message) || e) };
+        }
+    };
+
+    const doApply = async () => {
+        const f = state.filter;
+        const active = filterAppliesTo(f, location.hostname);
+        const wantExp = active && f.experimental;
+        let pageRes = null;
+        if (wantExp || state.pageMode) {
+            pageRes = await pageFilterApply(wantExp ? f : null, wantExp);
+        }
+        const usePage = !!(wantExp && pageRes && pageRes.ok);
+        state.pageMode = usePage;
+        state.pageError = wantExp && !usePage ? String((pageRes && pageRes.error) || '实验模式不可用') : '';
+
+        const fp = fingerprint({ ...f, enabled: active });
+        let hidden = 0, total = 0;
+        for (const el of postsOf(document)) {
+            total++;
+            const info = usePage ? null : (active ? postInfoOf(el) : null);
+            const sig = info ? signatureOf(info, fp) : fp;
+            if (state.sigs.get(el) === sig) { if (el.getAttribute(HIDDEN_ATTR) === '1') hidden++; continue; }
+            state.sigs.set(el, sig);
+            const show = !info || matchWeiboFilter(info, f);
+            if (show || usePage) {
+                if (el.getAttribute(HIDDEN_ATTR) === '1') {
+                    el.removeAttribute(HIDDEN_ATTR);
+                    el.style.removeProperty('display');
+                }
+            } else {
+                el.setAttribute(HIDDEN_ATTR, '1');
+                el.style.setProperty('display', 'none', 'important');
+                hidden++;
+            }
+        }
+        if (usePage) {
+            // 列表已经不渲染被筛掉的帖子了；计数以后台那份数组为准
+            hidden = Number(pageRes.hidden) || 0;
+            total = Math.max(Number(pageRes.total) || 0, total);
+        }
+        state.hidden = hidden;
+        state.total = total;
+        chip.hidden = !(active && hidden > 0);
+        if (!chip.hidden) {
+            // 全被筛掉时给一句明确的出路，别让人以为页面坏了
+            textEl.textContent = hidden === total && total > 0
+                ? `全部 ${total} 条都被筛掉了 · 点 ✕ 恢复显示`
+                : `已隐藏 ${hidden} 条 · ${usePage ? '实验模式 · ' : ''}${describeWeiboFilter(f)}`;
+            textEl.title = usePage
+                ? '实验模式：改的是微博内部列表数据，微博改版后可能失效（刷新页面即可恢复）'
+                : '不满足筛选条件的微博已整条隐藏；✕ 可清除筛选';
+        }
+        return { hidden, total, mode: usePage ? 'list' : 'dom', pageError: state.pageError };
+    };
+
+    // 串行执行：storage 推送和面板消息可能同时到达，并发跑会互相覆盖（状态各算各的）
+    const queueApply = () => {
+        const next = (state.pending || Promise.resolve()).catch(() => {}).then(doApply);
+        state.pending = next;
+        return next;
+    };
+
+    const schedule = () => {
+        clearTimeout(state.timer);
+        state.timer = setTimeout(() => { void queueApply(); }, 60);
+    };
+
+    // 虚拟列表插入新帖、回收复用节点都会走 childList
+    const mo = new MutationObserver(schedule);
+    mo.observe(document.body, { childList: true, subtree: true });
+    void queueApply();
+
+    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+        if (!msg) return false;
+        if (msg.action === 'mtbWeiboStatus') {
+            sendResponse({ ok: true, hidden: state.hidden, total: state.total, applied: filterAppliesTo(state.filter, location.hostname), mode: state.pageMode ? 'list' : 'dom', pageError: state.pageError });
+            return false;
+        }
+        if (msg.action !== 'mtbWeiboFilter') return false;
+        state.filter = normalizeWeiboFilter(msg.filter);
+        state.sigs = new WeakMap();   // 条件变了要整批重判
+        queueApply().then((out) => sendResponse({ ok: true, ...out })).catch(() => sendResponse({ ok: false }));
+        return true;
+    });
+
+    return {
+        apply(nextSettings) {
+            state.filter = normalizeWeiboFilter(nextSettings && nextSettings.weiboFilter);
+            state.sigs = new WeakMap();
+            void queueApply();
+        },
+        status() { return { hidden: state.hidden, total: state.total, applied: filterAppliesTo(state.filter, location.hostname), mode: state.pageMode ? 'list' : 'dom', pageError: state.pageError }; },
+        destroy() {
+            mo.disconnect();
+            clearTimeout(state.timer);
+        },
+    };
+}
+
+return { "isWeiboHost": (typeof isWeiboHost === 'undefined' ? undefined : isWeiboHost), "mountWeiboFilter": (typeof mountWeiboFilter === 'undefined' ? undefined : mountWeiboFilter) };
+})();
 __M["src/content/main.mjs"] = (function(){
 // 内容脚本入口：设置同步、媒体探测、工具栏显隐、宿主连接、键盘与全屏处理。
 
@@ -5682,6 +6099,7 @@ const { buildToolbar, migrateSettings, DEFAULT_SETTINGS } = __M["src/common/regi
 const { ensureBuiltins } = __M["src/common/builtin-scripts.js"];
 const { captureVideoFrame } = __M["src/content/frame.js"];
 const { extAlive, friendlyError, DEAD_TEXT } = __M["src/common/ext-state.js"];
+const { mountWeiboFilter } = __M["src/content/weibo-filter.mjs"];
 
 const STATE = {
     settings: null,
@@ -5703,6 +6121,7 @@ let runner = null;
 let boxLayer = null;
 let maskLayer = null;
 let shadow = null;
+let weiboFilter = null;
 
 // 扩展在 edge://extensions 里重载（或更新）之后，页面里这份内容脚本就成了僵尸：它的 runtime 端口
 // 随旧扩展一起销毁，之后任何 sendMessage 都会同步抛 "Extension context invalidated"。
@@ -5745,6 +6164,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     STATE.settings = s;
     if (toolbar) toolbar.applySettings(s);
     if (runner) runner.ctx.settings = s;
+    if (weiboFilter) weiboFilter.apply(s);
     if (prober) {
         prober.opts.minImgSize = s.toolbar.minImgSize;
         prober.opts.skipThumbnails = s.toolbar.skipThumbnails !== false;
@@ -5824,6 +6244,7 @@ async function boot(s) {
     toolbar.onMoved = () => positionLayers();
 
     prober = makeProber({ minImgSize: s.toolbar.minImgSize, skipThumbnails: s.toolbar.skipThumbnails !== false });
+    weiboFilter = mountWeiboFilter(s);
 
     document.addEventListener('mouseover', onOver, true);
     document.addEventListener('mousemove', onMove, { passive: true });

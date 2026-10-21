@@ -1,5 +1,7 @@
 // 工具目录与默认设置。工具栏按钮、设置页清单、host 分发都以本文件为唯一真值。
 
+import { DEFAULT_WEIBO_FILTER } from './weibo-filter.js';
+
 export const ICONS = {
     copy: '📋', link: '🔗', download: '💾', open: '🗗', info: 'ℹ️', eye: '👁️',
     comfy: '🧩', play: '▶', pause: '⏸', stepF: '⏭', stepB: '⏮', speed: '⏩',
@@ -154,6 +156,8 @@ export const DEFAULT_SETTINGS = {
         disabledHosts: [],
         includeFrame: true,
     },
+    // 只作用于微博信息流：不满足条件的整条 display:none（跟没发过一样）
+    weiboFilter: { ...DEFAULT_WEIBO_FILTER, keywords: [] },
     ai: {
         enabled: true,
         device: 'auto',              // auto | webgpu | wasm

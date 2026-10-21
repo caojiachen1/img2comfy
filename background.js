@@ -35,6 +35,195 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true; // 异步通道
 });
 
+
+// 实验模式：直接改微博页面里的信息流数组（在 MAIN world 跑，能碰到 Vue 的内部 state）。
+// 必须完全自包含：这个函数会被 chrome.scripting.executeScript 序列化注入。
+// 只做两件事：把微博自己那份 list 里不该显示的条目拿掉 / 放回去。列表组件会自己重排，所以不留空位。
+function weiboFilterPage(arg) {
+    try {
+        const KEY = '__mtbWeiboFilterPage';
+        const st = window[KEY] || (window[KEY] = { orig: [] });
+        const pad = (x) => String(x).padStart(2, '0');
+        const strip = (h) => String(h || '').replace(/<[^>]+>/g, '');
+        const day = (v) => {
+            if (v === undefined || v === null || v === '') return '';
+            const d = typeof v === 'number' ? new Date(v < 1e12 ? v * 1000 : v) : new Date(v);
+            return Number.isNaN(d.getTime()) ? '' : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+        };
+        const normDay = (v) => {
+            const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(v || '').trim());
+            return m ? `${m[1]}-${pad(m[2])}-${pad(m[3])}` : '';
+        };
+        const splitKeywords = (t) => {
+            const out = [];
+            const seen = new Set();
+            for (const raw of String(t || '').split(/[\n\r,，;；、]+/)) {
+                const k = raw.trim();
+                if (!k) continue;
+                const low = k.toLowerCase();
+                if (seen.has(low)) continue;
+                seen.add(low);
+                out.push(k);
+            }
+            return out;
+        };
+        const norm = (f) => {
+            const src = f && typeof f === 'object' ? f : {};
+            const t = src.types && typeof src.types === 'object' ? src.types : {};
+            const types = {};
+            for (const k of ['original', 'repost', 'text', 'image', 'video', 'music']) types[k] = t[k] !== false;
+            return {
+                enabled: !!src.enabled,
+                types,
+                keywordMode: src.keywordMode === 'none' ? 'none' : 'has',
+                keywords: splitKeywords(Array.isArray(src.keywords) ? src.keywords.join('\n') : src.keywords),
+                dateFrom: normDay(src.dateFrom),
+                dateTo: normDay(src.dateTo),
+            };
+        };
+        const match = (it, f) => {
+            const page = it.page_info || {};
+            const pageType = String(page.object_type || page.type || '').toLowerCase();
+            const text = strip(it.text || it.longText || '');
+            const hasImage = !!(it.pic_ids && it.pic_ids.length) || !!it.pic_infos;
+            const hasVideo = pageType.indexOf('video') >= 0;
+            const hasMusic = pageType.indexOf('music') >= 0 || /分享歌曲|网易云音乐|QQ音乐/.test(text);
+            const repost = !!it.retweeted_status;
+            if (repost ? !f.types.repost : !f.types.original) return false;
+            const textOnly = !hasImage && !hasVideo && !hasMusic;
+            const passMedia = (f.types.text && textOnly) || (f.types.image && hasImage) || (f.types.video && hasVideo) || (f.types.music && hasMusic);
+            if (!passMedia) return false;
+            if (f.keywords.length) {
+                const low = text.toLowerCase();
+                const hit = f.keywords.some((k) => low.indexOf(String(k).toLowerCase()) >= 0);
+                if (f.keywordMode === 'has' && !hit) return false;
+                if (f.keywordMode === 'none' && hit) return false;
+            }
+            if (f.dateFrom || f.dateTo) {
+                const d = day(it.created_at);
+                if (d) {
+                    if (f.dateFrom && d < f.dateFrom) return false;
+                    if (f.dateTo && d > f.dateTo) return false;
+                }
+            }
+            return true;
+        };
+        const keyOf = (it) => String(it.mid || it.idstr || it.id || '');
+
+        // 找信息流那份数组：从根组件往下走，挑元素带 mid/text/pic_ids/user 且最长的那个
+        const findList = () => {
+            const appEl = document.querySelector('#app');
+            const root = appEl && appEl._vnode && appEl._vnode.component;
+            if (!root) return null;
+            // 当前信息流是「屏幕上真正渲染出来的那一份」：拿页面上已有帖子的正文当指纹，
+            // 哪个候选数组的条目能在里面找到，哪个才是当前列表（切页后旧组件仍挂在 Vue 树里）
+            let rendered = '';
+            try {
+                rendered = [...document.querySelectorAll('article')].map((a) => String(a.textContent || '').replace(/\s+/g, '')).join('|').slice(0, 30000);
+            } catch (e) { rendered = ''; }
+            const seen = new Set();
+            let best = null;
+            // 单页应用切页后，上一个信息流的组件还挂在 Vue 树里；只按「数组最长」挑会挑到上一页那份。
+            // 所以优先挑「组件根节点在文档里、且可见」的列表；都不可见时再退回最长的那份。
+            const consider = (arr, inst) => {
+                if (!Array.isArray(arr) || !arr.length) return;
+                const first = arr[0];
+                if (!first || typeof first !== 'object') return;
+                const looks = ('mid' in first || 'idstr' in first) && ('text' in first || 'pic_ids' in first || 'user' in first);
+                if (!looks) return;
+                let visible = 0;
+                try {
+                    const el = inst && inst.subTree && inst.subTree.el;
+                    if (el && el.nodeType === 1) {
+                        const r = el.getBoundingClientRect();
+                        const cs = getComputedStyle(el);
+                        visible = (el.isConnected && cs.display !== 'none' && cs.visibility !== 'hidden' && (r.width > 0 || r.height > 0)) ? 1 : 0;
+                    }
+                } catch (e) { visible = 0; }
+                let hits = 0;
+                try {
+                    for (const it of arr.slice(0, 12)) {
+                        const t = strip(it.text || '').replace(/\s+/g, '').slice(0, 10);
+                        if (t && rendered.indexOf(t) >= 0) hits++;
+                    }
+                } catch (e) { hits = 0; }
+                if (!best || hits > best.hits) { best = { arr, hits, visible, length: arr.length }; return; }
+                if (hits === best.hits && (visible > best.visible || (visible === best.visible && arr.length > best.length))) {
+                    best = { arr, hits, visible, length: arr.length };
+                }
+            };
+            const visit = (vn, depth) => {
+                if (!vn || depth > 40) return;
+                if (vn.component) walk(vn.component, depth + 1);
+                if (Array.isArray(vn.children)) for (const c of vn.children) visit(c, depth + 1);
+            };
+            const walk = (inst, depth) => {
+                if (!inst || seen.has(inst) || depth > 40) return;
+                seen.add(inst);
+                for (const src of [inst.data, inst.setupState, inst.props]) {
+                    if (!src || typeof src !== 'object') continue;
+                    let keys = [];
+                    try { keys = Object.keys(src); } catch (e) { keys = []; }
+                    for (const k of keys) {
+                        let v;
+                        try { v = src[k]; } catch (e) { continue; }
+                        consider(v, inst);
+                    }
+                }
+                visit(inst.subTree, 0);
+            };
+            walk(root, 0);
+            return best ? best.arr : null;
+        };
+
+        // —— 换页必须先清空快照 ——
+        // 微博是单页应用：点「主页/分组」不会刷新页面，window 上的 st.orig 还留着上一个信息流的条目；
+        // 如果直接并进新列表再重建，新页面会被整段覆盖成「旧页面的帖子 + 新页面的帖子」（用户报的 bug）。
+        const href = location.href;
+        const navigated = st.href !== href;
+        if (navigated) {
+            st.orig = [];
+            st.arr = null;
+            st.href = href;
+        }
+        const f = norm(arg && arg.filter);
+        const active = !!(arg && arg.enabled) && f.enabled;
+        let list = findList();
+        // 全部被筛掉时数组是空的，findList 认不出来；只要还是同一个页面，就用上次记下的那个数组
+        if (!list && Array.isArray(st.arr) && st.href === href) list = st.arr;
+        if (!list) return { ok: false, error: '没找到微博信息流数组' };
+        if (navigated && !active) {
+            // 换页后的第一次调用恰好是「关掉筛选」：新页面本来就没被筛过，
+            // 绝不能拿刚清空的快照去 splice 它（那样会把新页面清空），直接以它为新基线
+            st.arr = list;
+            st.orig = list.slice();
+            return { ok: true, total: st.orig.length, live: list.length, hidden: 0 };
+        }
+        // 同一地址下信息流被重建（换了数组）：新列表的第一条如果不在旧快照里，说明是另一个信息流，也要清空。
+        // 用「第一条是否属于旧快照」而不是「有没有任意一条重合」：分页追加时第一条不变；
+        // 我们筛掉条目后新列表的第一条仍然属于旧快照；而换到别的信息流时第一条是全新的。
+        const firstLive = list.length ? keyOf(list[0]) : '';
+        const sameFeed = !!firstLive && st.orig.some((it) => keyOf(it) === firstLive);
+        if (st.arr && st.arr !== list && !sameFeed) st.orig = [];
+        const known = new Set(st.orig.map(keyOf));
+        for (const it of list) {
+            const k = keyOf(it);
+            if (k && !known.has(k)) { st.orig.push(it); known.add(k); }
+        }
+        const desired = active
+            ? st.orig.filter((it) => { try { return match(it, f); } catch (e) { return true; } })
+            : st.orig.slice();
+        const cur = list.map(keyOf).join('|');
+        const want = desired.map(keyOf).join('|');
+        if (cur !== want) list.splice(0, list.length, ...desired);
+        st.arr = list;
+        st.href = href;
+        return { ok: true, total: st.orig.length, live: list.length, hidden: st.orig.length - desired.length };
+    } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) };
+    }
+}
+
 const HANDLERS = {
     getState: async () => {
         const data = await chrome.storage.local.get(['mtbSettings', 'comfyConfig']);
@@ -274,6 +463,22 @@ const HANDLERS = {
         if (!req.keys.length) { gallerySel.delete(id); return { ok: true, n: 0 }; }
         gallerySel.set(id, { at: Date.now(), pageUrl: String(req.pageUrl || ''), keys: req.keys.slice(0, GALLERY_SEL_MAX_KEYS) });
         return { ok: true, n: Math.min(req.keys.length, GALLERY_SEL_MAX_KEYS) };
+    },
+
+    applyWeiboFilterPage: async (req, sender) => {
+        const tabId = Number((req && req.tabId) || (sender && sender.tab && sender.tab.id));
+        if (!tabId) return { ok: false, error: '缺少 tabId' };
+        try {
+            const r = await chrome.scripting.executeScript({
+                target: { tabId, allFrames: false },
+                world: 'MAIN',
+                func: weiboFilterPage,
+                args: [{ filter: (req && req.filter) || null, enabled: !!(req && req.enabled) }],
+            });
+            return (r && r[0] && r[0].result) || { ok: false, error: '页面没有返回结果' };
+        } catch (e) {
+            return { ok: false, error: String((e && e.message) || e) };
+        }
     },
 
     closeHost: async () => {

@@ -7,6 +7,7 @@ import { buildToolbar, migrateSettings, DEFAULT_SETTINGS } from '../common/regis
 import { ensureBuiltins } from '../common/builtin-scripts.js';
 import { captureVideoFrame } from './frame.js';
 import { extAlive, friendlyError, DEAD_TEXT } from '../common/ext-state.js';
+import { mountWeiboFilter } from './weibo-filter.mjs';
 
 const STATE = {
     settings: null,
@@ -28,6 +29,7 @@ let runner = null;
 let boxLayer = null;
 let maskLayer = null;
 let shadow = null;
+let weiboFilter = null;
 
 // 扩展在 edge://extensions 里重载（或更新）之后，页面里这份内容脚本就成了僵尸：它的 runtime 端口
 // 随旧扩展一起销毁，之后任何 sendMessage 都会同步抛 "Extension context invalidated"。
@@ -70,6 +72,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     STATE.settings = s;
     if (toolbar) toolbar.applySettings(s);
     if (runner) runner.ctx.settings = s;
+    if (weiboFilter) weiboFilter.apply(s);
     if (prober) {
         prober.opts.minImgSize = s.toolbar.minImgSize;
         prober.opts.skipThumbnails = s.toolbar.skipThumbnails !== false;
@@ -149,6 +152,7 @@ async function boot(s) {
     toolbar.onMoved = () => positionLayers();
 
     prober = makeProber({ minImgSize: s.toolbar.minImgSize, skipThumbnails: s.toolbar.skipThumbnails !== false });
+    weiboFilter = mountWeiboFilter(s);
 
     document.addEventListener('mouseover', onOver, true);
     document.addEventListener('mousemove', onMove, { passive: true });
