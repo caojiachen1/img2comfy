@@ -107,7 +107,7 @@ function fingerprint(f) {
     return [f.enabled ? 1 : 0, f.site, f.allSites ? 1 : 0, ['original', 'repost', 'text', 'image', 'video', 'music'].map((k) => (t[k] === false ? 0 : 1)).join(''), f.keywordMode, f.keywords.join('|'), f.dateFrom, f.dateTo].join('~');
 }
 
-// 非实验模式：被隐藏的帖子就在 DOM 里，直接按页面上的信息整理成列表
+// 非实验模式：被隐藏的帖子就在 DOM 里，照着原帖把头像/正文/图片/转发尽量带出来
 function domHiddenItems() {
     const out = [];
     for (const el of postsOf(document)) {
@@ -115,11 +115,23 @@ function domHiddenItems() {
         const links = [...el.querySelectorAll('header a')];
         const name = links.find((a) => /_name_|_bolder_|_link_/.test(String(a.className)) && (a.textContent || '').trim());
         const time = el.querySelector('[class*="_time_"]');
-        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        const avatar = el.querySelector('header img');
+        const pics = [...el.querySelectorAll('img')]
+            .map((img) => img.currentSrc || img.src || '')
+            .filter((src) => src && /sinaimg/i.test(src) && !/tva\d*\.|\/crop\.|avatar|emoji/i.test(src))
+            .slice(0, 4);
+        const coverImg = el.querySelector('[class*="videoBox"] img, [class*="video"] img');
+        const rtEl = el.querySelector('[class*="reText"], [class*="retweet"]');
+        const body = el.querySelector('[class*="ogText"], p') || el;
         out.push({
             name: name ? name.textContent.trim() : '',
-            date: '',
-            text,
+            avatar: avatar ? (avatar.currentSrc || avatar.src || '') : '',
+            date: time ? (time.getAttribute('title') || '') : '',
+            text: (body.innerText || body.textContent || '').replace(/\n{3,}/g, '\n\n').trim().slice(0, 600),
+            pics,
+            cover: coverImg ? (coverImg.currentSrc || coverImg.src || '') : '',
+            rtName: '',
+            rtText: rtEl ? (rtEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240) : '',
             url: time && time.href ? time.href : '',
         });
         if (out.length >= 200) break;
@@ -158,11 +170,21 @@ function ensureChipHost() {
         .lh { position: sticky; top: 0; padding: 8px 12px; color: #9fb0c7; background: rgba(18, 21, 28, .98);
           border-bottom: 1px solid rgba(255, 255, 255, .08); }
         .lh b { color: #e8eef8; font-weight: 600; }
-        a.row { display: block; padding: 8px 12px; color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, .05); }
-        div.row { display: block; padding: 8px 12px; border-bottom: 1px solid rgba(255, 255, 255, .05); }
-        a.row:hover { background: rgba(255, 255, 255, .06); }
-        .meta { display: flex; gap: 8px; color: #8b97a8; font-size: 11px; margin-bottom: 3px; }
-        .txt { color: #dbe6f6; word-break: break-word; }
+        a.card { display: block; padding: 10px 12px; color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, .06); }
+        div.card { display: block; padding: 10px 12px; border-bottom: 1px solid rgba(255, 255, 255, .06); }
+        a.card:hover { background: rgba(255, 255, 255, .055); }
+        .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+        .av { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: none; background: #222; }
+        .who { min-width: 0; }
+        .name { color: #cfe0f5; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .meta { color: #8b97a8; font-size: 11px; }
+        .txt { color: #dbe6f6; word-break: break-word; white-space: pre-wrap;
+          display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden; }
+        .rt { margin-top: 6px; padding: 6px 8px; border-radius: 8px; background: rgba(255, 255, 255, .05);
+          color: #b9c6d8; font-size: 11.5px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+        .pics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 7px; }
+        .pics img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 6px; background: #000; display: block; }
+        .pics.video img { grid-column: span 2; aspect-ratio: 16 / 9; }
         .empty { padding: 14px 12px; color: #8b97a8; }
       </style>
       <div class="box">
@@ -196,21 +218,63 @@ export function mountWeiboFilter(settings) {
             return;
         }
         for (const it of items) {
-            const row = document.createElement(it.url ? 'a' : 'div');
-            row.className = 'row';
-            if (it.url) {
-                row.href = it.url;
+            const safeUrl = /^https?:/i.test(String(it.url || '')) ? it.url : '';
+            const row = document.createElement(safeUrl ? 'a' : 'div');
+            row.className = 'card';
+            if (safeUrl) {
+                row.href = safeUrl;
                 row.target = '_blank';
                 row.rel = 'noopener';
-                row.title = it.url;
+                row.title = safeUrl;
             }
-            const meta = document.createElement('div');
-            meta.className = 'meta';
-            meta.textContent = [it.name || '未识别账号', it.date || ''].filter(Boolean).join(' · ');
+            const head = document.createElement('div');
+            head.className = 'head';
+            if (it.avatar && /^https?:/i.test(it.avatar)) {
+                const av = document.createElement('img');
+                av.className = 'av';
+                av.src = it.avatar;
+                av.alt = '';
+                av.loading = 'lazy';
+                head.appendChild(av);
+            }
+            const who = document.createElement('div');
+            who.className = 'who';
+            const nm = document.createElement('div');
+            nm.className = 'name';
+            nm.textContent = it.name || '未识别账号';
+            const mt = document.createElement('div');
+            mt.className = 'meta';
+            mt.textContent = it.date || it.timeText || '';
+            who.append(nm, mt);
+            head.appendChild(who);
+            row.appendChild(head);
+
             const txt = document.createElement('div');
             txt.className = 'txt';
             txt.textContent = it.text || '（没有正文摘要）';
-            row.append(meta, txt);
+            row.appendChild(txt);
+
+            if (it.rtText) {
+                const rt = document.createElement('div');
+                rt.className = 'rt';
+                rt.textContent = (it.rtName ? '转发 @' + it.rtName + '：' : '转发：') + it.rtText;
+                row.appendChild(rt);
+            }
+
+            const shot = (it.pics && it.pics.length) ? it.pics : (it.cover ? [it.cover] : []);
+            if (shot.length) {
+                const box = document.createElement('div');
+                box.className = 'pics' + (it.cover && !(it.pics && it.pics.length) ? ' video' : '');
+                for (const src of shot.slice(0, 4)) {
+                    if (!/^https?:/i.test(src)) continue;
+                    const im = document.createElement('img');
+                    im.src = src;
+                    im.alt = '';
+                    im.loading = 'lazy';
+                    box.appendChild(im);
+                }
+                if (box.childElementCount) row.appendChild(box);
+            }
             rowsEl.appendChild(row);
         }
     };

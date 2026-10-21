@@ -221,10 +221,10 @@ function filterHtml() {
         { uid: '6000009006', name: '有音乐账号', body: `<p>一首歌</p><div class="_musicBox_abc_1" style="height:80px;background:#222">音乐</div>`, cls: '' },
     ];
     const items = [
-        { mid: '9001', mblogid: 'P9001', user: { id: '6000009001', screen_name: '纯文字账号' }, created_at: 'Tue Oct 20 10:00:00 +0800 2026', text: '今天就随便聊聊，什么图都没有。' },
+        { mid: '9001', mblogid: 'P9001', user: { id: '6000009001', screen_name: '纯文字账号', profile_image_url: 'http://tvax1.sinaimg.cn:' + SITE + '/crop.0.0.1080.1080.180/6000009001a.png' }, created_at: 'Tue Oct 20 10:00:00 +0800 2026', text: '今天就随便聊聊，什么图都没有。' },
         { mid: '9002', mblogid: 'P9002', user: { id: '6000009002', screen_name: '有图账号' }, created_at: 'Tue Oct 20 10:01:00 +0800 2026', text: '两张图的日常', pic_ids: ['a', 'b'] },
         { mid: '9003', mblogid: 'P9003', user: { id: '6000009003', screen_name: '有视频账号' }, created_at: 'Tue Oct 20 10:02:00 +0800 2026', text: '一段视频', page_info: { object_type: 'video' } },
-        { mid: '9004', mblogid: 'P9004', user: { id: '6000009004', screen_name: '抽奖账号' }, created_at: 'Wed Oct 21 10:03:00 +0800 2026', text: '转发抽奖送周边', pic_ids: ['c'] },
+        { mid: '9004', mblogid: 'P9004', user: { id: '6000009004', screen_name: '抽奖账号', profile_image_url: 'http://tvax1.sinaimg.cn:' + SITE + '/crop.0.0.1080.1080.180/6000009004a.png' }, created_at: 'Wed Oct 21 10:03:00 +0800 2026', text: '转发抽奖送周边', pic_ids: ['c'], pic_infos: { c: { thumbnail: { url: 'http://wx1.sinaimg.cn:' + SITE + '/orj360/904.png' } } } },
         { mid: '9005', mblogid: 'P9005', user: { id: '6000009005', screen_name: '转发账号' }, created_at: 'Wed Oct 21 10:04:00 +0800 2026', text: '//@原作者 这条是转发的', retweeted_status: { mid: 'origin' }, pic_ids: ['d'] },
         { mid: '9006', mblogid: 'P9006', user: { id: '6000009006', screen_name: '有音乐账号' }, created_at: 'Wed Oct 21 10:05:00 +0800 2026', text: '一首歌', page_info: { object_type: 'music' } },
     ];
@@ -1038,9 +1038,11 @@ async function runWeiboFilterChecks() {
       const s=host&&host.shadowRoot;
       const chip=s&&s.querySelector('.chip');
       const list=s&&s.querySelector('.list');
-      const rows=s?[...s.querySelectorAll('.rows .row')]:[];
+      const rows=s?[...s.querySelectorAll('.rows .card')]:[];
       return {chipHidden:chip?chip.hidden:null, listHidden:list?list.hidden:null,
-        rows:rows.map((r)=>({text:(r.querySelector('.txt')||{}).textContent||'',meta:(r.querySelector('.meta')||{}).textContent||'',href:r.getAttribute('href')||''}))};
+        rows:rows.map((r)=>({text:(r.querySelector('.txt')||{}).textContent||'',meta:(r.querySelector('.meta')||{}).textContent||'',
+          name:(r.querySelector('.name')||{}).textContent||'',href:r.getAttribute('href')||'',
+          avatar:!!r.querySelector('.av'),pics:r.querySelectorAll('.pics img').length}))};
     })()`);
     const clickChip = () => cdp.ev(filterPage, `(()=>{const h=document.getElementById('mtb-filter-chip');const s=h&&h.shadowRoot;const c=s&&s.querySelector('.chip');if(!c)return false;c.click();return true})()`);
     const readFeed = () => cdp.ev(filterPage, `(()=>{
@@ -1072,9 +1074,10 @@ async function runWeiboFilterChecks() {
     await clickChip();
     await wait(300);
     const d1 = await readDropdown();
-    step('点右下角提示条能展开被隐藏的微博列表（页面隐藏模式，带原文链接）',
+    step('点右下角提示条能展开被隐藏的微博（页面隐藏模式：原帖卡片带头像和原文链接）',
         !!(d1 && d1.chipHidden === false && d1.listHidden === false && d1.rows.length === 1
-            && /随便聊聊/.test(d1.rows[0].text) && /weibo\.com/.test(d1.rows[0].href)), d1);
+            && /随便聊聊/.test(d1.rows[0].text) && /weibo\.com/.test(d1.rows[0].href)
+            && d1.rows[0].avatar === true), d1);
 
     const second = await setForm(`(()=>{const d=document.querySelector('#wfFrom');d.value='2026-10-21';d.dispatchEvent(new Event('change',{bubbles:true}));})()`);
     const f2 = await readFeed();
@@ -1130,10 +1133,13 @@ async function runWeiboFilterChecks() {
     const d2a = await readDropdown();
     if (d2a && d2a.listHidden !== false) { await clickChip(); await wait(300); }
     const d2 = await readDropdown();
-    step('实验模式下提示条列表列出被隐藏的两条（带作者/链接），可以点开看',
+    step('实验模式下提示条列表是原帖卡片：头像、作者、正文、抽奖那条连缩略图都在',
         !!(d2 && d2.chipHidden === false && d2.listHidden === false && d2.rows.length === 2
             && d2.rows.some((r) => /随便聊聊/.test(r.text)) && d2.rows.some((r) => /抽奖送周边/.test(r.text))
-            && d2.rows.every((r) => /weibo\.com/.test(r.href)) && d2.rows.every((r) => /账号/.test(r.meta))), d2);
+            && d2.rows.every((r) => /weibo\.com/.test(r.href)) && d2.rows.every((r) => /账号/.test(r.name))
+            && d2.rows.every((r) => r.avatar === true)
+            && d2.rows.some((r) => /抽奖送周边/.test(r.text) && r.pics >= 1)),
+        d2 ? d2.rows.map((r) => ({ t: r.text.slice(0, 10), a: r.avatar, p: r.pics, h: /weibo\.com/.test(r.href) })) : d2);
 
     const expBack = await setForm(`(()=>{const c=document.querySelector('#wfExperimental');c.click();})()`);
     const backList = await readList();

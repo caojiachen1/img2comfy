@@ -220,16 +220,49 @@ function weiboFilterPage(arg) {
         // 给右下角的下拉列表用：被挡住的帖子摘要（最多 200 条，避免一次塞太多）
         let items = [];
         if (active) {
+            // 把「原帖长什么样」尽量带出来：头像、正文（保留换行）、最多 4 张图、视频封面、转发内容
+            const clean = (h) => String(h || '')
+                .replace(/<br\s*\/?>/gi, '\n')
+                .replace(/<\/p>/gi, '\n')
+                .replace(/<[^>]+>/g, '')
+                .replace(/&nbsp;/g, ' ')
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
             try {
                 items = st.orig.filter((it) => !keep(it)).slice(0, 200).map((it) => {
                     const u = it.user || {};
                     const uid = String(u.id || u.idstr || '');
+                    const pics = [];
+                    try {
+                        const infos = it.pic_infos || {};
+                        for (const pid of (it.pic_ids || []).slice(0, 4)) {
+                            const info = infos[pid] || {};
+                            const pic = (info.thumbnail && info.thumbnail.url) || (info.bmiddle && info.bmiddle.url) || (info.large && info.large.url) || '';
+                            if (pic) pics.push(pic);
+                        }
+                    } catch (e) { /* 图片字段缺了就只显示文字 */ }
+                    const page = it.page_info || {};
+                    const cover = (page.page_pic && page.page_pic.url)
+                        || (page.media_info && page.media_info.big_pic_info && page.media_info.big_pic_info.pic_big && page.media_info.big_pic_info.pic_big.url)
+                        || '';
+                    const rt = it.retweeted_status || null;
                     return {
                         mid: keyOf(it),
                         uid,
                         name: String(u.screen_name || u.name || ''),
+                        avatar: String(u.profile_image_url || u.avatar_large || ''),
                         date: day(it.created_at),
-                        text: strip(it.text || it.longText || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                        timeText: String(it.created_at || ''),
+                        text: clean(it.text || it.longText || '').slice(0, 600),
+                        pics,
+                        cover: String(cover || ''),
+                        rtName: rt ? String((rt.user && (rt.user.screen_name || rt.user.name)) || '') : '',
+                        rtText: rt ? clean(rt.text || '').slice(0, 240) : '',
                         url: (uid && it.mblogid) ? `https://weibo.com/${uid}/${it.mblogid}` : (uid && it.mid ? `https://weibo.com/${uid}/${it.mid}` : ''),
                     };
                 });
