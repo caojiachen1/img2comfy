@@ -207,6 +207,7 @@ body.tab-filter .g-foot { display: none; }
 /* ---------------- 微博筛选表单（照微博原生的样子：类型 / 关键字 / 时间） ---------------- */
 .g-filter { display: flex; flex-direction: column; gap: 13px; padding: 14px 14px 20px; }
 .g-filter[hidden] { display: none !important; }
+.g-filter.loading { pointer-events: none; opacity: .6; }
 .wf-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .wf-label { flex: none; width: 42px; color: var(--muted); font-size: 12px; letter-spacing: .5px; }
 .wf-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 7px 13px; }
@@ -243,3 +244,9 @@ body.tab-filter .g-foot { display: none; }
 .wf-exp { align-items: center; }
 .wf-warn { margin: -4px 0 0 52px; padding: 7px 10px; border-radius: 8px; font-size: 11.5px; line-height: 1.6;
     color: #e8c58b; background: rgba(232, 169, 74, .08); border: 1px solid rgba(232, 169, 74, .28); }
+
+.g-tier { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.g-tier select {
+    padding: 4px 6px; border-radius: 7px; border: 1px solid var(--line); background: rgba(9, 11, 16, .78);
+    color: var(--text); font-size: 11.5px; outline: none;
+}

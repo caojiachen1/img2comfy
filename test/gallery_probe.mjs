@@ -737,6 +737,8 @@ await wait(250);
 const sel = await cdp.ev(gallery, `({text:document.querySelector('#selCount').textContent, cards:document.querySelectorAll('.g-card.sel').length})`);
 step('全选 36 张', sel && sel.cards === 36 && /36/.test(sel.text), sel);
 
+// 记录发送前的档位请求数：默认应该只按卡片档 mw690 拉，不再无脑拉 large
+const tiersBeforeSend = JSON.parse(JSON.stringify(counters.tiers));
 await cdp.ev(gallery, `document.querySelector('#btnSendRun').click()`);
 let sent = null;
 for (let i = 0; i < 160; i++) {
@@ -749,8 +751,37 @@ const bstate = await cdp.ev(gallery, `(async()=>{const r=await chrome.runtime.se
 step('批次实际跑在后台（状态已完成 36/0）', !!(bstate && bstate.running === false && bstate.ok === 36 && bstate.fail === 0 && bstate.finishedAt > 0), { running: bstate && bstate.running, ok: bstate && bstate.ok, fail: bstate && bstate.fail });
 step('假 ComfyUI 收到 36 次上传 / 36 次排队', counters.uploads === 36 && counters.prompts === 36, { uploads: counters.uploads, prompts: counters.prompts });
 step('上传文件名带上序号且互不重复', counters.filenames.length === 36 && new Set(counters.filenames).size === 36 && counters.filenames.every((n) => /^mtb_/.test(n)), { names: counters.filenames.slice(0, 3) });
-// 只有真正发给 ComfyUI 才拉 large 原图（浏览阶段一张都不该拉，见前面那条档位断言）
-step('发送时才取 large 原图（36 张）', (counters.tiers.large || 0) >= 36, counters.tiers);
+// 发送档可配：默认卡片档 mw690（用户报过「发过去接近 2000×2000、一张几 MB」）
+step('默认按卡片档 mw690 发送（36 张，一张都不拉 large）',
+    !!((counters.tiers.mw690 - (tiersBeforeSend.mw690 || 0)) >= 36
+        && (counters.tiers.large - (tiersBeforeSend.large || 0)) === 0),
+    { before: tiersBeforeSend, after: counters.tiers });
+
+// 档位设置：切到「原图 large」再发一张，服务端必须收到 large 请求
+const largeBefore = counters.tiers.large || 0;
+const tierPick = await cdp.ev(gallery, `(async()=>{
+  document.querySelector('#btnClear').click();
+  await new Promise(r=>setTimeout(r,150));
+  const c=[...document.querySelectorAll('.g-group:not(.g-junk) .g-card')][0];
+  c.click();
+  const s=document.querySelector('#sendTier'); s.value='orig'; s.dispatchEvent(new Event('change',{bubbles:true}));
+  await new Promise(r=>setTimeout(r,200));
+  document.querySelector('#btnSend').click();
+  return {tier:s.value, sel:document.querySelectorAll('.g-card.sel').length,
+    stored:(await chrome.storage.local.get(['mtbSettings'])).mtbSettings.gallery.sendTier};
+})()`);
+let tierSent = null;
+for (let i = 0; i < 100; i++) {
+    tierSent = await cdp.ev(gallery, `({status:document.querySelector('#status').textContent, running:!document.querySelector('#btnCancel').hidden})`);
+    if (tierSent && /完成|停止/.test(tierSent.status)) break;
+    await wait(250);
+}
+step('发送档位可配：选「原图 large」后，服务端确实收到 large（设置也存下来了）',
+    !!(tierPick && tierPick.tier === 'orig' && tierPick.stored === 'orig' && tierPick.sel === 1
+        && (counters.tiers.large || 0) >= largeBefore + 1), { tierPick, largeBefore, after: counters.tiers.large });
+await cdp.ev(gallery, `(async()=>{const s=document.querySelector('#sendTier');s.value='card';s.dispatchEvent(new Event('change',{bubbles:true}));
+  document.querySelector('#btnClear').click();return true})()`);
+await wait(250);
 
 // 用户的真实场景：一条九宫格先发了 3 张，点一下组里的「反选」就要把这条里剩下没发的 6 张选中。
 // 发送成功的卡片勾不会掉，所以「组内翻转」正好等于「取消已发送、选中未发送」
@@ -1057,7 +1088,10 @@ async function runWeiboFilterChecks() {
       return {total:rows.length, hidden:rows.filter(r=>r.hidden).map(r=>r.name), shown:rows.filter(r=>!r.hidden).map(r=>r.name),
         zeroed:rows.filter(r=>r.hidden).every(r=>r.articleZero), gap, chip:chip?{hidden:chip.hidden,text:chip.textContent}:null};
     })()`);
-    const setForm = (js) => cdp.ev(fp, `(async()=>{${js};await new Promise(r=>setTimeout(r,650));
+    const setForm = (js) => cdp.ev(fp, `(async()=>{
+      // 等面板把当前设置填进表单（initFilterTab）之后再点，否则点的是还没绑事件的控件
+      for(let i=0;i<60;i++){const f=document.querySelector('#panelFilter');if(f&&!f.classList.contains('loading'))break;await new Promise(r=>setTimeout(r,150));}
+      ${js};await new Promise(r=>setTimeout(r,650));
       return {status:document.querySelector('#wfStatus').textContent,
         stored:(await chrome.storage.local.get(['mtbSettings'])).mtbSettings.weiboFilter};})()`);
 

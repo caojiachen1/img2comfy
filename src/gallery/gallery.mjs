@@ -69,6 +69,9 @@ function bindEvents() {
     $('#btnRefresh').onclick = async () => { await collect(true); await syncBatchState(); };
     // tab 必须一开始就能点：面板刚打开、采集还没回来时点「筛选微博」不能白点
     for (const b of document.querySelectorAll('#gTabs button')) b.onclick = () => { if (!b.disabled) switchTab(b.dataset.panel); };
+    // 表单要等 initFilterTab 把当前设置填进去再解锁，否则「全没勾」会被当成条件立刻把页面筛空
+    const pf = $('#panelFilter');
+    if (pf) pf.classList.add('loading');
     $('#onlyView').onchange = () => {
         S.onlyView = $('#onlyView').checked;
         if (S.full) applyData(S.full, true);
@@ -92,6 +95,12 @@ function bindEvents() {
         if (S.running) return;
         S.selected.clear();
         refreshSelectionUI();
+    };
+    $('#sendTier').onchange = () => {
+        const v = $('#sendTier').value;
+        S.settings.gallery = { ...(S.settings.gallery || {}), sendTier: v };
+        chrome.runtime.sendMessage({ action: 'patchSettings', patch: { gallery: { sendTier: v } } }).catch(() => {});
+        toast(`发送档位：${TierLabel(v)}`);
     };
     $('#btnSend').onclick = () => runBatch(false);
     $('#btnSendRun').onclick = () => runBatch(true);
@@ -134,6 +143,11 @@ async function loadSettings() {
         S.settings = d.mtbSettings || {};
     } catch (e) { S.settings = {}; }
     renderComfyInfo();
+    $('#sendTier').value = ((S.settings.gallery || {}).sendTier) || 'card';
+}
+
+function TierLabel(v) {
+    return v === 'orig' ? '原图 large（很大）' : v === 'full' ? '高清 mw2000' : '卡片 mw690';
 }
 
 function renderComfyInfo() {
@@ -331,8 +345,9 @@ function applyData(data, keepSelection) {
     // 同一个 url 可能同时属于两条微博（转发），所以一个 url 对应多个条目 id
     S.byUrl = new Map();
     for (const it of S.flat) {
-        if (!S.byUrl.has(it.url)) S.byUrl.set(it.url, []);
-        S.byUrl.get(it.url).push(it.key);
+        const k = batchUrlKey(it.url);
+        if (!S.byUrl.has(k)) S.byUrl.set(k, []);
+        S.byUrl.get(k).push(it.key);
     }
     S.selected = keepSelection ? prevSelected : new Set();
     S.batchState = keepSelection ? prevStates : new Map();
@@ -740,6 +755,9 @@ function makeCard(it) {
     return card;
 }
 
+// 批量结果只回传 url，而发送档位可以选（mw690/mw2000/large）——查卡片状态前统一归一到 large 地址
+function batchUrlKey(url) { return weiboImageTierUrl(url, 'orig'); }
+
 function thumbKey(url, pageUrl) {
     // 必须按「完整地址」缓存：imageDedupeKey 会去掉 sinaimg 的尺寸段，
     // orj360 和 mw690/mw2000 会撞成同一个 key —— 升档就被缓存悄悄吃掉，面板永远停在糊缩略图上
@@ -978,8 +996,10 @@ async function runBatch(autoQueue) {
     const list = S.flat.filter((it) => S.selected.has(it.key));
     if (!list.length) { toast('先勾选要发送的图片', true); return; }
     const stamp = Date.now().toString(36).slice(-6);
+    // 用户选的发送档位：默认卡片档（mw690），不再无脑拉 4MB 的 large
+    const tier = ((S.settings.gallery || {}).sendTier) || 'card';
     const items = list.map((it, i) => ({
-        url: it.url,
+        url: weiboImageTierUrl(it.url, tier),
         pageUrl: it.pageUrl || S.data?.pageUrl || '',
         filename: sendFilename(it, i + 1, stamp),
         label: groupDisplay({ label: it.groupLabel, key: it.groupKey }),
@@ -1012,12 +1032,12 @@ function applyBatchState(st, { announce = false } = {}) {
         $('#progress').hidden = false;
         if (!mismatch) {
             for (const r of st.results || []) {
-                for (const key of S.byUrl.get(r.url) || []) {
+                for (const key of S.byUrl.get(batchUrlKey(r.url)) || []) {
                     if (S.cardEls.has(key)) setCardState(key, r.ok ? 'sent' : 'failed', r.ok ? (st.autoQueue ? '已排队' : '已发送') : (r.error || '失败'));
                 }
             }
             if (st.currentUrl) {
-                for (const cur of S.byUrl.get(st.currentUrl) || []) setCardState(cur, 'sending');
+                for (const cur of S.byUrl.get(batchUrlKey(st.currentUrl)) || []) setCardState(cur, 'sending');
             }
         }
         const done = (st.ok || 0) + (st.fail || 0);
@@ -1033,7 +1053,7 @@ function applyBatchState(st, { announce = false } = {}) {
     if (!st.finishedAt) { refreshSelectionUI(); return; }
     if (!mismatch) {
         for (const r of st.results || []) {
-            for (const key of S.byUrl.get(r.url) || []) {
+            for (const key of S.byUrl.get(batchUrlKey(r.url)) || []) {
                 if (S.cardEls.has(key)) setCardState(key, r.ok ? 'sent' : 'failed', r.ok ? (st.autoQueue ? '已排队' : '已发送') : (r.error || '失败'));
             }
         }
@@ -1247,6 +1267,7 @@ function initFilterTab() {
         $('#wfStatus').textContent = '当前页面不是微博，筛选不可用';
     }
     syncFilterForm();
+    $('#panelFilter').classList.remove('loading');
     for (const el of document.querySelectorAll('#panelFilter input, #panelFilter select')) {
         el.addEventListener('input', onFilterFormChanged);
         el.addEventListener('change', onFilterFormChanged);
@@ -1283,7 +1304,10 @@ function initFilterTab() {
         showEmpty('没有找到可读取的网页', '请先切换到有图片的普通网页，再点扩展图标。');
         return;
     }
-    await collect(false);
+    // 先把筛选表单初始化好（需要 S.tab 的 host）：采集可能要好几百毫秒，
+    // 期间用户点到还没绑事件的勾选框会白点，甚至拿「全没勾」把页面筛空
+    try { S.tab = await chrome.tabs.get(S.tabId); } catch (e) { /* 取不到就按空 host 处理 */ }
     initFilterTab();
+    await collect(false);
     await syncBatchState();
 })();

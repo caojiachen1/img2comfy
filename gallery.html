@@ -91,6 +91,13 @@
     <button id="btnClear">清空</button>
     <span class="g-sel" id="selCount">已选 0 张</span>
     <span class="sp"></span>
+    <label class="g-tier" title="发给 ComfyUI 的清晰度档位：卡片 mw690 约 41KB、高清 mw2000 约 283KB、原图 large 可能 4MB 以上">发送档位
+      <select id="sendTier">
+        <option value="card">卡片 mw690</option>
+        <option value="full">高清 mw2000</option>
+        <option value="orig">原图 large</option>
+      </select>
+    </label>
     <span class="g-hint g-comfy" id="comfyInfo"></span>
     <span class="g-hint" id="status"></span>
     <button id="btnCancel" class="danger" hidden>停止</button>

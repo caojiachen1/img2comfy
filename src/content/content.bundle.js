@@ -5540,6 +5540,9 @@ const DEFAULT_SETTINGS = {
     },
     // 只作用于微博信息流：不满足条件的整条 display:none（跟没发过一样）
     weiboFilter: { ...DEFAULT_WEIBO_FILTER, keywords: [] },
+    gallery: {
+        sendTier: 'card',   // 发给 ComfyUI 用哪个档：card=mw690（默认，~41KB）· full=mw2000 · orig=large（4MB+）
+    },
     ai: {
         enabled: true,
         device: 'auto',              // auto | webgpu | wasm
