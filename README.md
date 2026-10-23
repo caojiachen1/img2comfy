@@ -64,6 +64,38 @@ uid + 永久链接当分组键，不能整条并回「页面组」）；支持�
 恢复时按 `pageUrl` 再校验一道，换过页面不许把上一页的勾选搬过来。
 顶部还有个「只看屏幕附近」开关：只保留扫描那一刻视口上下各一屏内的图（文档坐标判），关掉则列出
 这个页面已加载的全部图。
+**微博上还有「全部微博」**（默认开，只有微博域名才露出来，状态记在 `settings.gallery.feedAll`）：虚拟列表只把屏幕上
+那几条挂进 DOM，**滚过去的帖子整条被摘掉**，光扫 DOM 永远拿不到它们的图 —— 而微博页面自己那份信息流数据
+（`#app._vnode.component.data.list`）里每条都带着 `pic_ids`/`pic_infos`（含各档地址和真实宽高）。
+所以扫描前先在**主世界**读一次这份数据（`weiboFeedPage`，纯只读，绝不改页面数据），再由
+`mergeFeedPosts`（`src/common/gallery.js`，纯函数，单测钉住）并进采集结果：
+归组按「帖子 id 对上采集器的键 `acct:<uid>#ps<mid|bid>`」→ 其次「这些图已经登记在某个 DOM 组里」→ 都不对才新建 `feed:<mid>` 组，
+所以同一条微博不会因为这轮没渲染就变成两组重复图；**转发的图挂在 `retweeted_status` 上，并成一条微博的一组**；
+纯文字帖子不建组；**被信息流筛选挡掉的帖子连数据都不捞**（按页面上 `data-mtb-filtered` 的正文前缀认出）。
+新组没有真实文档位置，按列表下标在两个量到位置的组之间**插值**，面板"顺序=信息流顺序"仍然成立。
+补来的卡片照样只拉 `mw690`（数据里给的是原图地址，档位由 `weiboImageTierUrl` 现算），一张都不碰 4MB 的 `large`；
+这些条目**不进后台缓存**（下一次扫描还能从页面数据重新拿到，留在缓存里会变成"关掉开关还是看得到"）；
+只有下面「帮我翻页」**直接问后端**要来的那些必须另存 —— 它们压根不在页面列表里，重扫扫不出来。
+摘要会写「按微博数据补出 N 条 / M 张」，读不到那份数据时写「信息流数据没读到」并在悬停里给原因
+（移动版/改版后的页面就是读不到，不影响正常扫描）。
+**「帮我翻页」按钮**（微博域名才露出，页数在底部「翻页页数」选 1/3/5/10，记在 `settings.gallery.loadPages`）：
+它替你把信息流往后翻，**全程不滚动你的页面**。先走温和的一条 —— 叫组件自己的 `loadMoreData()`
+（真页面实测：分组页调一次列表 13→40 条、个人主页连翻两页 35→77 条，`scrollY` 一点没动、页面 DOM 也没被改），
+微博正常滚页面走的就是这个函数，所以不会出现「我们和它的分页状态各说各话」。
+**认「哪个组件手里有信息流」不能只按一种形状写死**（用户一点到个人主页就翻不动，就是这个原因）：
+分组页是 `Home` 的 `data.list` + `max_id_str`，个人主页是 `ProfileFeed` 的 **`data.data` + `page`**，
+而且有的组件是原地 `push`、**有的是整个换掉数组引用**（`data.data = [...旧, ...新]`）—— 攥着旧引用永远看不到变长，
+所以长度每次从 `data[key]` 重新读。分组页还会**给每个标签页各留一份 `Home`**，先遍历到的那份可能内部状态是空的、
+一调就抛（真页面报过 `Cannot read properties of undefined (reading 'id')`），所以候选按「可见 → 更长」排序后
+**一份一份试，谁真的把列表变长了就用谁继续翻**。
+全都抛或根本没有那个方法时才退回第二条 —— 从 `performance` 里挑**页面自己已经发过的那条读流请求**照抄
+（不猜接口名；先按形状筛掉 `config`/`log`/`allGroups`/`side` 这些噪声，带 `page`/`list_id`/`containerid` 的优先、其次新发的在前），
+一条拿不到东西就换下一条（最多 3 条）：URL 里有 `page` 就**从组件当前页码接着往后翻**，否则带 `Home` 的 `max_id_str` 当游标；
+返回体 `data.statuses` 和 `data.list` 都认（分组页给前者、个人主页给后者）。真页面实测
+`GET /ajax/statuses/mymblog?uid=…&page=2&feature=0` 与 `/ajax/feed/groupstimeline?list_id=…&count=25&max_id=…` 各回一页帖子。
+两条都只 GET 读流、都不碰页面，也**绝不发任何写操作**；碰到空页、游标不动或 HTTP 出错就自己收手，
+所以页数选到 10 也不会追着微博问（一次问太急容易被限流）。**直接要来的那些帖子按标签页存进后台缓存**
+（`galleryCachePut` 的 `extra`）：它们不在页面列表里、重扫扫不出来，关掉面板再打开还在，也不用重问一次。
 **三档清晰度，各用各的**（真页面实测同一 pid：`large` 7008×4672 / 4.2MB，`mw2000` 2000×1333 / 283KB，
 `mw690` 690×460 / 41KB，`orj360` 405×270 / 14KB）：sinaimg 的 URL 形状是 `/<尺寸变体>/<pid>.jpg`，
 `wap180`/`tw420`/`orj360`/`mw690`/`square`/`bmiddle`/`thumb980`/`auto-webkit` 这类变体段可以互换
@@ -228,7 +260,7 @@ MV3 扩展页的 `script-src 'self'` 挡掉了跨源脚本与 `blob:` 模块，�
 
 ```bash
 node scripts/check-imports.mjs        # 语法 + 相对路径 + 具名导入是否存在（50+ 文件）
-node test/unit_pure.mjs              # 294 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言）
+node test/unit_pure.mjs              # 312 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言）
 node test/run_browser.mjs            # 页面级：内容脚本包 + 工具栏 + 拖拽 + 算子链 + 视频取帧
 node test/run_browser.mjs --ai       # 再加：vendor + slimSAM/swin2SR/YuNet 真实推理 + 设置页
 node test/run_browser.mjs --ai --only=sr|sam|face|vlm|script|options   # 单跑某一阶段
@@ -254,6 +286,15 @@ node test/gallery_probe.mjs --headed --weibo-host   # 本页图片下拉面板 +
 1×1 的 `data:` 占位图不收；转发复用同一 pid 的两条微博各算一条、组内仍去重）与
 `?scroller=1`（内层容器自己滚：容器 `scrollTop` 要加回文档坐标，滚过顶部的帖子不算回收节点，
 同容器里 `top:-9000` 的回收节点照旧挡）；面板摘要还必须写明「无用图片 N 张」并给出原因分布；另有一份 `?fold=1` 夹具（角标 `+6`）验证经 `/ajax/statuses/show` 把 9 张补成 15 张。
+还有一份 `?feed=1` 夹具守「全部微博」：DOM 里只挂两条帖子，另外四条只存在于假 Vue 根 `#app._vnode.component.data.list` 里（真虚拟列表滚过去就这样）。
+断言数据侧捞到 5 条有图的（纯文字不建组、被筛选挡掉的那条连数据都不许捞回、转发的图挂在 `retweeted_status` 上要和转发的这条并成一组）、
+面板补成 27 张 / 5 组且**补来的三条插在两条在屏微博中间**（按列表下标插值，不是堆到尾巴）、补来的卡片只取 `mw690`（服务端 `large` 计数不许涨）、
+关掉开关就退回页面上真有的 18 张、再打开又补齐。
+「帮我翻页」另有两份夹具 `?more=1`/`?more=2`：前者给假 Home 组件挂一个真的 `ctx.loadMoreData()`（异步追加 5 条并推游标），
+点一次按钮要看到列表 12→27、面板 27 组 27 张、`loadMoreData` 恰好被调 3 次，而 **`window.scrollY` 始终是 0、`article` 数量一点没变**
+（页面故意做到 4000+ px 高，「一滚就必然挪视口」这件事本身写成前置断言）；后者把那个方法摘掉、只留一条页面发过的
+`/ajax/feed/groupstimeline`，假接口按 `max_id` 一页 5 条、第三页起回空 —— 要看到面板 12→22、页数选到 10 也只被问 3 次、
+页面一点没动，并且**关掉面板重开还是 22 张**（直接要来的帖子进了按标签页缓存）。
 还有一份 `?filter=1` 夹具守信息流筛选：照真页面的**虚拟列表**复刻（6 条帖子各自装在
 `transform: translateY(...)` 的绝对定位槽里），所以除了「该藏的藏了」，还断言隐藏后相邻可见槽间距为 0 ——
 前后帖子紧连、不留空槽；面板里从 tab 切到筛选、取消「纯文字」、设起始日期、加「不含 抽奖」、再取消「原创」，
@@ -368,7 +409,7 @@ src/gallery/*                 采集注入函数 collect.mjs + 批量窗口逻�
 src/common/gallery.js         微博图 URL 升级/去重键/域名判定等纯函数
 vendor/                       transformers.js + onnxruntime-web + QuickJS wasm（setup-vendor.mjs 生成，已 gitignore）
 scripts/                      build-content / setup-vendor / check-imports
-test/                         unit_pure（294 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
+test/                         unit_pure（312 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
                               gallery_probe（有头，本页图片/批量发送）、cdp.mjs、旧的 run_headless + harness + cors_server
 ```
 
@@ -380,7 +421,7 @@ test/                         unit_pure（294 条）、run_browser + harness_pag
 
 ## 五、已知边界（如实记录）
 
-- 端到端验证覆盖到：294 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+- 端到端验证覆盖到：312 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
   slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）、
   多模态也跑通了真推理（`qwen3vl-2b` q4f16 约 490s、`smolvlm2-256m` 约 146s 出答案）。
   GB 级权重在 CPU 模式下仍然很慢，建议 GPU + `q4`；断流写坏的半截缓存会在建会话时炸成
@@ -401,3 +442,11 @@ test/                         unit_pure（294 条）、run_browser + harness_pag
   先 `extAlive()` 探活、再兜住同步抛出的 `Extension context invalidated`，统一提示「扩展已更新…请按 F5 刷新页面后再用」，
   不让它冒成未捕获异常。
 - 用户脚本不能直接操作页面 DOM（只能经 `ctx.overlay/panel`），这是刻意的安全边界。
+- **「全部微博」补出来的只是这个页面已经加载过的帖子**：微博自己还没请求下来的那部分拿不到 ——
+  面板**绝不替用户滚动页面**（这条是产品硬约束），要更全就自己往下滚一段再点「刷新」。
+  它也依赖桌面版那份 Vue 3 数据（`#app._vnode.component.data.list`，实验性筛选同源）：改版或换成移动版就
+  读不到，这时退回「只列页面上真有的图」，摘要写「信息流数据没读到」，悬停给原因，不报错也不崩。
+- **「帮我翻页」是替你多问微博几次**：请求数由你选的页数决定（1~10，产品侧卡死），只 GET 读流、不发任何写操作；
+  但翻得太急理论上会碰它的限流/风控，所以默认 3 页、不自动翻、点一次翻一次。真页面实测过两条路都成立
+  （组件 `loadMoreData` 一次 13→40 条且视口不动；克隆读流请求一条回 25 条 / 60 张图、与页面已有零重复），
+  微博改版后两条都可能失效 —— 失效时按钮会明确说「没加载到更多：原因」，不会闷声什么都不发生。

@@ -260,6 +260,164 @@ window.__mtbRerender = function () {
 
 // 内层容器自己滚的信息流（x.com 那类）：滚过顶部的帖子 rect.top 是大负数，
 // 但它们的文档位置是正的 —— 回收节点判定必须把容器的 scrollTop 加回去，不然就把好图当回收帖误杀
+// 「全部微博」夹具：真虚拟列表只把屏幕上那几条挂进 DOM，滚过去的整条摘掉 —— 光扫 DOM 就拿不到它们的图。
+// 这里 DOM 里只挂两条（甲、乙）+ 一条被筛选挡掉的（庚），另外四条只存在于页面自己那份信息流数据里。
+// 数据里同时演：转发微博的图在原帖对象上（己）、纯文字帖子（戊，不该建组）、已经采到的帖子不许重复。
+function feedHtml() {
+    const a1 = { uid: '6000006101', name: '甲在屏上' };
+    const a2 = { uid: '6000006102', name: '乙在屏上' };
+    const infos = (...pids) => {
+        const o = {};
+        for (const p of pids) o[p] = { large: { url: `http://wx1.sinaimg.cn:${SITE}/orj360/${p}.png`, width: 900, height: 600 } };
+        return o;
+    };
+    const items = [
+        { mid: '5000006101', bid: 'Pm60000061010', user: { id: '6000006101', screen_name: '甲在屏上' }, created_at: 'Tue Oct 20 10:00:00 +0800 2026', text: '甲在屏上的第1条微博正文，九宫格九张图必须算同一条', pic_ids: ['611', '612', '631', '632'], pic_infos: infos('611', '612', '631', '632') },
+        { mid: '5000006103', bid: 'Pm6000006103', user: { id: '6000006103', screen_name: '丙已回收' }, created_at: 'Tue Oct 20 10:01:00 +0800 2026', text: '丙被虚拟列表摘掉了，页面上没有它的 DOM', pic_ids: ['641', '642'], pic_infos: infos('641', '642') },
+        { mid: '5000006102', bid: 'Pm60000061021', user: { id: '6000006102', screen_name: '乙在屏上' }, created_at: 'Tue Oct 20 10:02:00 +0800 2026', text: '乙在屏上的第2条微博正文，九宫格九张图必须算同一条', pic_ids: ['621'], pic_infos: infos('621') },
+        { mid: '5000006104', bid: 'Pm6000006104', user: { id: '6000006104', screen_name: '丁已回收' }, created_at: 'Tue Oct 20 10:03:00 +0800 2026', text: '丁也在数据里', pic_ids: ['651', '652', '653'], pic_infos: infos('651', '652', '653') },
+        { mid: '5000006105', bid: 'Pm6000006105', user: { id: '6000006105', screen_name: '戊纯文字' }, created_at: 'Tue Oct 20 10:04:00 +0800 2026', text: '戊一条图都没有，不该为它建组' },
+        { mid: '5000006106', bid: 'Pm6000006106', user: { id: '6000006106', screen_name: '庚被筛掉' }, created_at: 'Tue Oct 20 10:05:00 +0800 2026', text: '庚被筛选挡住的帖子不许出现在面板里', pic_ids: ['661', '662'], pic_infos: infos('661', '662') },
+        {
+            mid: '5000006107', bid: 'Pm6000006107', user: { id: '6000006107', screen_name: '己转发带原帖图' }, created_at: 'Tue Oct 20 10:06:00 +0800 2026',
+            text: '己转发的这条，图在原帖数据里', pic_ids: ['671'], pic_infos: infos('671'),
+            retweeted_status: { mid: '5000006108', pic_ids: ['671', '672'], pic_infos: infos('671', '672') },
+        },
+    ];
+    const hiddenPost = `<article class="post card9 weibo-main" data-mtb-filtered="1" style="display:none"><header>${authorHtml({ uid: '6000006106', name: '庚被筛掉' })}</header>`
+        + `<p>庚被筛选挡住的帖子不许出现在面板里</p>`
+        + [661, 662].map((n) => `<img src="http://wx1.sinaimg.cn:${SITE}/orj360/${n}.png" width="200" height="200" alt="图${n}" style="display:block;width:200px;height:200px;background:#222">`).join('')
+        + `</article>`;
+    return `<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>全部微博测试</title>
+<style>body{background:#0d1016;color:#ddd;font:13px system-ui;margin:20px;position:relative}
+.post{background:#171b23;border:1px solid #2a3040;border-radius:10px;padding:12px;margin:0 0 18px;width:600px}
+header a{color:#8ab4ff;text-decoration:none;margin-right:6px}
+.grid{display:grid;grid-template-columns:repeat(3,180px);gap:6px;margin-top:8px;padding:0;list-style:none}
+.cell{position:relative}
+.grid img.badge{position:absolute;top:2px;right:2px;width:20px;height:14px}
+.thumb{display:block;line-height:0}
+.grid img{width:180px;height:135px;object-fit:cover;display:block;background:#000}</style></head><body>
+${postHtml(a1, 0, 611)}
+${postHtml(a2, 1, 621)}
+${hiddenPost}
+<div id="app"></div>
+<script>
+// weiboFeedPage 在主世界里找的就是这个形状：#app._vnode.component.data.list
+window.__mtbFeed = ${JSON.stringify(items)};
+document.getElementById('app')._vnode = { component: { type: { name: 'Home' }, data: { list: window.__mtbFeed }, subTree: null } };
+</script>
+</body></html>`;
+}
+
+// 「帮我翻页」夹具。mode：
+//   1 = 单个 Home，带可用的 loadMoreData（组件路线）
+//   2 = 没有 loadMoreData，只有页面自己发过的一条读流请求（接口路线）
+//   3 = 两份 Home：先找到的那份一调就抛（真页面报错原文就是 Cannot read properties of undefined (reading 'id')），
+//       第二份才是能用的 —— 必须一份一份试，不能挑到第一份就放弃
+//   4 = 两份 Home 都抛，只剩可克隆的读流请求 —— 必须自动退回接口路线并标出 fallback
+// 页面故意做得很高，这样「用滚动来触发加载」一定会把 scrollY 顶起来 —— 断言它一直是 0 才算真没滚。
+function moreHtml(mode) {
+    const m = Number(mode) || 1;
+    const start = Array.from({ length: 12 }, (_, i) => ({
+        mid: 'M' + (1000 + i), bid: 'B' + (1000 + i), user: { id: 'U' + i, screen_name: '甲' + i },
+        text: '第' + i + '条微博的正文',
+        pic_ids: ['P' + (1000 + i)], pic_infos: { ['P' + (1000 + i)]: { large: { url: `http://wx1.sinaimg.cn:${SITE}/orj360/P${1000 + i}.png`, width: 900, height: 600 } } },
+    }));
+    const stale = Array.from({ length: 20 }, (_, i) => ({
+        mid: 'S' + i, bid: 'BS' + i, user: { id: 'WS' + i, screen_name: '旧标签页' + i }, text: '旧标签页的第' + i + '条',
+        pic_ids: ['SP' + i], pic_infos: { ['SP' + i]: { large: { url: `http://wx1.sinaimg.cn:${SITE}/orj360/SP${i}.png`, width: 900, height: 600 } } },
+    }));
+    const multi = m === 3 || m === 4;
+    return `<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>帮我翻页测试</title>
+<style>body{background:#0d1016;color:#ddd;font:13px system-ui;margin:20px}
+.post{background:#171b23;border:1px solid #2a3040;border-radius:10px;padding:12px;margin:0 0 18px;width:600px}
+header a{color:#8ab4ff;text-decoration:none;margin-right:6px}</style></head><body>
+<article class="post card9 weibo-main"><header><a class="_default_cssmod_3" href="http://weibo.com/u/U0"></a><a class="_link_cssmod_124 _bolder_cssmod_9" href="http://weibo.com/mygroups?gid=1">甲0</a> <a class="_time_cssmod_33" href="http://weibo.com/U0/Pt0">1小时前</a></header><p>第0条微博的正文</p></article>
+<article class="post card9 weibo-main"><header><a class="_default_cssmod_3" href="http://weibo.com/u/U1"></a><a class="_link_cssmod_124 _bolder_cssmod_9" href="http://weibo.com/mygroups?gid=1">甲1</a> <a class="_time_cssmod_33" href="http://weibo.com/U1/Pt1">1小时前</a></header><p>第1条微博的正文</p></article>
+<div style="height:4200px">这段空白只是为了让「靠滚动加载」一定会把 scrollY 顶起来</div>
+<div id="app"></div>
+<script>
+window.__mtbFeed = ${JSON.stringify(start)};
+window.__mtbStale = ${JSON.stringify(stale)};
+window.__mtbCalls = 0;
+window.__mtbTried = 0;
+window.__mtbLoader = ${m === 1 ? 'true' : 'false'};
+function appendTo(list, tag, data) {
+    const base = list.length;
+    for (let k = 0; k < 5; k++) {
+        const i = base + k;
+        const pid = tag + i;
+        list.push({ mid: 'N' + pid, bid: 'B' + pid, user: { id: 'V' + pid, screen_name: '翻页来的' + i },
+            text: '第' + i + '条微博的正文', pic_ids: [pid],
+            pic_infos: { [pid]: { large: { url: 'http://wx1.sinaimg.cn:${SITE}/orj360/' + pid + '.png', width: 900, height: 600 } } } });
+    }
+    data.max_id_str = String(200 + base);
+}
+const goodCtx = {
+    loadMoreData: function () {
+        window.__mtbCalls++;
+        return new Promise(function (res) { setTimeout(function () {
+            appendTo(window.__mtbFeed, 'Q', goodData); res();
+        }, 320); });
+    },
+};
+const badCtx = {
+    loadMoreData: function () {
+        window.__mtbTried++;
+        return this.curTab.id;   // 真页面里那份空状态的 Home 就是这样炸的
+    },
+};
+const goodData = { list: window.__mtbFeed, max_id_str: '100', isNoData: false };
+${m >= 5 ? `
+// 个人主页那种形状：数组挂在 data.data 上、翻页是「整个换掉引用」（不是原地 push）、游标是 page
+window.__mtbPf = { data: window.__mtbFeed, page: 2, isOver: false, isNoData: false };
+const pfCtx = {
+    loadMoreData: function () {
+        window.__mtbCalls++;
+        return new Promise(function (res) { setTimeout(function () {
+            const nx = window.__mtbPf.data.slice();
+            const base = nx.length;
+            for (let k = 0; k < 5; k++) {
+                const i = base + k; const pid = 'PF' + i;
+                nx.push({ mid: 'PFM' + i, bid: 'B' + pid, user: { id: 'PFU' + i, screen_name: '主页翻页' + i },
+                    text: '第' + i + '条微博的正文', pic_ids: [pid],
+                    pic_infos: { [pid]: { large: { url: 'http://wx1.sinaimg.cn:${SITE}/orj360/' + pid + '.png', width: 900, height: 600 } } } });
+            }
+            window.__mtbPf.data = nx;
+            window.__mtbPf.page += 1;
+            res();
+        }, 320); });
+    },
+};
+document.getElementById('app')._vnode = { component: { type: { name: 'ProfileFeed' }, data: window.__mtbPf, ctx: ${m === 5 ? 'pfCtx' : 'badCtx'}, subTree: { el: document.body } } };
+` : multi ? `
+// 那份坏掉的 Home 故意给更长的列表：候选是按「可见 → 更长」排的，它排第一个，
+// 正好演「先找到的那份是坏的」，产品侧必须换下一份而不是直接放弃
+const staleHome = { type: { name: 'Home' }, data: { list: window.__mtbStale, max_id_str: '100', isNoData: false }, ctx: badCtx, subTree: { el: document.body } };
+const goodHome = { type: { name: 'Home' }, data: goodData, ctx: ${m === 3 ? 'goodCtx' : 'badCtx'}, subTree: { el: document.body } };
+document.getElementById('app')._vnode = { component: { type: { name: 'Index' }, data: {}, subTree: { children: [{ component: staleHome }, { component: goodHome }] } } };
+` : `
+const home = { type: { name: 'Home' }, data: goodData, ctx: ${m === 1 ? 'goodCtx' : '{getLuicode: function () { }}'}, subTree: null };
+document.getElementById('app')._vnode = { component: home };
+`}
+// 接口路线：先让页面自己发一次读流请求，performance 里才「有请求可克隆」
+if (${m === 2 || m === 4}) {
+    fetch('/ajax/feed/groupstimeline?list_id=4660985254641891&refresh=4&fast_refresh=1&count=25', { credentials: 'include' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) { window.__mtbFirst = (j && ((j.data && j.data.statuses) || j.statuses) || []).length; })
+        .catch(function () { window.__mtbFirst = -1; });
+}
+// 个人主页的读流接口按 page 翻、返回体挂在 data.list 上 —— mode 6 演的就是这一种
+if (${m === 6}) {
+    fetch('/ajax/statuses/mymblog?uid=5512350098&page=1&feature=0', { credentials: 'include' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) { window.__mtbFirst = (j && j.data && j.data.list ? j.data.list.length : -1); })
+        .catch(function () { window.__mtbFirst = -1; });
+}
+</script>
+</body></html>`;
+}
+
 function scrollerHtml() {
     // 4 条帖子才够深：容器可视区 320px，内容约 1900px，能真的滚到 1500，
     // 让第一条帖子的图 rect.top 落到 -1200 以下 —— 不然「只加 window.scrollY」的旧算法根本碰不到阈值
@@ -288,7 +446,7 @@ addEventListener('load', tick); setInterval(tick, 200);
 </body></html>`;
 }
 
-const counters = { uploads: 0, prompts: 0, filenames: [], imgProxy: 0, tiers: {}, dest: {}, tierDest: {} };
+const counters = { uploads: 0, prompts: 0, filenames: [], imgProxy: 0, tiers: {}, dest: {}, tierDest: {}, feedReqs: 0 };
 const server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
     if (u.pathname === '/nine.html') {
@@ -296,6 +454,13 @@ const server = http.createServer((req, res) => {
         res.end(u.searchParams.get('shapes') === '1' ? shapesHtml()
             : u.searchParams.get('fold') === '1' ? foldHtml()
                 : u.searchParams.get('filter') === '1' ? filterHtml()
+                : u.searchParams.get('feed') === '1' ? feedHtml()
+                : u.searchParams.get('more') === '1' ? moreHtml(1)
+                    : u.searchParams.get('more') === '2' ? moreHtml(2)
+                        : u.searchParams.get('more') === '3' ? moreHtml(3)
+                            : u.searchParams.get('more') === '4' ? moreHtml(4)
+                                : u.searchParams.get('more') === '5' ? moreHtml(5)
+                                    : u.searchParams.get('more') === '6' ? moreHtml(6)
                 : u.searchParams.get('scroller') === '1' ? scrollerHtml()
                     : u.searchParams.get('lazy') === '1' ? lazyHtml() : fixtureHtml(u.searchParams.get('extra') === 'weibo'));
         return;
@@ -309,6 +474,40 @@ const server = http.createServer((req, res) => {
         });
         res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         res.end(JSON.stringify({ ok: 1, pic_ids: pids, pic_infos }));
+        return;
+    }
+    // 「帮我翻页」的备用路线要克隆的就是这种请求：按 max_id 游标一页一页给（第 3 页起是空的）
+    if (u.pathname === '/ajax/feed/groupstimeline') {
+        counters.feedReqs++;
+        const cur = u.searchParams.get('max_id') || '';
+        const page = (n) => Array.from({ length: 5 }, (_, k) => {
+            const id = 'E' + n + k;
+            return {
+                mid: id, bid: 'B' + id, user: { id: 'W' + id, screen_name: '接口来的' + id }, text: '接口第' + n + '页第' + k + '条',
+                pic_ids: ['R' + id], pic_infos: { ['R' + id]: { url: `http://wx1.sinaimg.cn:${SITE}/orj360/R${id}.png`, width: 900, height: 600, large: { url: `http://wx1.sinaimg.cn:${SITE}/orj360/R${id}.png`, width: 900, height: 600 } } },
+            };
+        });
+        const next = cur === '' || cur === '100' ? 1 : cur === '101' ? 2 : 0;
+        const body = next ? { ok: 1, data: { statuses: page(next), max_id_str: String(100 + next) } } : { ok: 1, data: { statuses: [], max_id_str: '' } };
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(body));
+        return;
+    }
+    // 个人主页那种：按 page 翻、条目挂在 data.list 上（第 4 页起回空）
+    if (u.pathname === '/ajax/statuses/mymblog') {
+        counters.feedReqs++;
+        const pg = parseInt(u.searchParams.get('page'), 10) || 1;
+        const mk = (n) => Array.from({ length: 5 }, (_, k) => {
+            const id = 'MB' + n + k;
+            return {
+                mid: id, bid: 'B' + id, user: { id: 'MU' + id, screen_name: '主页接口' + id }, text: '主页接口第' + n + '页第' + k + '条',
+                created_at: 'Tue Oct 20 10:00:00 +0800 2026',
+                pic_ids: [id], pic_infos: { [id]: { large: { url: `http://wx1.sinaimg.cn:${SITE}/orj360/${id}.png`, width: 900, height: 600 } } },
+            };
+        });
+        const list = pg >= 1 && pg <= 3 ? mk(pg) : [];
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ ok: 1, data: { list, max_id: '' } }));
         return;
     }
     // 故意不响应的图：浏览器永远解码不完（naturalWidth 保持 0），用来验「没解码的图也该收进列表」
@@ -1334,6 +1533,207 @@ else {
     step('非微博站点不挂信息流筛选（条件开到最严也不插提示条、不改任何帖子）', !!(gate && !gate.chip && gate.hidden === 0), gate);
     await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
       s.weiboFilter={enabled:false,image:'any',video:'any',keywordMode:'off',keywords:[]};await chrome.storage.local.set({mtbSettings:s});return true})()`);
+}
+
+// —— 全部微博：页面上没有 DOM 的帖子，从微博自己那份信息流数据里补进面板 ——
+if (WEIBO_HOST) {
+    await cdp.open(`http://${PAGE_HOST}:${SITE}/nine.html?feed=1`);
+    await wait(900);
+    const feedIds = await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>(t.url||'').includes('feed=1')).map(t=>t.id))`);
+    const feedTabId = feedIds && feedIds[0];
+    // 让内容脚本真的把庚筛掉（夹具里手写的那个 data-mtb-filtered 会被它当陈旧标记清掉，必须靠筛选现造）
+    await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+      s.weiboFilter={enabled:true,site:'weibo.com',allSites:true,types:{original:true,repost:true,text:true,image:true,video:true,music:true},keywordMode:'none',keywords:['不许出现在面板里'],dateFrom:'',dateTo:'',experimental:false};
+      await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    let marked = 0;
+    for (let i = 0; i < 25 && marked === 0; i++) {
+        await wait(400);
+        marked = await cdp.ev(swSess, `(async()=>{const r=await chrome.scripting.executeScript({target:{tabId:${feedTabId}},func:()=>document.querySelectorAll('[data-mtb-filtered="1"]').length});return (r[0]&&r[0].result)||0})()`).catch(() => 0);
+    }
+    step('夹具里那条被筛掉的微博确实在页面上被标成隐藏（前置条件也必须是断言，否则下面的对照是永远绿的假绿）',
+        marked >= 1, { marked });
+    const raw = feedTabId ? await cdp.ev(gallery, `(async()=>{
+      const m=await import('/src/gallery/collect.mjs');
+      const g=await import('/src/common/gallery.js');
+      const rr=await chrome.scripting.executeScript({target:{tabId:${feedTabId},allFrames:false},world:'MAIN',func:m.weiboFeedPage,args:[{max:300}]});
+      const r=rr[0]&&rr[0].result;
+      if (!r || !r.ok) return r;
+      return { ok: r.ok, total: r.total, posts: (r.posts||[]).map((x)=>g.weiboStatusToPost(x, x.index)) };
+    })()`) : null;
+    const byId = raw ? Object.fromEntries((raw.posts || []).map((p) => [p.mid, (p.pics || []).map((x) => String(x.url).split('/').pop())])) : {};
+    step('信息流数据里每条都捞得到图（7 条里 5 条有图；转发的图在原帖对象上也要并成一条、纯文字不建组）',
+        !!(raw && raw.ok && raw.total === 7 && (raw.posts || []).length === 5
+            && byId['5000006101'] && byId['5000006101'].length === 4
+            && byId['5000006107'] && byId['5000006107'].join(',') === '671.png,672.png'
+            && !byId['5000006105']), raw && { total: raw.total, got: (raw.posts || []).length, err: raw.error, byId });
+    step('被筛选挡掉的微博连数据都不许捞回面板（页面上它就是不存在的）',
+        !!(raw && !byId['5000006106'] && (raw.posts || []).every((p) => !(p.pics || []).some((x) => /66\d\.png/.test(String(x.url))))), byId['5000006106'] || 'ok');
+
+    const readFeedPanel = `(()=>{const gs=[...document.querySelectorAll('.g-group:not(.g-junk)')];
+      return {theme:document.documentElement.dataset.theme,chk:document.querySelector('#feedAll').checked,
+        wrapHidden:document.querySelector('#feedAllWrap').hidden,
+        names:gs.map(x=>(x.querySelector('.g-group-name')||{}).textContent||''),
+        cards:document.querySelectorAll('.g-card').length,
+        summary:(document.querySelector('#summary')||{}).textContent||''}})()`;
+    const feedGallery = feedTabId ? await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${feedTabId}`) : null;
+    const tiersBefore = JSON.parse(JSON.stringify(counters.tiers));
+    let fp = null;
+    for (let i = 0; i < 30 && !(fp && /补出/.test(fp.summary)); i++) {
+        await wait(500);
+        fp = feedGallery ? await cdp.ev(feedGallery, readFeedPanel) : null;
+    }
+    step('「全部微博」默认开着（微博站点才露这个开关），面板一打开就把滚过去的帖子补进来',
+        !!(fp && fp.wrapHidden === false && fp.chk === true && fp.cards === 27 && fp.names.length === 5
+            && /按微博数据补出 3 条 \/ 9 张/.test(fp.summary)), fp && { chk: fp.chk, hidden: fp.wrapHidden, cards: fp.cards, names: fp.names, summary: fp.summary });
+    step('补进来的帖子按信息流顺序插在两条在屏微博之间（不是堆到列表尾巴上）',
+        !!(fp && fp.names.join(',') === '@甲在屏上,@丙已回收,@乙在屏上,@丁已回收,@己转发带原帖图'), fp && fp.names);
+    step('被筛掉那条的图（661/662）一张都没进面板',
+        !!(fp && !/66\d\.png/.test(fp.summary + JSON.stringify(fp.names)) && fp.cards === 27), fp && { cards: fp.cards });
+    // 卡片只有进过视口才取图，先把面板滚到底把补来的那两张也刷出来
+    await cdp.ev(feedGallery, `(async()=>{const m=document.querySelector('.g-main');
+      for(let y=0;y<=m.scrollHeight;y+=300){m.scrollTop=y;await new Promise(r=>setTimeout(r,90));}
+      await new Promise(r=>setTimeout(r,1200));m.scrollTop=0;return true})()`);
+    const feedCards = await cdp.ev(feedGallery, `(()=>{const g=[...document.querySelectorAll('.g-group:not(.g-junk)')].find(x=>/丙已回收/.test(x.textContent));
+      const cs=[...(g?g.querySelectorAll('.g-card'):[])];
+      return {n:cs.length,tiers:cs.map(c=>c.dataset.tier||''),loaded:cs.filter(c=>{const i=c.querySelector('img');return i&&i.naturalWidth>0}).length,
+        titles:cs.map(c=>String(c.title|| '').split('\\n')[0])}})()`);
+    const tiersOnFeed = JSON.parse(JSON.stringify(counters.tiers));
+    step('补来的卡片自己就把图取到了（data-tier=card 走 mw690，不是退回页面小图、也没拉 4MB 原图）',
+        !!(feedCards && feedCards.n === 2 && feedCards.loaded === 2
+            && feedCards.tiers.every((t) => t === 'card') && !feedCards.tiers.includes('orig')), feedCards);
+    step('浏览这批补来的图一次都没请求 large 档（服务端计数说了算）',
+        !((tiersOnFeed.large || 0) > (tiersBefore.large || 0)), { before: tiersBefore, after: tiersOnFeed });
+
+    await cdp.ev(feedGallery, `document.querySelector('#feedAll').click()`);
+    let off = null;
+    for (let i = 0; i < 30 && !(off && off.cards === 18); i++) {
+        await wait(500);
+        off = await cdp.ev(feedGallery, readFeedPanel);
+    }
+    const storedOff = await cdp.ev(swSess, `chrome.storage.local.get(['mtbSettings']).then(d=>((d.mtbSettings||{}).gallery||{}).feedAll)`);
+    step('关掉「全部微博」只剩页面上真有的那两条（18 张）：开关是唯一来源，别拿缓存糊过去',
+        !!(off && off.chk === false && off.cards === 18 && off.names.length === 2 && !/补出/.test(off.summary)), off && { chk: off.chk, cards: off.cards, names: off.names, summary: off.summary });
+    step('开关状态写进设置（下次打开面板还是用户选的那样）', storedOff === false, { storedOff });
+
+    await cdp.ev(feedGallery, `document.querySelector('#feedAll').click()`);
+    let back = null;
+    for (let i = 0; i < 30 && !(back && back.cards === 27); i++) {
+        await wait(500);
+        back = await cdp.ev(feedGallery, readFeedPanel);
+    }
+    step('再打开「全部微博」又补齐成 27 张（关掉不是把数据弄丢了）', !!(back && back.chk === true && back.cards === 27), back && { chk: back.chk, cards: back.cards });
+
+    // 反向对照的落点记在这儿：把 collect.mjs 里合并转发原帖图那行删掉 → 第 1 条红；
+    // 把 weiboFeedPage 的 isHidden 判断短路 → 第 2、5 条红；把 mergeFeedPosts 直接 return → 第 3、4、6、7、8、9 条全红。
+    await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+      s.weiboFilter=Object.assign({},s.weiboFilter||{},{enabled:false,keywordMode:'has',keywords:[]});
+      await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    await wait(600);
+    await cdp.ev(swSess, `chrome.tabs.remove(${feedTabId}).then(()=>true)`).catch(() => {});
+    await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>Promise.all(ts.filter(t=>(t.url||'').includes('gallery.html?tabId=${feedTabId}')).map(t=>chrome.tabs.remove(t.id)))).then(()=>true)`).catch(() => {});
+}
+
+// —— 「帮我翻页」：① 叫微博自己的 loadMoreData 翻页 ② 拿不到就克隆页面那条读流请求按 max_id 要后面几页 ——
+if (WEIBO_HOST) {
+    // 夹具把 __mtbFeed 挂在页面世界里，所以读它必须指名 world:'MAIN'（内容脚本那种隔离世界读不到）
+    const pageState = (tid) => cdp.ev(swSess, `(async()=>{const r=await chrome.scripting.executeScript({target:{tabId:${tid},allFrames:false},world:'MAIN',func:()=>({
+        len:window.__mtbFeed.length, calls:window.__mtbCalls, y:Math.round(window.scrollY),
+        arts:document.querySelectorAll('article').length, docH:Math.round(document.documentElement.scrollHeight),
+        maxId:String(document.querySelector('#app')._vnode.component.data.max_id_str||'')})});return r[0]&&r[0].result})()`);
+    const panelRead = `(()=>({cards:document.querySelectorAll('.g-card').length,
+        groups:document.querySelectorAll('.g-group:not(.g-junk)').length,
+        toast:(document.querySelector('#toast')||{}).textContent||'',
+        summary:(document.querySelector('#summary')||{}).textContent||'',
+        btnHidden:document.querySelector('#btnMore').hidden,btnDisabled:document.querySelector('#btnMore').disabled,
+        sel:(document.querySelector('#morePages')||{}).value}))()`;
+    const closePanels = (tid) => cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>Promise.all(ts.filter(t=>(t.url||'').includes('gallery.html?tabId=${tid}')).map(t=>chrome.tabs.remove(t.id)))).then(()=>true)`).catch(() => {});
+
+    await cdp.open(`http://${PAGE_HOST}:${SITE}/nine.html?more=1`);
+    await wait(1000);
+    const m1ids = await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>(t.url||'').includes('more=1')).map(t=>t.id))`);
+    const m1 = m1ids && m1ids[0];
+    const st1 = m1 ? await pageState(m1) : null;
+    step('翻页夹具前置条件成立：列表 12 条、DOM 只挂 2 条纯文字帖子、页面高到「一滚就会挪视口」',
+        !!(st1 && st1.len === 12 && st1.arts === 2 && st1.y === 0 && st1.docH > 4000), st1);
+    const g1 = m1 ? await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${m1}`) : null;
+    let p1 = null;
+    for (let i = 0; i < 30 && !(p1 && p1.cards === 12); i++) { await wait(400); p1 = g1 ? await cdp.ev(g1, panelRead) : null; }
+    step('点之前只有列表里那 12 条（12 组 12 张），「帮我翻页」在微博页面上可见可用、页数默认 3',
+        !!(p1 && p1.cards === 12 && p1.groups === 12 && p1.btnHidden === false && p1.btnDisabled === false && p1.sel === '3'), p1);
+    await cdp.ev(g1, `document.querySelector('#btnMore').click()`);
+    for (let i = 0; i < 40 && !(p1 && p1.cards === 27); i++) { await wait(500); p1 = await cdp.ev(g1, panelRead); }
+    const st1b = m1 ? await pageState(m1) : null;
+    step('点「帮我翻页」就是替用户翻：叫微博自己的 loadMoreData 翻了 3 页（列表 12→27，面板跟着 27 组 27 张）',
+        !!(p1 && p1.cards === 27 && p1.groups === 27 && st1b && st1b.len === 27 && st1b.calls === 3
+            && /微博自己又加载了 15 条微博（翻了 3 页）/.test(p1.toast)), { panel: p1, page: st1b });
+    step('翻页全程不滚用户页面（scrollY 仍是 0）、也不改页面 DOM（article 还是 2 条），游标跟着走',
+        !!(st1b && st1b.y === 0 && st1b.arts === 2 && st1b.maxId === '222'), st1b);
+    await closePanels(m1);
+    await cdp.ev(swSess, `chrome.tabs.remove(${m1}).then(()=>true)`).catch(() => {});
+
+    await cdp.open(`http://${PAGE_HOST}:${SITE}/nine.html?more=2`);
+    await wait(1600);
+    const m2ids = await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>(t.url||'').includes('more=2')).map(t=>t.id))`);
+    const m2 = m2ids && m2ids[0];
+    const st2 = m2 ? await pageState(m2) : null;
+    step('备用路线的夹具里确实没有 loadMoreData（只剩那条发过的读流请求可以克隆）',
+        !!(st2 && st2.len === 12 && st2.calls === 0), st2);
+    const g2 = m2 ? await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${m2}`) : null;
+    let p2 = null;
+    for (let i = 0; i < 30 && !(p2 && p2.cards === 12); i++) { await wait(400); p2 = g2 ? await cdp.ev(g2, panelRead) : null; }
+    await cdp.ev(g2, `(()=>{const s=document.querySelector('#morePages');s.value='10';s.dispatchEvent(new Event('change'));return true})()`);
+    await wait(600);
+    counters.feedReqs = 0;
+    await cdp.ev(g2, `document.querySelector('#btnMore').click()`);
+    for (let i = 0; i < 40 && !(p2 && p2.cards === 22); i++) { await wait(500); p2 = await cdp.ev(g2, panelRead); }
+    const st2b = m2 ? await pageState(m2) : null;
+    const storedPages = await cdp.ev(swSess, `chrome.storage.local.get(['mtbSettings']).then(d=>((d.mtbSettings||{}).gallery||{}).loadPages)`);
+    step('组件方法拿不到时退回「克隆页面那条读流请求 + max_id」：22 组 22 张，摘要写明直接向微博要了 2 页',
+        !!(p2 && p2.cards === 22 && p2.groups === 22 && /直接向微博要了 2 页 · 10 条有图的微博/.test(p2.toast)
+            && st2b && st2b.len === 12 && st2b.y === 0), { panel: p2, page: st2b });
+    step('页数选到 10 也不会追着微博问：两页有数据 + 碰到空页自己收手（服务端只被问了 3 次）',
+        counters.feedReqs >= 2 && counters.feedReqs <= 4 && storedPages === 10, { feedReqs: counters.feedReqs, storedPages });
+    step('这条直接要来的路完全不碰页面：列表还是 12 条、一次 loadMoreData 都没调过、视口没动',
+        !!(st2b && st2b.len === 12 && st2b.calls === 0 && st2b.y === 0), st2b);
+
+    await closePanels(m2);
+    const g2b = await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${m2}`);
+    let p2b = null;
+    for (let i = 0; i < 30 && !(p2b && p2b.cards === 22); i++) { await wait(400); p2b = await cdp.ev(g2b, panelRead); }
+    step('关掉面板再重开，直接要来的那 10 条还在（不重问微博一次）',
+        !!(p2b && p2b.cards === 22 && counters.feedReqs <= 4), p2b);
+    await closePanels(m2);
+    await cdp.ev(swSess, `chrome.tabs.remove(${m2}).then(()=>true)`).catch(() => {});
+
+    // —— 真页面报过的错：先找到的那份 Home 一调就抛，必须换下一份；全都抛就退回接口路线 ——
+    const callMore = (tid, pages) => cdp.ev(gallery, `(async()=>{const m=await import('/src/gallery/collect.mjs');const rr=await chrome.scripting.executeScript({target:{tabId:${tid},allFrames:false},world:'MAIN',func:m.weiboLoadMorePages,args:[{pages:${pages}}]});return rr[0]&&rr[0].result})()`);
+    const moreState = (tid) => cdp.ev(swSess, `(async()=>{const r=await chrome.scripting.executeScript({target:{tabId:${tid},allFrames:false},world:'MAIN',func:()=>({good:window.__mtbFeed.length, stale:(window.__mtbStale||[]).length, pf:window.__mtbPf?window.__mtbPf.data.length:-1, tried:window.__mtbTried, calls:window.__mtbCalls, y:Math.round(window.scrollY)})});return r[0]&&r[0].result})()`);
+    for (const mode of [3, 4, 5, 6]) {
+        await cdp.open(`http://${PAGE_HOST}:${SITE}/nine.html?more=${mode}`);
+        await wait(mode === 4 || mode === 6 ? 1700 : 1000);
+        const mids = await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>(t.url||'').includes('more=${mode}')).map(t=>t.id))`);
+        const tid = mids && mids[0];
+        const res = tid ? await callMore(tid, mode === 6 ? 3 : 2) : null;
+        const st = tid ? await moreState(tid) : null;
+        if (mode === 3) {
+            step('先找到的那份 Home 一调就抛（真页面那个 reading id 报错）也必须换下一份，不许直接放弃',
+                !!(res && res.route === 'component' && res.ok && res.pages === 2 && res.added === 10
+                    && st && st.tried === 1 && st.calls === 2 && st.good === 22 && st.stale === 20 && st.y === 0), { res, st });
+        } else if (mode === 4) {
+            step('所有 Home 都抛时自动退回接口路线（结果里标 fallback），页面列表一点没动',
+                !!(res && res.route === 'fetch' && res.fallback === true && res.ok && res.statuses.length === 10
+                    && st && st.good === 12 && st.stale === 20 && st.calls === 0 && st.y === 0), { res, st });
+        } else if (mode === 5) {
+            step('个人主页那种形状（数组挂在 data.data、翻页是整个换引用）也算得到：组件路线连翻 2 页 12→22',
+                !!(res && res.route === 'component' && res.ok && res.pages === 2 && res.added === 10
+                    && st && st.pf === 22 && st.good === 12 && st.calls === 2 && st.y === 0), { res, st });
+        } else {
+            step('主页读流接口按 page 翻、条目在 data.list 里也认：从页面当前页码接着要 2 页，第 4 页空了就收手',
+                !!(res && res.route === 'fetch' && res.ok && res.pages === 2 && res.statuses.length === 10
+                    && st && st.pf === 12 && st.calls === 0 && st.y === 0), { res, st });
+        }
+        if (tid) await cdp.ev(swSess, `chrome.tabs.remove(${tid}).then(()=>true)`).catch(() => {});
+    }
 }
 
 // —— 面板换肤实测：五档风格必须真的画出五种不同的样子，而且不许把网格换坏 ——

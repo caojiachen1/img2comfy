@@ -205,7 +205,7 @@ body.gallery-page {
 }
 .g-tabs button:hover { color: var(--text); }
 .g-tabs button.active { color: var(--text); background: var(--wash-bg); border-color: var(--line); }
-body.tab-filter .g-view, body.tab-filter #btnWide, body.tab-filter #btnRefresh { display: none; }
+body.tab-filter .g-view, body.tab-filter #btnWide, body.tab-filter #btnRefresh, body.tab-filter #btnMore { display: none; }
 body.tab-filter .g-foot { display: none; }
 
 /* ---------------- 微博筛选表单（照微博原生的样子：类型 / 关键字 / 时间） ---------------- */

@@ -10,7 +10,7 @@ import { STEPS, runChain } from '../src/common/steps.js';
 import { buildToolbar, migrateSettings, DEFAULT_SETTINGS, TOOLS, DEFAULT_COLLAPSED } from '../src/common/registry.js';
 import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.js';
 import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64, bytesFingerprint, uniqueUploadName, extFromMime } from '../src/common/util.js';
-import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial } from '../src/common/gallery.js';
+import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, clampLoadPages } from '../src/common/gallery.js';
 import { UI_THEMES, DEFAULT_UI_THEME, normalizeUiTheme, uiThemeLabel } from '../src/common/theme.js';
 
 let pass = 0, fail = 0;
@@ -859,5 +859,155 @@ console.log('== theme（界面风格）==');
         DEFAULT_SETTINGS.ui.theme === DEFAULT_UI_THEME && DEFAULT_SETTINGS.toolbar.theme === 'dark');
 }
 
-__summary();
-process.exit(fail ? 1 : 0);
+console.log('== mergeFeedPosts（微博信息流数据并进采集分组）==');
+{
+    const mkAcc = (withPid = true) => {
+        const acc = { groups: [], byKey: new Map(), seen: new Set() };
+        if (withPid) acc.byPid = new Map();
+        return acc;
+    };
+    // 造一份「DOM 已经扫到」的累加器，形状与 mergeResults 里的 S.raw 一致
+    const addDom = (acc, key, label, pids, y) => {
+        const g = { key, label, sub: '', items: [], junk: false, y };
+        acc.byKey.set(key, g);
+        acc.groups.push(g);
+        pids.forEach((pid, i) => {
+            const url = `https://wx1.sinaimg.cn/large/${pid}.jpg`;
+            const dk = imageDedupeKey(url);
+            const k = key + '|' + dk;
+            acc.seen.add(k);
+            acc.byPid.set(dk, key);
+            g.items.push({ key: k, url, y: y + i, src: 'dom' });
+        });
+        return g;
+    };
+    const pic = (pid, w = 900, h = 600) => ({ url: `https://wx2.sinaimg.cn/mw690/${pid}.jpg`, width: w, height: h });
+    const post = (o) => ({ index: 0, mid: '', bid: '', id: '', uid: '', name: '', text: '', pics: [], ...o });
+
+    const acc1 = mkAcc();
+    const r1 = mergeFeedPosts(acc1, [
+        post({ index: 0, mid: 'M100001', uid: '700001', name: '甲', text: '第一条的内容', pics: [pic('A1'), pic('A2')] }),
+        post({ index: 1, mid: 'M100002', uid: '700002', name: '乙', text: '第二条的内容', pics: [pic('B1')] }),
+    ], { pageUrl: 'https://weibo.com/ttarticle' });
+    ok('DOM 里没有的帖子按微博数据新建 feed 组（2 条微博 3 张图，键是 feed:<mid>）',
+        r1.groups === 2 && r1.items === 3 && acc1.groups.length === 2
+        && acc1.groups[0].key === 'feed:M100001' && acc1.groups[0].label === '甲' && acc1.groups[0].sub === '第一条的内容'
+        && acc1.groups[1].key === 'feed:M100002' && acc1.groups[1].items.length === 1, JSON.stringify(r1));
+    const r1b = mergeFeedPosts(acc1, [
+        post({ index: 0, mid: 'M100001', uid: '700001', name: '甲', text: '第一条的内容', pics: [pic('A1'), pic('A2')] }),
+    ], {});
+    ok('同一批数据重复扫（用户点刷新）不重复加组也不重复加图',
+        r1b.groups === 0 && r1b.items === 0 && acc1.groups.length === 2, JSON.stringify(r1b));
+
+    const acc2 = mkAcc();
+    addDom(acc2, 'acct:500001#psC300003', '丙', ['C1'], 1000);
+    const r2 = mergeFeedPosts(acc2, [
+        post({ index: 0, mid: 'C300003', uid: '500001', name: '丙', pics: [pic('C1'), pic('C2')] }),
+    ], {});
+    ok('帖子 id 对得上采集器的键就并回那条微博（不新建组，只补 DOM 缺的那张）',
+        r2.groups === 0 && r2.matched === 1 && r2.items === 1
+        && acc2.groups.length === 1 && acc2.groups[0].key === 'acct:500001#psC300003'
+        && acc2.groups[0].items.length === 2, JSON.stringify(r2));
+
+    const acc3 = mkAcc();
+    addDom(acc3, 'acct:600001#psOLDID1', '丁', ['D1'], 5000);
+    const r3 = mergeFeedPosts(acc3, [
+        post({ index: 7, mid: 'NEWID99', uid: '600001', name: '丁', pics: [pic('D1'), pic('D2')] }),
+    ], {});
+    ok('上轮在 DOM、这轮被回收（id 变了）的帖子靠「这张图已在哪个组」找回原组',
+        r3.groups === 0 && r3.items === 1 && acc3.groups.length === 1
+        && acc3.groups[0].key === 'acct:600001#psOLDID1', JSON.stringify(r3));
+
+    const acc4 = mkAcc();
+    const repostA = post({ index: 0, mid: 'R100001', uid: '800001', name: '转发甲', pics: [pic('SAME1')] });
+    const repostB = post({ index: 1, mid: 'R100002', uid: '800002', name: '转发乙', pics: [pic('SAME1')] });
+    const r4 = mergeFeedPosts(acc4, [repostA, repostB], {});
+    ok('同一轮里两条复用同一批图的微博（转发）也各算一条，不许并成一组',
+        r4.groups === 2 && r4.items === 2 && acc4.groups.length === 2
+        && acc4.groups.every((g) => g.items.length === 1), JSON.stringify({ r4, sizes: acc4.groups.map((g) => g.items.length) }));
+    // 真正会出事的是跨轮：第一轮只见到甲，第二轮用户滚出来一条转发同一批图的乙 ——
+    // 放开「不许落到 feed 组」的限制，乙会被并进甲的组、图上又被 seen 挡掉，整条微博从面板上消失
+    const acc4b = mkAcc();
+    mergeFeedPosts(acc4b, [repostA], {});
+    const r4b = mergeFeedPosts(acc4b, [repostA, repostB], {});
+    ok('下一轮才出现的转发帖子必须另开一组（不许靠「这张图见过」并到别人的组里被吞掉）',
+        r4b.groups === 1 && acc4b.groups.length === 2
+        && acc4b.groups.every((g) => g.items.length === 1)
+        && acc4b.groups.some((g) => g.key === 'feed:R100002'), JSON.stringify({ r4b, keys: acc4b.groups.map((g) => g.key + ':' + g.items.length) }));
+
+    const acc5 = mkAcc();
+    addDom(acc5, 'acct:9#psE100001', '上', ['E1'], 1000);
+    addDom(acc5, 'acct:9#psE200002', '下', ['E2'], 3000);
+    const mid = post({ index: 2, mid: 'E300003', uid: '9', name: '中', pics: [pic('E3')] });
+    const tail = post({ index: 5, mid: 'E400004', uid: '9', name: '尾', pics: [pic('E4')] });
+    mergeFeedPosts(acc5, [
+        post({ index: 0, mid: 'E100001', uid: '9', name: '上', pics: [pic('E1')] }),
+        mid, tail,
+        post({ index: 4, mid: 'E200002', uid: '9', name: '下', pics: [pic('E2')] }),
+    ], {});
+    const gMid = acc5.groups.find((g) => g.key === 'feed:E300003');
+    const gTail = acc5.groups.find((g) => g.key === 'feed:E400004');
+    ok('feed 组的文档位置按列表下标在两个真实位置之间插值（第 2 条落在 2000）',
+        gMid && gMid.y === 2000, gMid && gMid.y);
+    ok('最后一个真实位置之后按平均间距往下外推（下标 5 → 3500）',
+        gTail && gTail.y === 3500, gTail && gTail.y);
+
+    const acc6 = mkAcc();
+    mergeFeedPosts(acc6, [post({ index: 0, mid: 'F100001', uid: '1', name: '己', pics: [pic('F1', 1234, 567)] })], { pageUrl: 'https://weibo.com/x' });
+    const fItem = acc6.groups[0].items[0];
+    ok('补来的条目档位齐全（原图 large / 卡片 mw690 / 查看器 mw2000、缩略先用卡片档）且带数据里的真实宽高',
+        fItem.url === 'https://wx2.sinaimg.cn/large/F1.jpg' && fItem.card === 'https://wx2.sinaimg.cn/mw690/F1.jpg'
+        && fItem.full === 'https://wx2.sinaimg.cn/mw2000/F1.jpg' && fItem.thumb === fItem.card
+        && fItem.width === 1234 && fItem.height === 567 && fItem.src === 'feed', JSON.stringify(fItem));
+    ok('补来的条目键沿用「<组键>|<图片去重键>」格式（面板重开才能认回旧勾选）',
+        fItem.key === acc6.groups[0].key + '|' + imageDedupeKey(fItem.url), fItem.key);
+
+    const acc7 = mkAcc(false);
+    const r7 = mergeFeedPosts(acc7, [
+        null, undefined, '不是对象', 42,
+        post({ index: 0, mid: 'G100001', pics: [] }),
+        post({ index: 1, mid: 'G100002', pics: [{ url: '/relative/only.jpg' }, { url: 'data:image/png;base64,AAA' }, pic('G3')] }),
+    ], {});
+    ok('脏数据（空图/相对地址/非对象）只跳过不抛异常，缺 byPid 时自己补上',
+        r7.groups === 1 && r7.items === 1 && r7.skipped === 1 && acc7.byPid instanceof Map, JSON.stringify(r7));
+    ok('没有信息流数据时原样返回（一条都不补，也不报错）',
+        mergeFeedPosts(mkAcc(), [], {}).groups === 0
+        && mergeFeedPosts(mkAcc(), null, {}).items === 0
+        && mergeFeedPosts(null, [post({ pics: [pic('H1')] })], {}).items === 0);
+}
+
+console.log('== 微博翻页（映射与页数）==');
+{
+    const inf = (u, w = 900, h = 600) => ({ large: { url: u, width: w, height: h } });
+    const p1 = weiboStatusToPost({
+        mid: '5000000001', bid: 'AbCdEf', user: { id: '700001', screen_name: '  甲  ' },
+        text: '带 <a href="/n/x">@某某</a> 的正文<br>两行', created_at: 'x',
+        pic_ids: ['A', 'B'], pic_infos: { A: inf('https://wx1.sinaimg.cn/large/A.jpg', 1200, 800), B: inf('https://wx2.sinaimg.cn/mw2000/B.jpg') },
+    }, 3);
+    ok('weiboStatusToPost：取 large 的地址与真实宽高，档位表对不上也不影响（面板侧自己换算）',
+        p1.pics.length === 2 && p1.pics[0].url === 'https://wx1.sinaimg.cn/large/A.jpg'
+        && p1.pics[0].width === 1200 && p1.pics[0].height === 800
+        && p1.pics[1].url === 'https://wx2.sinaimg.cn/mw2000/B.jpg' && p1.index === 3, JSON.stringify(p1));
+    ok('weiboStatusToPost：正文剥 HTML 只留文字、昵称去掉首尾空白、bid 带出来供认组',
+        p1.text === '带 @某某 的正文 两行' && p1.name === '甲' && p1.bid === 'AbCdEf' && p1.uid === '700001', JSON.stringify(p1));
+    const p2 = weiboStatusToPost({
+        mid: '5000000002', pic_ids: ['X'], pic_infos: { X: { large: { latest_url: 'https://wx3.sinaimg.cn/large/X.jpg' } } },
+        retweeted_status: { pic_ids: ['X', 'Y'], pic_infos: { Y: { mw2000: { url: 'https://wx4.sinaimg.cn/mw2000/Y.jpg', width: 400, height: 300 } } } },
+    }, 0);
+    ok('weiboStatusToPost：转发的图在原帖上，与原帖同 pid 的只算一张（latest_url 也认）',
+        p2.pics.length === 2 && p2.pics.some((x) => /\/X\.jpg$/.test(x.url))
+        && p2.pics.some((x) => x.url === 'https://wx4.sinaimg.cn/mw2000/Y.jpg' && x.width === 400), JSON.stringify(p2));
+    const p3 = weiboStatusToPost({ mid: '5000000003', pic_ids: ['Z'], pic_infos: { Z: { large: { url: '/relative/z.jpg' } } } }, 'bad');
+    ok('weiboStatusToPost：非 http 的地址一律不要，index 不是数字就归 0（不许把 NaN 传进插值）',
+        p3.pics.length === 0 && p3.index === 0, JSON.stringify(p3));
+    ok('weiboStatusToPost：条目形状不对（null / 数字 / 没有 user）也不抛，回一份空 pics 的结构',
+        weiboStatusToPost(null, 0).pics.length === 0
+        && weiboStatusToPost(42, 0).pics.length === 0
+        && weiboStatusToPost({ mid: '1', user: null, pic_ids: '不是数组' }, 0).pics.length === 0);
+    ok('翻页页数卡死在 1~10：0 页抬到 1、99 页压到 10，脏值回默认 3（一次问太急容易被限流）',
+        clampLoadPages(0) === 1 && clampLoadPages(99) === 10 && clampLoadPages('5') === 5
+        && clampLoadPages('x') === 3 && clampLoadPages(undefined) === 3 && clampLoadPages(-2) === 1
+        && clampLoadPages(4.6) === 5);
+}
+
+__summary();process.exit(fail ? 1 : 0);

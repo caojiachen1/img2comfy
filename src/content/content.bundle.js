@@ -5598,6 +5598,8 @@ const DEFAULT_SETTINGS = {
     weiboFilter: { ...DEFAULT_WEIBO_FILTER, keywords: [] },
     gallery: {
         sendTier: 'card',   // 发给 ComfyUI 用哪个档：card=mw690（默认，~41KB）· full=mw2000 · orig=large（4MB+）
+        feedAll: true,      // 微博：连被虚拟列表摘掉、页面上没有 DOM 的帖子也从微博自己的信息流数据里收图
+        loadPages: 3,       // 「帮我翻页」一次翻几页（产品侧卡到 1~10）
     },
     ai: {
         enabled: true,

@@ -493,8 +493,10 @@ const HANDLERS = {
             }
             groups.push(g); n += items.length;
         }
-        galleryCache.set(id, { at: Date.now(), meta: entry.meta || null, groups });
-        return { ok: true, items: n, groups: groups.length };
+        // 「帮我翻页」直接要来的帖子（不在页面列表里，重扫也拿不到）跟着标签页一起存
+        const extra = Array.isArray(entry.extra) ? entry.extra.slice(0, 900).filter((p) => p && Array.isArray(p.pics)) : [];
+        galleryCache.set(id, { at: Date.now(), meta: entry.meta || null, groups, extra });
+        return { ok: true, items: n, groups: groups.length, extra: extra.length };
     },
 
     galleryCacheClear: async (req) => { galleryCache.delete(Number(req && req.tabId)); gallerySel.delete(Number(req && req.tabId)); return { ok: true }; },

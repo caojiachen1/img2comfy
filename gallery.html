@@ -16,8 +16,10 @@
   <div class="hdr-actions">
     <span class="g-site" id="siteInfo"></span>
     <label class="g-view" title="只列屏幕上下各一屏内的图；关掉则列出这个页面已经加载的全部图"><input type="checkbox" id="onlyView">只看屏幕附近</label>
+    <label class="g-view" id="feedAllWrap" title="连滚过去、被虚拟列表从页面上摘掉的微博一起收：图地址直接问微博自己那份信息流数据要，不用先把帖子滚出来"><input type="checkbox" id="feedAll">全部微博</label>
     <button id="btnWide" title="下拉面板最宽只能 800px，点这里用接近全屏的大窗打开">⤢ 大窗</button>
     <button id="btnRefresh" title="重新扫描当前页面">刷新</button>
+    <button id="btnMore" hidden title="替你把微博的信息流往后翻页加载：先叫微博自己加载下一页（页面画面不动），它不肯就照页面那条读流请求直接向后端要后面几页。全程只读、不滚动你的页面">帮我翻页</button>
     <button id="btnSettings" class="primary" title="打开 Media Hover Toolbar 设置">设置</button>
   </div>
 </header>
@@ -92,6 +94,14 @@
     <button id="btnClear">清空</button>
     <span class="g-sel" id="selCount">已选 0 张</span>
     <span class="sp"></span>
+    <label class="g-tier" id="morePagesWrap" title="点「帮我翻页」一次翻几页（1~10）。翻页就是替你多问微博几次，问得越急越容易被限流，别一次拉满">翻页页数
+      <select id="morePages">
+        <option value="1">1 页</option>
+        <option value="3">3 页</option>
+        <option value="5">5 页</option>
+        <option value="10">10 页</option>
+      </select>
+    </label>
     <label class="g-tier" title="发给 ComfyUI 的清晰度档位：卡片 mw690 约 41KB、高清 mw2000 约 283KB、原图 large 可能 4MB 以上">发送档位
       <select id="sendTier">
         <option value="card">卡片 mw690</option>

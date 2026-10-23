@@ -58,3 +58,172 @@ export function accountInitial(name) {
     if (!t) return '?';
     return Array.from(t)[0].toUpperCase();
 }
+
+/* 微博信息流里的一个条目（列表里的 item，或翻页接口返回的 status）→ 面板补图用的帖子形状。
+   这是「一条微博有哪些图」的唯一映射处：读列表和读翻页接口两条路都走它，别在页面里再写一份。
+   转发的图挂在 retweeted_status 上，而九宫格显示在这一条下面，所以两边并成一组、按 pathname 去重；
+   档位优先 large，只有 mw2000 的导出就退一档（两个键名各版本都见过）。 */
+export function weiboStatusToPost(item, index) {
+    const it = item && typeof item === 'object' ? item : {};
+    const rt = it.retweeted_status && typeof it.retweeted_status === 'object' ? it.retweeted_status : null;
+    const pics = [];
+    const seen = new Set();
+    for (const src of [it, rt]) {
+        if (!src) continue;
+        const infos = src.pic_infos || {};
+        let ids = [];
+        try {
+            ids = (Array.isArray(src.pic_ids) && src.pic_ids.length) ? src.pic_ids : Object.keys(infos);
+        } catch (e) { ids = []; }
+        for (const pid of ids) {
+            const info = infos[pid] || {};
+            const big = info.large || info.mw2000 || {};
+            const url = String(big.url || big.latest_url || info.url || '');
+            if (!/^https?:\/\//i.test(url)) continue;
+            let key = url;
+            try { key = new URL(url).pathname; } catch (e) { }
+            if (seen.has(key)) continue;
+            seen.add(key);
+            pics.push({ url, width: Number(big.width || info.width) || 0, height: Number(big.height || info.height) || 0 });
+        }
+    }
+    const user = it.user && typeof it.user === 'object' ? it.user : {};
+    const strip = (h) => String(h == null ? '' : h).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    return {
+        index: Number(index) || 0,
+        id: String(it.mid || it.idstr || it.id || ''),
+        mid: String(it.mid || ''),
+        bid: String(it.bid || it.mblogid || ''),
+        uid: String(user.id || user.uid || ''),
+        name: strip(user.screen_name || ''),
+        text: strip(it.text || it.longText || (rt && rt.text) || '').slice(0, 200),
+        pics,
+    };
+}
+
+// 翻页页数：面板上给的是 1/3/5/10，产品侧兜到 1~10（一次问太多页容易把自己送进微博的限流）
+export function clampLoadPages(v) {
+    const n = Math.round(Number(v));
+    if (!Number.isFinite(n)) return 3;
+    return Math.max(1, Math.min(10, n));
+}
+
+/* 把「微博自己信息流数据」里的帖子并进采集分组（DOM 扫描之后跑）。
+   归组三条路，按可靠性递减：
+   1) 帖子 id 对上采集器的键格式 acct:<uid>#ps<mid|bid> —— 同一条微博 DOM 在不在都归同一组；
+   2) 这些图已经登记在某个组里（这条帖子上一轮扫描在 DOM 里、这一轮被虚拟列表回收了，键会变，靠图找回来）；
+   3) 都对不上才新建 feed 组。
+   新组没有真实文档位置，按列表下标在「有真 y 的组」之间插值 —— 微博列表下标和页面位置同向（上→下），
+   面板「顺序=信息流顺序」的排序才不会被喂成一团。 */
+export function mergeFeedPosts(acc, posts, meta = {}) {
+    const stats = { groups: 0, items: 0, matched: 0, skipped: 0 };
+    if (!acc || !Array.isArray(acc.groups) || !acc.byKey || !acc.seen || !Array.isArray(posts) || !posts.length) {
+        return stats;
+    }
+    if (!acc.byPid) acc.byPid = new Map();
+    const pageUrl = String(meta.pageUrl || '');
+    const rows = [];
+
+    for (const p of posts) {
+        if (!p || typeof p !== 'object') continue;
+        const srcPics = Array.isArray(p.pics) ? p.pics : [];
+        const pics = [];
+        for (const raw of srcPics) {
+            const url = raw && /^https?:\/\//i.test(String(raw.url || '')) ? upgradeWeiboImageUrl(raw.url) : '';
+            if (!url) continue;
+            const dk = imageDedupeKey(url);
+            if (pics.some((x) => x.dk === dk)) continue;
+            pics.push({ url, dk, width: Number(raw.width) || 0, height: Number(raw.height) || 0 });
+        }
+        if (!pics.length) { stats.skipped++; continue; }
+
+        const ids = [];
+        for (const v of [p.mid, p.bid, p.id]) {
+            const s = String(v == null ? '' : v);
+            if (s.length >= 5 && ids.indexOf(s) < 0) ids.push(s);
+        }
+        const owners = [];
+        for (const v of [p.uid, p.name]) {
+            const s = String(v == null ? '' : v);
+            if (s && owners.indexOf('acct:' + s) < 0) owners.push('acct:' + s);
+        }
+        let key = '';
+        for (const idv of ids) {
+            for (const own of owners) {
+                const cand = own + '#ps' + idv;
+                if (acc.byKey.has(cand)) { key = cand; break; }
+            }
+            if (key) break;
+        }
+        if (!key) {
+            for (const pic of pics) {
+                const found = acc.byPid.get(pic.dk);
+                // 只认 DOM 量出来的那个组：feed 组自己按 mid 就能认回来，
+                // 让「两条转发同一批图的微博」落到 byPid 上会被并成一组（少一条微博）
+                if (found && found.indexOf('feed:') !== 0) { key = found; break; }
+            }
+        }
+
+        let g = key ? acc.byKey.get(key) : null;
+        if (g && key.indexOf('feed:') !== 0) stats.matched++;
+        if (!g) {
+            key = 'feed:' + (ids[0] || pics[0].dk);
+            if (acc.byKey.has(key)) { g = acc.byKey.get(key); } else {
+                g = { key, label: String(p.name || ''), sub: String(p.text || '').slice(0, 72), items: [], junk: false, y: 0, feed: true };
+                acc.byKey.set(key, g);
+                acc.groups.push(g);
+                stats.groups++;
+            }
+        }
+        // 组里只要有过 DOM 量到的条目，这个 y 就是真的，可以当插值锚点
+        const domItem = g.items.find((it) => it && it.src !== 'feed' && Number.isFinite(it.y));
+        rows.push({ g, pics, index: Number(p.index) || 0, anchorY: domItem ? domItem.y : null });
+        if (domItem) g.y = Math.min(Number.isFinite(g.y) ? g.y : Infinity, domItem.y);
+    }
+
+    const anchors = rows.filter((r) => r.anchorY != null).sort((a, b) => a.index - b.index);
+    const spacing = (() => {
+        if (anchors.length < 2) return 600;
+        const gaps = [];
+        for (let i = 1; i < anchors.length; i++) {
+            const d = anchors[i].index - anchors[i - 1].index;
+            if (d > 0) gaps.push((anchors[i].anchorY - anchors[i - 1].anchorY) / d);
+        }
+        if (!gaps.length) return 600;
+        gaps.sort((a, b) => a - b);
+        return Math.max(120, Math.min(4000, Math.round(gaps[Math.floor(gaps.length / 2)])));
+    })();
+    const yAt = (idx) => {
+        if (!anchors.length) return idx * spacing;
+        let prev = null, next = null;
+        for (const a of anchors) {
+            if (a.index <= idx) prev = a;
+            if (a.index >= idx && !next) next = a;
+        }
+        if (prev && next && prev !== next) {
+            const t = (idx - prev.index) / (next.index - prev.index);
+            return Math.round(prev.anchorY + (next.anchorY - prev.anchorY) * t);
+        }
+        if (prev) return Math.round(prev.anchorY + (idx - prev.index) * spacing);
+        return Math.round(next.anchorY - (next.index - idx) * spacing);
+    };
+
+    for (const r of rows) {
+        const y = r.anchorY != null ? r.anchorY : yAt(r.index);
+        r.g.y = y;
+        for (const pic of r.pics) {
+            const key = r.g.key + '|' + pic.dk;
+            if (acc.seen.has(key)) continue;
+            acc.seen.add(key);
+            acc.byPid.set(pic.dk, r.g.key);
+            const card = weiboImageTierUrl(pic.url, 'card');
+            r.g.items.push({
+                key, url: pic.url, thumb: card, card, full: weiboImageTierUrl(pic.url, 'full'),
+                y, width: pic.width, height: pic.height,
+                kind: 'image', alt: '', pageUrl, groupKey: r.g.key, src: 'feed',
+            });
+            stats.items++;
+        }
+    }
+    return stats;
+}

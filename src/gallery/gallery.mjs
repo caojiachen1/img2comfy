@@ -2,8 +2,8 @@
 // 页面本身不注入内容脚本：用 chrome.scripting.executeScript 把 collectPageImages 投进去。
 // 批量发送由后台执行，面板关掉也不会中断。
 
-import { collectPageImages } from './collect.mjs';
-import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial } from '../common/gallery.js';
+import { collectPageImages, weiboFeedPage, weiboLoadMorePages } from './collect.mjs';
+import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, clampLoadPages } from '../common/gallery.js';
 import { baseNameFromUrl, sanitizeFilename } from '../common/util.js';
 import { normalizeWeiboFilter, splitKeywords, describeWeiboFilter } from '../common/weibo-filter.js';
 import { normalizeUiTheme } from '../common/theme.js';
@@ -45,6 +45,13 @@ const S = {
     wide: false,
     raw: null,
     weiboFlag: false,
+    feedAll: true,
+    feedStats: null,
+    feedError: '',
+    feedTotal: 0,
+    extraPosts: [],
+    moreBusy: false,
+    moreDetail: '',
 };
 
 // 下拉面板被 Chromium 锁在 800×600，想要更大的浏览面就另开一个普通扩展窗口
@@ -77,6 +84,21 @@ function bindEvents() {
         S.onlyView = $('#onlyView').checked;
         if (S.full) applyData(S.full, true);
     };
+    // 「全部微博」要重扫（得多问一次页面自己那份信息流数据），不像「只看屏幕附近」只是换个筛法
+    $('#feedAll').onchange = () => {
+        if (S.running) return;
+        S.feedAll = $('#feedAll').checked;
+        S.settings.gallery = { ...(S.settings.gallery || {}), feedAll: S.feedAll };
+        chrome.runtime.sendMessage({ action: 'patchSettings', patch: { gallery: { feedAll: S.feedAll } } }).catch(() => {});
+        if (!S.feedAll) {
+            // 关掉就把手上这份带数据补来的结果丢掉，否则用户看到的是「关了还在」
+            S.raw = null;
+            S.cachedCount = 0;
+            S.extraPosts = [];
+            S.feedTotal = 0;
+        }
+        void (async () => { await collect(true); await syncBatchState(); })();
+    };
     $('#selAll').onchange = () => {
         if (S.running) return;
         const on = $('#selAll').checked;
@@ -102,6 +124,13 @@ function bindEvents() {
         S.settings.gallery = { ...(S.settings.gallery || {}), sendTier: v };
         chrome.runtime.sendMessage({ action: 'patchSettings', patch: { gallery: { sendTier: v } } }).catch(() => {});
         toast(`发送档位：${TierLabel(v)}`);
+    };
+    $('#btnMore').onclick = () => { void loadMorePages(); };
+    $('#morePages').onchange = () => {
+        const v = clampLoadPages($('#morePages').value);
+        S.settings.gallery = { ...(S.settings.gallery || {}), loadPages: v };
+        chrome.runtime.sendMessage({ action: 'patchSettings', patch: { gallery: { loadPages: v } } }).catch(() => {});
+        toast(`一次翻 ${v} 页`);
     };
     $('#btnSend').onclick = () => runBatch(false);
     $('#btnSendRun').onclick = () => runBatch(true);
@@ -150,6 +179,9 @@ async function loadSettings() {
     applyUiTheme(S.settings);
     renderComfyInfo();
     $('#sendTier').value = ((S.settings.gallery || {}).sendTier) || 'card';
+    S.feedAll = (S.settings.gallery || {}).feedAll !== false;
+    $('#feedAll').checked = S.feedAll;
+    $('#morePages').value = String(clampLoadPages((S.settings.gallery || {}).loadPages));
 }
 
 // 主题必须赶在揭开 #bootMask 之前贴好，否则用户看得见面板从默认皮肤换成自己那套的闪一下
@@ -229,6 +261,10 @@ async function collect(keepSelection) {
         const host = (() => { try { return new URL(tab.url).hostname; } catch (e) { return ''; } })();
         $('#siteInfo').textContent = host;
         S.weiboFlag = isWeiboHost(host);
+        $('#feedAllWrap').hidden = !S.weiboFlag;
+        $('#btnMore').hidden = !S.weiboFlag;
+        $('#morePagesWrap').hidden = !S.weiboFlag;
+        $('#btnMore').disabled = !(S.weiboFlag && S.feedAll) || S.moreBusy;
     } catch (e) {
         showEmpty('读取当前页面失败', truncate(e.message || e, 180) + '。刷新网页或重新加载扩展后再试。');
         return;
@@ -250,6 +286,8 @@ async function seedFromCache() {
         const res = await chrome.runtime.sendMessage({ action: 'galleryCacheGet', tabId: S.tabId });
         const e = res && res.entry;
         const groups = e && Array.isArray(e.groups) ? e.groups : [];
+        // 「帮我翻页」直接问后端要来的帖子也按标签页存着：关掉面板再开不至于白翻一次
+        if (e && Array.isArray(e.extra)) S.extraPosts = e.extra.filter((p) => p && Array.isArray(p.pics) && p.pics.length);
         if (!groups.length) return;
         S.cachedCount = groups.reduce((n, g) => n + ((g && g.items) || []).length, 0);
         mergeResults([{ result: { ...(e.meta || {}), groups } }], S.tab);
@@ -262,7 +300,17 @@ function saveToCache() {
         pageUrl: S.data.pageUrl, pageTitle: S.data.pageTitle,
         host: S.data.host, weibo: S.data.weibo, view: S.data.view || null,
     };
-    chrome.runtime.sendMessage({ action: 'galleryCachePut', tabId: S.tabId, entry: { meta, groups: S.raw.groups } })
+    // 按信息流数据补来的条目不进缓存：那种图每次都能重新从页面数据里拿到，
+    // 留在缓存里会变成「关掉全部微博还是看得到」
+    const groups = S.raw.groups
+        .map((g) => {
+            const items = (g.items || []).filter((it) => it.src !== 'feed');
+            return items.length ? { ...g, items, y: items.reduce((m, it) => Math.min(m, it.y || 0), Infinity) } : null;
+        })
+        .filter(Boolean);
+    // 「帮我翻页」直接问微博要来的那些帖子必须单独留着：它们不在页面列表里，重扫也扫不出来
+    if (!groups.length && !S.extraPosts.length) return;
+    chrome.runtime.sendMessage({ action: 'galleryCachePut', tabId: S.tabId, entry: { meta, groups, extra: S.extraPosts } })
         .catch(() => {});
 }
 
@@ -297,8 +345,92 @@ async function restoreSelection() {
     refreshSelectionUI();
 }
 
+// 问页面自己那份信息流数据要图（只在主世界读，不碰页面数据）：虚拟列表把滚过去的帖子整条摘掉，
+// 光扫 DOM 拿不到，而列表里每条都带 pic_ids/pic_infos。读不到就算了，不影响正常扫描。
+async function readFeedPosts() {
+    S.feedError = '';
+    if (!S.weiboFlag || !S.feedAll) return null;
+    try {
+        const res = await chrome.scripting.executeScript({
+            target: { tabId: S.tabId, allFrames: false }, world: 'MAIN', func: weiboFeedPage, args: [{ max: 300 }],
+        });
+        const r = res && res[0] && res[0].result;
+        if (!r || !r.ok) {
+            S.feedError = (r && r.error) || '页面里没有微博的信息流数据';
+            return null;
+        }
+        S.feedTotal = r.total | 0;
+        // 「一条微博有哪些图」只在 src/common/gallery.js 的 weiboStatusToPost 里映射一次；
+        // 之前按「帮我翻页」直接问后端要来的那些帖子接在列表末尾，插值才会排在正确的位置上
+        const seen = new Set();
+        const list = [];
+        for (const [i, it] of (Array.isArray(r.posts) ? r.posts : []).entries()) {
+            const p = weiboStatusToPost(it, Number(it.index) || i);
+            if (!p.pics.length) continue;
+            if (p.mid) seen.add(p.mid);
+            list.push(p);
+        }
+        const extra = [];
+        for (const [i, p] of S.extraPosts.entries()) {
+            if (p.mid && seen.has(p.mid)) continue;
+            extra.push({ ...p, index: Math.max(list.length, S.feedTotal) + i });
+        }
+        S.extraPosts = extra;
+        return { posts: list.concat(extra), total: S.feedTotal };
+    } catch (e) {
+        S.feedError = truncate(String((e && e.message) || e || ''), 90);
+        return null;
+    }
+}
+
+// 「帮我翻页」：先调微博组件自己的 loadMoreData（它正常加载下一页走的就是这个，视口一动不动），
+// 那个方法拿不到就退回克隆页面已经发过的那条读流请求 + max_id 游标，直接向微博要后面几页。
+// 两条都只读、都不滚动页面；页数由底部「翻页页数」定，产品侧卡到 1~10（一次问太急容易被限流）。
+async function loadMorePages() {
+    if (S.moreBusy || S.running) return;
+    S.moreBusy = true;
+    const btn = $('#btnMore');
+    btn.disabled = true;
+    const pages = clampLoadPages($('#morePages').value);
+    setLoading(true, '正在替微博翻页（不滚动页面）…');
+    let res = null;
+    try {
+        const r = await chrome.scripting.executeScript({
+            target: { tabId: S.tabId, allFrames: false }, world: 'MAIN', func: weiboLoadMorePages, args: [{ pages }],
+        });
+        res = r && r[0] && r[0].result;
+    } catch (e) {
+        res = { ok: false, error: truncate(String((e && e.message) || e || ''), 90) };
+    }
+    S.moreBusy = false;
+    if (res && res.route === 'fetch' && Array.isArray(res.statuses) && res.statuses.length) {
+        const seen = new Set(S.extraPosts.map((p) => p.mid).filter(Boolean));
+        for (const s of res.statuses) {
+            const p = weiboStatusToPost(s, 0);
+            if (!p.pics.length || (p.mid && seen.has(p.mid))) continue;
+            if (p.mid) seen.add(p.mid);
+            S.extraPosts.push(p);
+        }
+        S.extraPosts = S.extraPosts.slice(-900);
+    }
+    await collect(true);
+    await syncBatchState();
+    btn.disabled = !(S.weiboFlag && S.feedAll);
+    const added = (res && res.added) | 0;
+    S.moreDetail = (res && (res.detail || res.stopped || res.error)) || '';
+    if (added > 0) {
+        toast(res.route === 'component'
+            ? `微博自己又加载了 ${added} 条微博（翻了 ${res.pages} 页）`
+            : `直接向微博要了 ${res.pages} 页 · ${added} 条有图的微博`
+                + (res.fallback ? '（微博自己的翻页没走通，已改用这条）' : ''));
+    } else {
+        toast('没加载到更多' + (res && (res.stopped || res.error) ? '：' + (res.stopped || res.error) : ''), true);
+    }
+}
+
 async function scanOnce() {
     const args = [{ max: 400, weibo: !!S.weiboFlag }];
+    const feed = await readFeedPosts();
     let results;
     try {
         try {
@@ -307,7 +439,7 @@ async function scanOnce() {
             results = await chrome.scripting.executeScript({ target: { tabId: S.tabId }, func: collectPageImages, args });
         }
     } catch (e) { return null; }
-    return mergeResults(results, S.tab);
+    return mergeResults(results, S.tab, feed);
 }
 
 /* 「只看屏幕附近」：只保留扫描那一刻视口上下各一屏范围内的图。
@@ -365,7 +497,7 @@ function applyData(data, keepSelection) {
     S.cardEls.clear(); S.groupEls.clear();
     setLoading(false);
     $('#summary').textContent = buildSummary(shown);
-    $('#summary').title = dropNote(shown);
+    $('#summary').title = [dropNote(shown), S.feedError ? `读不到微博信息流数据：${S.feedError}` : '', S.moreDetail ? `翻页细节：${S.moreDetail}` : ''].filter(Boolean).join('；');
     $('#pageTitle').textContent = data.pageTitle || S.tab?.title || '';
     document.title = '本页图片' + (data.pageTitle ? ' · ' + truncate(data.pageTitle, 40) : '');
     renderGroups();
@@ -382,8 +514,9 @@ function applyData(data, keepSelection) {
     }
 }
 
-function mergeResults(results, tab) {
-    if (!S.raw) S.raw = { groups: [], byKey: new Map(), seen: new Set() };
+function mergeResults(results, tab, feed) {
+    if (!S.raw) S.raw = { groups: [], byKey: new Map(), seen: new Set(), byPid: new Map() };
+    if (!S.raw.byPid) S.raw.byPid = new Map();
     const groups = S.raw.groups;
     const byKey = S.raw.byKey;
     const seen = S.raw.seen;
@@ -413,6 +546,8 @@ function mergeResults(results, tab) {
                 const key = target.key + '|' + dkey;
                 if (seen.has(key)) continue;
                 seen.add(key);
+                // 记「这张图属于哪个组」：信息流数据里的帖子只能靠图认出是同一条微博（键格式两边不一样）
+                S.raw.byPid.set(dkey, target.key);
                 const thumbRaw = String(raw.thumb || '');
                 const thumb = thumbRaw && !/^blob:/i.test(thumbRaw) ? thumbRaw : url;
                 const y = Math.round(raw.y) || 0;
@@ -431,9 +566,13 @@ function mergeResults(results, tab) {
             }
         }
     }
+    // 微博自己那份信息流数据：DOM 里没有的帖子（被虚拟列表回收了）在这里补成组
+    if (feed === null) S.feedStats = null;
+    else if (feed && Array.isArray(feed.posts) && feed.posts.length) {
+        S.feedStats = mergeFeedPosts(S.raw, feed.posts, { pageUrl: (meta && meta.pageUrl) || tab?.url || '' });
+    }
     const host = (() => { try { return new URL(tab?.url || meta?.pageUrl || '').hostname; } catch (e) { return ''; } })();
-    const weibo = isWeiboHost(host) || !!(meta && meta.weibo);
-    const pageTitle = (tab && tab.title) || (meta && meta.pageTitle) || host || '本页图片';
+    const weibo = isWeiboHost(host) || !!(meta && meta.weibo);    const pageTitle = (tab && tab.title) || (meta && meta.pageTitle) || host || '本页图片';
     const finalGroups = groups.filter((g) => g.items.length)
         // 累加过多轮扫描后顺序是乱的，按这条微博在页面里的位置排，面板顺序=信息流顺序；
         // 「无用图片」永远排最后
@@ -497,11 +636,14 @@ function buildSummary(data) {
     const off = data.hidden ? ` · 另有 ${data.hidden} 张在屏幕外` : '';
     const kept = S.cachedCount ? ` · 含之前滚过的位置` : '';
     const fixed = data.enriched ? ` · 补齐折叠 ${data.enriched} 张` : '';
+    const st = S.feedStats;
+    const fromFeed = st && (st.groups || st.items) ? ` · 按微博数据补出 ${st.groups} 条 / ${st.items} 张` : '';
+    const feedErr = (S.feedAll && S.weiboFlag && S.feedError && !st) ? ` · 信息流数据没读到` : '';
     // 无用图片不再算「被忽略」：它们收在最后一个折叠组里，想看的可以展开
     const junk = data.junk ? ` · 无用图片 ${data.junk} 张（默认收起）` : '';
     const ignored = Math.max(0, (data.dropped || 0) - (data.junk || 0));
     const drop = ignored ? ` · 已忽略 ${ignored} 张` : '';
-    return `${data.host || ''} · ${kind} · ${data.total} 张图片${fixed}${truncated}${off}${junk}${drop}${kept}`;
+    return `${data.host || ''} · ${kind} · ${data.total} 张图片${fixed}${fromFeed}${feedErr}${truncated}${off}${junk}${drop}${kept}`;
 }
 
 function renderGroups() {

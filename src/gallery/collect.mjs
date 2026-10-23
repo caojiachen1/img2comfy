@@ -598,3 +598,384 @@ export async function collectPageImages(options = {}) {
     };
 }
 
+// 注入到页面**主世界**执行：把微博自己那份信息流数据里的图片捞出来（只读，绝不改页面数据）。
+// 为什么必须问数据而不是扫 DOM：桌面版信息流是虚拟列表，屏幕上下各留几条，滚过去的帖子整条被摘掉，
+// 光扫 DOM 就永远拿不到那些图；而列表里每条都自带 pic_ids/pic_infos（含各档地址和真实宽高），
+// 一次就能把这个页面已经加载出来的所有微博的图全捞出来。
+// 这个函数会被序列化后执行，必须完全自包含；找列表的那段判定与 background 里 weiboFilterPage 同源。
+export function weiboFeedPage(arg) {
+    const opt = arg || {};
+    try {
+        const maxPosts = Math.max(1, Math.min(500, Number(opt.max) || 300));
+        const strip = (h) => String(h == null ? '' : h).replace(/<[^>]+>/g, '');
+        const flat = (s) => strip(s).replace(/\s+/g, ' ').trim();
+
+        const findList = () => {
+            const appEl = document.querySelector('#app');
+            const root = appEl && appEl._vnode && appEl._vnode.component;
+            if (!root) return null;
+            // 单页应用切页后旧组件仍挂在 Vue 树里，所以优先挑「页面里已渲染帖子能找到」且「组件可见」的那份
+            let rendered = '';
+            try {
+                rendered = [...document.querySelectorAll('article')].map((a) => String(a.textContent || '').replace(/\s+/g, '')).join('|').slice(0, 30000);
+            } catch (e) { rendered = ''; }
+            const keyOf = (it) => String((it && (it.mid || it.idstr || it.id)) || '');
+            const seen = new Set();
+            let best = null;
+            const consider = (arr, inst) => {
+                if (!Array.isArray(arr) || !arr.length) return;
+                const first = arr[0];
+                if (!first || typeof first !== 'object') return;
+                const looks = ('mid' in first || 'idstr' in first) && ('text' in first || 'pic_ids' in first || 'user' in first);
+                if (!looks) return;
+                let visible = 0;
+                try {
+                    const el = inst && inst.subTree && inst.subTree.el;
+                    if (el && el.nodeType === 1) {
+                        const r = el.getBoundingClientRect();
+                        const cs = getComputedStyle(el);
+                        visible = (el.isConnected && cs.display !== 'none' && cs.visibility !== 'hidden' && (r.width > 0 || r.height > 0)) ? 1 : 0;
+                    }
+                } catch (e) { visible = 0; }
+                let hits = 0;
+                try {
+                    for (const it of arr.slice(0, 12)) {
+                        const t = strip(it.text || '').replace(/\s+/g, '').slice(0, 10);
+                        if (t && rendered.indexOf(t) >= 0) hits++;
+                    }
+                } catch (e) { hits = 0; }
+                if (!best || hits > best.hits) { best = { arr, hits, visible, length: arr.length }; return; }
+                if (hits === best.hits && (visible > best.visible || (visible === best.visible && arr.length > best.length))) {
+                    best = { arr, hits, visible, length: arr.length };
+                }
+            };
+            const visit = (vn, depth) => {
+                if (!vn || depth > 40) return;
+                if (vn.component) walk(vn.component, depth + 1);
+                if (Array.isArray(vn.children)) for (const c of vn.children) visit(c, depth + 1);
+            };
+            const walk = (inst, depth) => {
+                if (!inst || seen.has(inst) || depth > 40) return;
+                seen.add(inst);
+                for (const src of [inst.data, inst.setupState, inst.props]) {
+                    if (!src || typeof src !== 'object') continue;
+                    let keys = [];
+                    try { keys = Object.keys(src); } catch (e) { keys = []; }
+                    for (const k of keys) {
+                        let v;
+                        try { v = src[k]; } catch (e) { continue; }
+                        consider(v, inst);
+                    }
+                }
+                visit(inst.subTree, 0);
+            };
+            walk(root, 0);
+            return best ? best.arr : null;
+        };
+
+        // 被微博筛选挡掉的帖子在页面上就是「没发过」，面板里也不许把它的数据捞回来。
+        // 条目里没有 DOM 身份可对，只能拿正文当前缀去认（和上面挑列表同一套指纹办法）
+        let hiddenText = '';
+        try {
+            hiddenText = [...document.querySelectorAll('[data-mtb-filtered="1"]')]
+                .map((a) => String(a.textContent || '').replace(/\s+/g, '')).join('|');
+        } catch (e) { hiddenText = ''; }
+        const isHidden = (t) => {
+            if (!hiddenText) return false;
+            const k = String(t || '').replace(/\s+/g, '').slice(0, 12);
+            return k.length >= 6 && hiddenText.indexOf(k) >= 0;
+        };
+
+        const hasPics = (src) => {
+            if (!src || typeof src !== 'object') return false;
+            try {
+                if (Array.isArray(src.pic_ids) && src.pic_ids.length) return true;
+                const infos = src.pic_infos;
+                return !!(infos && typeof infos === 'object' && Object.keys(infos).length);
+            } catch (e) { return false; }
+        };
+
+        const list = findList();
+        if (!list) return { ok: false, error: '没找到微博信息流数组' };
+        const posts = [];
+        for (let i = 0; i < list.length && posts.length < maxPosts; i++) {
+            let it;
+            try { it = list[i]; } catch (e) { continue; }
+            if (!it || typeof it !== 'object') continue;
+            let rt = null;
+            try { rt = it.retweeted_status && typeof it.retweeted_status === 'object' ? it.retweeted_status : null; } catch (e) { rt = null; }
+            // 只把「有没有图」的判断留在这里（省得把一堆纯文字帖子搬出去），
+            // 「一条微博有哪些图」一律由 src/common/gallery.js 的 weiboStatusToPost 映射，别在页面里再写一份
+            if (!hasPics(it) && !hasPics(rt)) continue;
+            const text = flat(it.text || it.longText || (rt && rt.text) || '');
+            if (isHidden(text.replace(/ /g, ''))) continue;
+            let user = {};
+            try { user = { id: (it.user && it.user.id) || '', uid: (it.user && it.user.uid) || '', screen_name: (it.user && it.user.screen_name) || '' }; } catch (e) { user = {}; }
+            const slim = (src) => {
+                if (!src || typeof src !== 'object') return null;
+                let ids = [];
+                let infos = {};
+                try {
+                    ids = Array.isArray(src.pic_ids) ? src.pic_ids.slice() : [];
+                    infos = src.pic_infos || {};
+                } catch (e) { return null; }
+                const keep = {};
+                for (const pid of (ids.length ? ids : Object.keys(infos))) {
+                    const info = infos[pid];
+                    if (!info || typeof info !== 'object') continue;
+                    const big = info.large || info.mw2000 || {};
+                    keep[pid] = { large: { url: big.url || big.latest_url || '', width: big.width, height: big.height } };
+                }
+                return { pic_ids: ids, pic_infos: keep };
+            };
+            const mine = slim(it);
+            const theirs = slim(rt);
+            posts.push({
+                index: i,
+                mid: it.mid, bid: it.bid, mblogid: it.mblogid, idstr: it.idstr, id: it.id,
+                text: it.text || it.longText || '',
+                user,
+                pic_ids: (mine && mine.pic_ids) || [],
+                pic_infos: (mine && mine.pic_infos) || {},
+                retweeted_status: theirs ? { pic_ids: theirs.pic_ids, pic_infos: theirs.pic_infos } : (rt ? {} : null),
+            });
+        }
+        return { ok: true, total: list.length, posts };
+    } catch (e) {
+        return { ok: false, error: String((e && e.message) || e || '').slice(0, 160) };
+    }
+}
+
+// 注入到页面主世界执行：替用户「翻页」。两条路，先温和后直接：
+// ① 调微博组件自己的 loadMoreData（Home 组件上就有）—— 这是它正常加载下一页的同一条代码路径，
+//    列表真的变长、视口一动不动，也不会出现我们和它的分页状态各说各话；
+// ② 拿不到那个方法时，克隆页面自己已经发过的那条信息流请求（从 performance 里取，不猜接口名），
+//    带上 Home 的 max_id 游标直接向后端要后面几页 —— 完全不碰页面。
+// 两条都绝不滚动页面，也不发任何写操作（只有 GET 读流）。
+export async function weiboLoadMorePages(arg) {
+    const opt = arg || {};
+    const maxPages = Math.max(1, Math.min(10, Number(opt.pages) || 3));
+    const waitMs = Math.max(1500, Math.min(12000, Number(opt.waitMs) || 7000));
+    const out = { ok: false, route: '', before: 0, after: 0, added: 0, pages: 0, stopped: '', error: '', detail: '', fallback: false, statuses: [] };
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const visibleOf = (inst) => {
+        try {
+            const el = inst && inst.subTree && inst.subTree.el;
+            if (!el || el.nodeType !== 1 || !el.isConnected) return 0;
+            const cs = getComputedStyle(el);
+            if (cs.display === 'none' || cs.visibility === 'hidden') return 0;
+            const r = el.getBoundingClientRect();
+            return (r.width > 0 || r.height > 0) ? 1 : 0;
+        } catch (e) { return 0; }
+    };
+    // 认「哪个组件手里有信息流」不能只认分组页那一种形状：
+    //   分组页 = Home 组件的 data.list + max_id_str（接口按游标翻）
+    //   个人主页 = ProfileFeed 组件的 data.data + page（接口按页码翻，返回体是 data.list）
+    // 分组页还会给每个标签页各留一份 Home，先遍历到的那份可能内部状态是空的（一调就抛），
+    // 所以候选要全收下来（可见的、更长的排前面）逐个试。
+    const looksLikeStatuses = (v) => {
+        if (!Array.isArray(v) || !v.length) return false;
+        let f = null;
+        try { f = v[0]; } catch (e) { return false; }
+        if (!f || typeof f !== 'object') return false;
+        return ('mid' in f || 'idstr' in f || 'mblogid' in f)
+            && ('user' in f || 'text' in f || 'pic_ids' in f || 'created_at' in f);
+    };
+    const findFeeds = () => {
+        try {
+            const appEl = document.querySelector('#app');
+            const root = appEl && appEl._vnode && appEl._vnode.component;
+            if (!root) return [];
+            const seen = new Set();
+            const hits = [];
+            const visit = (vn, d) => {
+                if (!vn || d > 40) return;
+                if (vn.component) walk(vn.component, d + 1);
+                if (Array.isArray(vn.children)) vn.children.forEach((c) => visit(c, d + 1));
+            };
+            const walk = (inst, d) => {
+                if (!inst || seen.has(inst) || d > 40) return;
+                seen.add(inst);
+                let data = null;
+                try { data = inst.data; } catch (e) { }
+                if (data && typeof data === 'object') {
+                    let keys = [];
+                    try { keys = Object.keys(data); } catch (e) { keys = []; }
+                    for (const k of keys) {
+                        let v = null;
+                        try { v = data[k]; } catch (e) { continue; }
+                        if (!looksLikeStatuses(v)) continue;
+                        hits.push({ inst, data, key: k, list: v, len: v.length, visible: visibleOf(inst) });
+                    }
+                }
+                visit(inst.subTree, 0);
+            };
+            walk(root, 0);
+            hits.sort((a, b) => b.visible - a.visible || b.len - a.len);
+            return hits;
+        } catch (e) { return []; }
+    };
+    const noMoreOf = (data) => {
+        try { return data.isNoData === true || data.isOver === true || data.isEnd === true; } catch (e) { return false; }
+    };
+    // 有的组件是原地 push 数组，有的是整个换掉（`data.data = [...旧, ...新]`）——
+    // 攥着旧引用永远看不到变长，所以长度每次都从组件的 data 上重新读
+    const lenOf = (c) => {
+        try { const v = c.data[c.key]; return Array.isArray(v) ? v.length : c.len; } catch (e) { return c.len; }
+    };
+    const listOf = (c) => {
+        try { const v = c.data[c.key]; return Array.isArray(v) ? v : []; } catch (e) { return []; }
+    };
+    const idOf = (s) => { try { return String((s && (s.mid || s.idstr || s.id)) || ''); } catch (e) { return ''; } };
+    // 页面里发过的请求太多，先按形状筛出「读流接口」：带 page/list_id/containerid 的优先，其次新发的在前
+    const FEED_URL_SKIP = /config|getTipsAd|allGroups|unreadHint|detectVideoCodec|copyright|getNavConfig|\/side|sidedetail|profile\/info|profile\/detail|multimedia|\/log\/|getLiveInfo|search\/emoticon/i;
+    const feedUrls = () => {
+        const rows = [];
+        try {
+            for (const e of performance.getEntriesByType('resource')) {
+                const n = String((e && e.name) || '');
+                if (!/\/ajax\/(?:feed|statuses|profile)\/[a-z0-9_]+/i.test(n)) continue;
+                if (FEED_URL_SKIP.test(n)) continue;
+                rows.push({ n, t: (e && e.startTime) || 0, paged: /[?&](?:page|max_id|since_id|containerid|list_id)=/i.test(n) ? 1 : 0 });
+            }
+        } catch (e) { return []; }
+        rows.sort((a, b) => b.paged - a.paged || b.t - a.t);
+        return rows.map((r) => r.n);
+    };
+    const parseList = (json) => {
+        try {
+            const data = (json && json.data) || json || {};
+            if (Array.isArray(data.statuses)) return { items: data.statuses, data };
+            if (Array.isArray(data.list)) return { items: data.list, data };
+            if (Array.isArray(json.statuses)) return { items: json.statuses, data };
+            if (Array.isArray(json.list)) return { items: json.list, data };
+        } catch (e) { }
+        return { items: [], data: {} };
+    };
+
+    try {
+        const feeds = findFeeds();
+        const best = feeds[0] || null;
+        out.before = best ? lenOf(best) : 0;
+        let winner = null;
+        const tried = [];
+        for (const c of feeds) {
+            let fn = null;
+            try { fn = c.inst.ctx && typeof c.inst.ctx.loadMoreData === 'function' ? c.inst.ctx.loadMoreData : null; } catch (e) { fn = null; }
+            if (!fn) continue;
+            const len = lenOf(c);
+            try {
+                const r = fn.call(c.inst.ctx);
+                if (r && typeof r.then === 'function') await Promise.race([r, sleep(waitMs)]);
+            } catch (e) { tried.push(String((e && e.message) || e).slice(0, 70)); continue; }
+            const t0 = Date.now();
+            while (lenOf(c) === len && Date.now() - t0 < waitMs) await sleep(200);
+            if (lenOf(c) > len) { winner = c; out.before = len; out.pages = 1; break; }
+            tried.push('这一页没加载出来');
+        }
+        if (winner) {
+            out.route = 'component';
+            for (let i = out.pages; i < maxPages; i++) {
+                if (noMoreOf(winner.data)) { out.stopped = '没有更多了'; break; }
+                const len = lenOf(winner);
+                try {
+                    const r = winner.inst.ctx.loadMoreData.call(winner.inst.ctx);
+                    if (r && typeof r.then === 'function') await Promise.race([r, sleep(waitMs)]);
+                } catch (e) {
+                    out.stopped = '微博自己的翻页中途出错了';
+                    out.detail = String((e && e.message) || e).slice(0, 120);
+                    break;
+                }
+                const t0 = Date.now();
+                while (lenOf(winner) === len && Date.now() - t0 < waitMs) await sleep(200);
+                if (lenOf(winner) === len) { out.stopped = '第 ' + (i + 1) + ' 页没加载出来'; break; }
+                out.pages++;
+                await sleep(400);
+            }
+            out.after = lenOf(winner);
+            out.added = out.after - out.before;
+            out.ok = out.added > 0;
+            if (out.ok) return out;
+        }
+        if (!out.ok) out.detail = tried.join('；').slice(0, 200);
+
+        // ②：克隆页面自己发过的那条读流请求（组件翻页没走通、或那个组件根本没有方法时走这里）。
+        // 一条 URL 拿不到东西就换下一条试（个人主页/超话页的接口名和参数都不一样），最多试 3 条
+        const seenId = new Set();
+        for (const f of feeds) {
+            try { for (const it of listOf(f)) { const k = idOf(it); if (k) seenId.add(k); } } catch (e) { }
+        }
+        const urls = feedUrls();
+        if (!urls.length) { out.error = out.detail || '页面里没有可克隆的信息流请求'; out.detail = ''; return out; }
+        out.route = 'fetch';
+        out.fallback = winner != null || tried.length > 0;
+        let cursorOf = '';
+        try { cursorOf = best ? String(best.data.max_id_str || best.data.max_id || '') : ''; } catch (e) { cursorOf = ''; }
+        let pageFrom = 0;
+        try { pageFrom = best && best.data.page ? (parseInt(best.data.page, 10) || 0) : 0; } catch (e) { pageFrom = 0; }
+        for (let k = 0; k < urls.length && k < 3 && !out.ok; k++) {
+            let u = null;
+            try { u = new URL(urls[k], location.href); } catch (e) { continue; }
+            u.searchParams.delete('refresh');
+            u.searchParams.delete('fast_refresh');
+            const byPage = u.searchParams.has('page');
+            if (byPage) {
+                let start = (parseInt(u.searchParams.get('page'), 10) || 1);
+                if (pageFrom > start) start = pageFrom;
+                u.searchParams.set('page', String(start));
+            } else if (cursorOf) {
+                u.searchParams.set('max_id', cursorOf);
+            }
+            let pages = 0;
+            let requests = 0;
+            let lastError = '';
+            while (pages < maxPages && requests < maxPages * 2 + 2) {
+                requests++;
+                let json = null;
+                try {
+                    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+                    const timer = ctrl ? setTimeout(() => ctrl.abort(), waitMs) : 0;
+                    const res = await fetch(u.href, {
+                        credentials: 'include', signal: ctrl ? ctrl.signal : undefined,
+                        headers: { 'x-requested-with': 'XMLHttpRequest' },
+                    });
+                    if (timer) clearTimeout(timer);
+                    if (!res || !res.ok) { lastError = '接口回了 HTTP ' + ((res && res.status) || 0); break; }
+                    json = await res.json();
+                } catch (e) { lastError = '向微博要下一页失败了'; out.detail = String((e && e.message) || e).slice(0, 120); break; }
+                const parsed = parseList(json);
+                if (!parsed.items.length) { lastError = lastError || '这一页是空的'; break; }
+                let fresh = 0;
+                for (const s of parsed.items) {
+                    const id = idOf(s);
+                    if (id && seenId.has(id)) continue;
+                    if (id) seenId.add(id);
+                    out.statuses.push(s);
+                    fresh++;
+                }
+                if (fresh) pages++;
+                out.pages = Math.max(out.pages, pages);
+                if (byPage) {
+                    let cur = parseInt(u.searchParams.get('page'), 10) || 1;
+                    u.searchParams.set('page', String(cur + 1));
+                } else {
+                    let next = '';
+                    try { next = String(parsed.data.max_id_str || parsed.data.max_id || json.max_id_str || json.max_id || ''); } catch (e) { next = ''; }
+                    if (!next || next === String(u.searchParams.get('max_id') || '')) { lastError = '没有更多了'; break; }
+                    u.searchParams.set('max_id', next);
+                }
+                if (!fresh && pages === 0 && requests >= 2) { lastError = '后面几页都是重复的'; break; }
+                await sleep(400);
+            }
+            out.ok = out.statuses.length > 0;
+            if (!out.ok && lastError) out.stopped = lastError;
+        }
+        out.added = out.statuses.length;
+        out.ok = out.statuses.length > 0;
+        return out;
+    } catch (e) {
+        out.error = String((e && e.message) || e || '').slice(0, 140);
+        return out;
+    }
+}
+
