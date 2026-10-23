@@ -6,6 +6,7 @@ import { collectPageImages } from './collect.mjs';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial } from '../common/gallery.js';
 import { baseNameFromUrl, sanitizeFilename } from '../common/util.js';
 import { normalizeWeiboFilter, splitKeywords, describeWeiboFilter } from '../common/weibo-filter.js';
+import { normalizeUiTheme } from '../common/theme.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const truncate = (s, n = 90) => (String(s || '').length > n ? String(s).slice(0, n - 1) + '…' : String(s || ''));
@@ -135,6 +136,10 @@ function bindEvents() {
         }
     });
     window.addEventListener('resize', settlePanelSize);
+    // 设置页改了界面风格，已经开着的面板立刻跟着换肤，不用等下次重开
+    chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && changes.mtbSettings) applyUiTheme(changes.mtbSettings.newValue);
+    });
 }
 
 async function loadSettings() {
@@ -142,8 +147,14 @@ async function loadSettings() {
         const d = await chrome.storage.local.get(['mtbSettings']);
         S.settings = d.mtbSettings || {};
     } catch (e) { S.settings = {}; }
+    applyUiTheme(S.settings);
     renderComfyInfo();
     $('#sendTier').value = ((S.settings.gallery || {}).sendTier) || 'card';
+}
+
+// 主题必须赶在揭开 #bootMask 之前贴好，否则用户看得见面板从默认皮肤换成自己那套的闪一下
+function applyUiTheme(settings) {
+    document.documentElement.dataset.theme = normalizeUiTheme(((settings || {}).ui || {}).theme);
 }
 
 function TierLabel(v) {
@@ -1289,14 +1300,16 @@ function initFilterTab() {
     const q = new URLSearchParams(location.search);
     S.wide = q.get('wide') === '1';
     if (S.wide) document.documentElement.classList.add('wide');
+    // 先把设置读起来：贴主题要用它，而大窗模式紧接着就揭开遮罩，晚一步就被用户看见换肤那一下
+    const settingsReady = loadSettings();
     bindEvents();
     if (S.wide) $('#btnWide').hidden = true;
     askPanelSize();
     settlePanelSize();
+    await settingsReady;
     if (S.wide) revealBoot();
     // 遮罩绝不能把面板锁死：万一视口一直读不稳（定时器被节流、窗口刚在动），到点直接揭开
     setTimeout(revealBoot, 2600);
-    await loadSettings();
     let tabId = parseInt(q.get('tabId') || '', 10);
     if (!Number.isFinite(tabId)) tabId = await findTabId();
     S.tabId = Number.isFinite(tabId) && tabId > 0 ? tabId : null;

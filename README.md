@@ -190,11 +190,45 @@ MV3 扩展页的 `script-src 'self'` 挡掉了跨源脚本与 `blob:` 模块，�
   搬运与校验脚本：`node scripts/ms-mirror.mjs --list` 看计划、`--all` 全搬（按字节数校验后才上传，
   半截文件不会进仓库）；`node scripts/ms-check.mjs` 查上游是否已有同步仓。
 
+## 一之三、界面风格（主题）
+
+设置页「工具栏外观」页最上面那块「界面风格」的下拉框（`#uiTheme`）选的是 `settings.ui.theme`，共五档
+（选项由 `src/common/theme.js` 的 `UI_THEMES` 动态生成，HTML 里不写死，顺序就是那份数组的顺序）：
+**glass 暗色玻璃**（当前默认，也就是改造前用户正在用的那套外观，逐像素钉死不许动）、
+**fluent 黑白·亮** 与 **fluent-dark 黑白·暗**（纯黑白灰实色，无半透明、无渐变、无毛玻璃、小圆角）、
+**neon 霓虹**（深底青紫发光，允许通透）、**contrast 高对比**（纯黑纯白 + 2px 描边 + 黄色强调，无障碍取向）。
+认不出的值一律回落 glass，存储里保留原值不改写，回落发生在渲染侧。
+
+**它只管扩展自己的页面**：设置页（`options.html`）与「本页图片」面板（`gallery.html`），
+外加右下角那条微博筛选提示条（提示条画在用户自己的页面上、Shadow DOM 吃不到扩展页的 `theme.css`，
+所以 `weibo-filter.mjs` 里另带一套 `--cf-*`，靠宿主元素上的 `data-theme` 选档，`mountWeiboFilter()`
+贴一次、设置变更推送进来时再刷一次）。**悬浮工具栏的皮肤不由它管**，仍由老字段
+`settings.toolbar.theme` 单独控制，六档 `dark|light|glass|neon|fluent|contrast`
+（`dark` 是 `.wrap` 的默认值所以 CSS 里没有 `data-theme="dark"` 那一块；本次新增的「黑白·实色」与
+「高对比」就落在 `fluent`/`contrast` 上：整块关掉 `backdrop-filter`、顶部渐变亮线和内白纱，
+底色/描边全换成实色，`contrast` 另外把描边提到 2px）。两个字段互不相干，迁移时也不会互相带跑。
+
+维护约定，改样式前先看这条：**颜色只能进 `src/common/theme.css`**，那里是唯一的颜色真值，
+按 `html[data-theme="X"]` 整块切换（glass 那块同时挂 `:root` 兜底，JS 还没贴上属性时不至于闪一块白板）；
+五块的 token 键集必须两两完全相等，少一个键的那个主题会去兜 `:root`，切过去就缺一块底色。
+`src/options/options.css` 与 `src/gallery/gallery.css` 里**只许读 `var(--…)`，不许再出现一个字面颜色**
+——漏一处，切到别的主题时那一块就还是上一套皮肤的颜色，用户看到的就是一块花掉的补丁，
+而这种错位只有在切过主题之后才会被发现，所以 `test/unit_pure.mjs` 直接拿文本断言拦在前面
+（顺带拦住 `#faceGallery` 这类长得像十六进制的 ID 选择器：检测器只扫声明块，并有正对照自证不是永远 0 命中）。
+新加一档时四处都要补齐：`UI_THEMES` 加一项、`theme.css` 加一块（键顺序保持一致）、
+`weibo-filter.mjs` 加一个 `:host([data-theme=…])`，工具栏那一套在 `ui.mjs` 的 `CSS` 里加
+`.wrap[data-theme=…]` 并在 `options.html` 的 `<select id="theme">` 里加一项 —— 少补哪一处，
+`test/unit_pure.mjs` 的 theme 一节都会红，不会让你悄悄漏过去。
+`fluent`/`fluent-dark`/`contrast` 三套的整块里一次都不许出现 `rgba(`、`linear-gradient`、`blur(`
+（`--shadow: none`、`--blur: none` 这种写法是允许的，`test/gallery_probe.mjs` 还会在真浏览器里读回
+分组底色的 alpha 与页脚的 `backdrop-filter` 复核，并钉住 glass 下提示条底色必须是
+`rgba(18, 21, 28, 0.92)`），glass/neon 则反过来断言仍然含半透明与毛玻璃，免得默认外观被偷偷抹平。
+
 ## 二、验证
 
 ```bash
 node scripts/check-imports.mjs        # 语法 + 相对路径 + 具名导入是否存在（50+ 文件）
-node test/unit_pure.mjs              # 220 条纯算法单测（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位）
+node test/unit_pure.mjs              # 294 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言）
 node test/run_browser.mjs            # 页面级：内容脚本包 + 工具栏 + 拖拽 + 算子链 + 视频取帧
 node test/run_browser.mjs --ai       # 再加：vendor + slimSAM/swin2SR/YuNet 真实推理 + 设置页
 node test/run_browser.mjs --ai --only=sr|sam|face|vlm|script|options   # 单跑某一阶段
@@ -334,7 +368,7 @@ src/gallery/*                 采集注入函数 collect.mjs + 批量窗口逻�
 src/common/gallery.js         微博图 URL 升级/去重键/域名判定等纯函数
 vendor/                       transformers.js + onnxruntime-web + QuickJS wasm（setup-vendor.mjs 生成，已 gitignore）
 scripts/                      build-content / setup-vendor / check-imports
-test/                         unit_pure（220 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
+test/                         unit_pure（294 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
                               gallery_probe（有头，本页图片/批量发送）、cdp.mjs、旧的 run_headless + harness + cors_server
 ```
 
@@ -346,7 +380,7 @@ test/                         unit_pure（220 条）、run_browser + harness_pag
 
 ## 五、已知边界（如实记录）
 
-- 端到端验证覆盖到：220 条算法单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+- 端到端验证覆盖到：294 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
   slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）、
   多模态也跑通了真推理（`qwen3vl-2b` q4f16 约 490s、`smolvlm2-256m` 约 146s 出答案）。
   GB 级权重在 CPU 模式下仍然很慢，建议 GPU + `q4`；断流写坏的半截缓存会在建会话时炸成

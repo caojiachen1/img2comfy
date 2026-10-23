@@ -154,6 +154,34 @@ button.btn.gear:hover { background: linear-gradient(180deg, rgba(110,168,255,.22
 .wrap[data-theme="light"] button.btn.gear:hover { background: rgba(47,98,200,.14); border-color: rgba(47,98,200,.35); }
 .wrap[data-theme="glass"] button.btn.gear:hover { background: rgba(255,255,255,.24); border-color: rgba(255,255,255,.45); box-shadow: inset 0 1px 0 rgba(255,255,255,.3); }
 .wrap[data-theme="neon"] button.btn.gear:hover { background: rgba(80,190,255,.26); border-color: rgba(103,214,255,.6); box-shadow: 0 0 20px rgba(80,190,255,.28); }
+.wrap[data-theme="fluent"] {
+  --tb-text: #fff; --tb-text-hover: #fff; --tb-muted: #c9c9c9; --tb-faint: #9a9a9a; --tb-accent: #fff; --tb-accent2: #c9c9c9; --tb-gear: #fff;
+  --tb-border: #5a5a5a; --tb-hairline: #3a3a3a; --tb-hover: #1f1f1f; --tb-press: #2e2e2e;
+  --tb-surface: #000000; --tb-menu-surface: #121212; --tb-gear-surface: #1f1f1f; --tb-gear-border: #5a5a5a;
+  --tb-shadow: none;
+  --ic-filter: grayscale(1) brightness(2.2) contrast(1.05);
+  --ic-filter-hover: grayscale(1) brightness(2.6) contrast(1.02);
+  /* 工具栏压在用户随便什么页面上，纯黑实底必须靠实色描边自证存在：把默认的毛玻璃、顶部渐变亮线、内白纱一并关掉 */
+  box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none;
+}
+.wrap[data-theme="fluent"]::before { display: none; }
+.wrap[data-theme="fluent"] .menu { backdrop-filter: none; -webkit-backdrop-filter: none; }
+.wrap[data-theme="fluent"] button.btn.gear:hover { background: #2e2e2e; border-color: #fff; box-shadow: none; }
+.wrap[data-theme="contrast"] {
+  --tb-text: #fff; --tb-text-hover: #fff; --tb-muted: #fff; --tb-faint: #fff; --tb-accent: #ffd400; --tb-accent2: #ffd400; --tb-gear: #ffd400;
+  --tb-border: #fff; --tb-hairline: #fff; --tb-hover: #1a1a1a; --tb-press: #333333;
+  --tb-surface: #000000; --tb-menu-surface: #000000; --tb-gear-surface: #000000; --tb-gear-border: #ffd400;
+  --tb-shadow: none;
+  /* 无障碍高对比：emoji 压成纯白单色才在纯黑底上够醒目 */
+  --ic-filter: grayscale(1) brightness(3);
+  --ic-filter-hover: grayscale(1) brightness(3.6);
+  box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none;
+  border-width: 2px;
+}
+.wrap[data-theme="contrast"]::before { display: none; }
+.wrap[data-theme="contrast"] .menu { backdrop-filter: none; -webkit-backdrop-filter: none; border-width: 2px; }
+.wrap[data-theme="contrast"] button.btn:focus-visible { box-shadow: 0 0 0 3px #ffd400; }
+.wrap[data-theme="contrast"] button.btn.gear:hover { background: #ffd400; color: #000; border-color: #ffd400; box-shadow: none; }
 @keyframes mtb-breathe { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
 .logbox {
   position: fixed; z-index: 2147483647; right: 16px; top: 96px; display: none; pointer-events: auto;

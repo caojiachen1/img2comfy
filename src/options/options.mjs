@@ -5,6 +5,7 @@ import { TOOLS, TOOL_GROUPS, DEFAULT_SETTINGS, migrateSettings, buildToolbar, fi
 import { STEPS, stepParamDefaults, stepGroups } from '../common/steps.js';
 import { CONTEXT_API_DOC, BUILTIN_SCRIPTS, ensureBuiltins } from '../common/builtin-scripts.js';
 import { uid, formatBytes } from '../common/util.js';
+import { UI_THEMES, normalizeUiTheme } from '../common/theme.js';
 import { CSS as MTB_CSS } from '../content/ui.mjs';
 import { initPanels, renderAiPanel, renderCustomPanel, renderSitesPanel, bindOutputPanel } from './panels.mjs';
 
@@ -13,6 +14,14 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const store = (obj) => new Promise((r) => chrome.storage.local.set(obj, r));
 const read = (keys) => new Promise((r) => chrome.storage.local.get(keys, r));
+
+export function applyUiTheme(v) {
+    document.documentElement.dataset.theme = normalizeUiTheme(v);
+}
+// 换肤要赶在首帧：等 main() 那次 await read() 回来再贴，用户看得见从默认皮肤跳到自己那套的闪
+try {
+    read(['mtbSettings']).then((d) => applyUiTheme(((d.mtbSettings || {}).ui || {}).theme)).catch(() => { /* 拿不到就留着 theme.css 的 :root 默认 */ });
+} catch (e) { /* 没有 chrome.storage（单测桩里）也用不着换肤 */ }
 
 let previewItems = [];
 
@@ -45,6 +54,7 @@ function scheduleSave() {
 
 // ---------------------------------------------------------------- 绑定
 const BINDINGS = [
+    ['ui.theme', 'uiTheme'],
     ['toolbar.showOn', 'showOn'], ['toolbar.showKey', 'showKey'], ['toolbar.layout', 'layout'],
     ['toolbar.iconMode', 'iconMode'], ['toolbar.theme', 'theme'], ['toolbar.anchor', 'anchor'],
     ['toolbar.offsetX', 'offsetX', 'num'], ['toolbar.offsetY', 'offsetY', 'num'],
@@ -90,6 +100,8 @@ function bindFormEvents() {
             if (kind === 'num') v = parseFloat(v) || 0;
             setPath(S.settings, path, v);
             if (path === 'toolbar.anchor') { setPath(S.settings, 'toolbar.anchorOffset', null); }
+            // 界面风格改完马上换肤：这一页自己就是预览，不用等保存回来
+            if (path === 'ui.theme') applyUiTheme(v);
             markDirty();
             syncForm();
         };
@@ -555,10 +567,14 @@ function escapeHtml(s) {
 (async function main() {
     const data = await read(['mtbSettings', 'comfyConfig']);
     S.settings = ensureBuiltins(migrateSettings(data.mtbSettings || data.comfyConfig || DEFAULT_SETTINGS));
+    applyUiTheme((S.settings.ui || {}).theme);
     if (!S.settings.tools || Object.keys(S.settings.tools).length < TOOLS.length) {
         const { defaultToolbarState } = await import('../common/registry.js');
         S.settings.tools = { ...defaultToolbarState(), ...(S.settings.tools || {}) };
     }
+    // 下拉项由 theme.js 的清单生成：手写 HTML 迟早和 CSS 里的 data-theme 对不上
+    const uiThemes = $('#uiTheme');
+    for (const t of UI_THEMES) { const o = document.createElement('option'); o.value = t.id; o.textContent = t.label; o.title = t.hint; uiThemes.appendChild(o); }
     const groups = $('#toolGroup');
     for (const g of TOOL_GROUPS) { const o = document.createElement('option'); o.value = g; o.textContent = g; groups.appendChild(o); }
     $$('#tabs button').forEach((b) => {
@@ -586,7 +602,7 @@ function escapeHtml(s) {
     renderParamEditor();
     window.addEventListener('resize', () => positionPreview());
     $('#sampleImg').addEventListener('load', () => renderPreviewToolbar());
-    document.addEventListener('visibilitychange', async () => { if (!document.hidden) { const d = await read(['mtbSettings']); if (d.mtbSettings?.version === 2 && !S.dirty) { S.settings = ensureBuiltins(migrateSettings(d.mtbSettings)); syncForm(); renderToolList(); } } });
+    document.addEventListener('visibilitychange', async () => { if (!document.hidden) { const d = await read(['mtbSettings']); if (d.mtbSettings?.version === 2 && !S.dirty) { S.settings = ensureBuiltins(migrateSettings(d.mtbSettings)); applyUiTheme((S.settings.ui || {}).theme); syncForm(); renderToolList(); } } });
     toast('设置已载入 · 改动自动保存');
 })();
 

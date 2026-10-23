@@ -1040,6 +1040,43 @@ step('退出图片面板再打开：之前勾选的三张仍然是勾选状态',
         && backB.sel.every((k) => markA.keys.includes(k)) && /已选 3/.test(backB.count)),
     { readyA, markA, backB });
 
+// —— 界面风格（主题）实测用的三条通路 ——
+// 改设置一律走后台写 mtbSettings：面板与内容脚本都靠 chrome.storage.onChanged 自己换肤，
+// 这正是用户从设置页切风格时走的同一条路，所以这里不碰任何产品代码。
+const SOLID_THEMES = ['fluent', 'fluent-dark', 'contrast'];
+const SOFT_THEMES = ['glass', 'neon'];
+const setUiTheme = (id) => cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+  s.ui=Object.assign({},s.ui,{theme:${JSON.stringify(id)}});await chrome.storage.local.set({mtbSettings:s});return true})()`);
+const alphaOf = (c) => {
+    const m = /rgba?\(([^)]+)\)/.exec(String(c || ''));
+    if (!m) return null;
+    const parts = m[1].split(/[\s,/]+/).filter(Boolean);
+    return parts.length >= 4 ? Number(parts[3]) : 1;
+};
+// 分组卡片：底色/描边/正文色三元组（钉住五档互不相同），页脚：毛玻璃（.g-group 自己不吃 backdrop-filter，
+// 面板里真带 backdrop-filter 的是页脚，所以毛玻璃这条量在页脚上，量在分组上会永远绿）
+const readPanelTheme = () => cdp.ev(gallery, `(()=>{
+  const g=document.querySelector('.g-group');
+  const foot=document.querySelector('.g-foot');
+  if(!g||!foot) return {err:'面板里没有分组或页脚'};
+  const cs=getComputedStyle(g), fs=getComputedStyle(foot), de=document.documentElement;
+  return {theme:de.dataset.theme||'', bg:cs.backgroundColor, border:cs.borderColor, color:cs.color,
+    bgi:cs.backgroundImage, blur:cs.backdropFilter||'none',
+    footBlur:(fs.backdropFilter||fs.webkitBackdropFilter||'none'), footBgi:fs.backgroundImage,
+    cols:(getComputedStyle(document.querySelector('#groups')).getPropertyValue('--cols')||'').trim(),
+    cards:document.querySelectorAll('.g-card').length, sw:de.scrollWidth, iw:innerWidth};
+})()`);
+const settleTheme = async (id) => {
+    await setUiTheme(id);
+    let row = null;
+    for (let i = 0; i < 40; i++) {
+        row = await readPanelTheme();
+        if (row && row.theme === id && !row.err) return row;
+        await wait(120);
+    }
+    return row;
+};
+
 async function runWeiboFilterChecks() {
     const filterPage = await cdp.open(`http://${PAGE_HOST}:${SITE}/nine.html?filter=1`);
     await wait(1600);
@@ -1235,6 +1272,54 @@ async function runWeiboFilterChecks() {
         !!(raceSetup === 2 && raceRes && raceRes.ok === true && Array.isArray(raceList)
             && raceList.join(',') === '9201,9202'), { raceSetup, raceRes, raceList });
 
+    // —— 右下角提示条跟随界面风格 ——
+    // 提示条画在用户页面上，吃不到扩展页的 theme.css，配色是它自带的一套 --cf-*，
+    // 所以它必须自己被贴上 data-theme；这里按后台写设置这条既有通路依次换风格再读它的实际渲染值。
+    const enableFilter = (id) => cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+      s.ui=Object.assign({},s.ui,{theme:${JSON.stringify(id)}});
+      s.weiboFilter=Object.assign({},s.weiboFilter,{enabled:true,types:{text:false}});
+      await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    const readChipTheme = () => cdp.ev(filterPage, `(()=>{
+      const host=document.getElementById('mtb-filter-chip');
+      const chip=host&&host.shadowRoot?host.shadowRoot.querySelector('.chip'):null;
+      if(!chip) return {err:'页面里没有提示条'};
+      const cs=getComputedStyle(chip);
+      return {theme:host.dataset.theme||'', hidden:!!chip.hidden, bg:cs.backgroundColor, border:cs.borderColor,
+        borderTop:cs.borderTopWidth, blur:(cs.backdropFilter||cs.webkitBackdropFilter||'none'), color:cs.color};
+    })()`).catch(() => null);
+    const settleChip = async (id) => {
+        await enableFilter(id);
+        let r = null;
+        for (let i = 0; i < 40; i++) {
+            r = await readChipTheme();
+            if (r && r.theme === id && !r.err) return r;
+            await wait(120);
+        }
+        return r;
+    };
+
+    const chipFluent = await settleChip('fluent');
+    step('换界面风格后右下角提示条的 data-theme 跟着换（它自己贴不上就等于没跟随）',
+        !!(chipFluent && chipFluent.theme === 'fluent' && chipFluent.hidden === false), chipFluent);
+    step('fluent 档提示条底色是不透明实色（半透明底压在随便什么网页上会糊成一片）',
+        !!(chipFluent && alphaOf(chipFluent.bg) === 1), chipFluent);
+    step('fluent 档提示条没有毛玻璃', !!(chipFluent && chipFluent.blur === 'none'), chipFluent);
+
+    const chipContrast = await settleChip('contrast');
+    step('contrast 档提示条描边升到 2px（列表分隔线也必须一起升，不然高对比只粗了一半）',
+        !!(chipContrast && chipContrast.borderTop === '2px'), chipContrast);
+    step('contrast 档提示条没有毛玻璃且底色不透明',
+        !!(chipContrast && chipContrast.blur === 'none' && alphaOf(chipContrast.bg) === 1), chipContrast);
+
+    const chipGlass = await settleChip('glass');
+    step('切回 glass 后提示条底色必须回到 rgba(18, 21, 28, 0.92)（钉死用户当前在用的外观）',
+        !!(chipGlass && chipGlass.bg === 'rgba(18, 21, 28, 0.92)' && /blur\(/.test(chipGlass.blur || '')), chipGlass);
+
+    await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+      s.ui=Object.assign({},s.ui,{theme:'glass'});s.weiboFilter=Object.assign({},s.weiboFilter,{enabled:false});
+      await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    await wait(300);
+
     if (filterTabId) await cdp.ev(swSess, `chrome.tabs.remove(${filterTabId}).then(()=>true)`).catch(() => { /* 关不掉就算了 */ });
     await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>Promise.all(ts.filter(t=>(t.url||'').includes('gallery.html?tabId=${filterTabId}')).map(t=>chrome.tabs.remove(t.id)))).then(()=>true)`).catch(() => { /* 关不掉就算了 */ });
 }
@@ -1250,6 +1335,40 @@ else {
     await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
       s.weiboFilter={enabled:false,image:'any',video:'any',keywordMode:'off',keywords:[]};await chrome.storage.local.set({mtbSettings:s});return true})()`);
 }
+
+// —— 面板换肤实测：五档风格必须真的画出五种不同的样子，而且不许把网格换坏 ——
+await cdp.send('Emulation.setDeviceMetricsOverride', { width: 800, height: 600, deviceScaleFactor: 1, mobile: false }, gallery);
+await cdp.ev(gallery, `dispatchEvent(new Event('resize'))`);
+await wait(900);
+const themeBase = await settleTheme('glass');
+step('面板开局就是默认风格 glass（#bootMask 揭开前必须贴好，闪一块别的皮肤用户看得见）',
+    !!(themeBase && themeBase.theme === 'glass' && themeBase.cols === '3' && !themeBase.err), themeBase);
+const themeRows = [themeBase];
+for (const id of ['fluent', 'fluent-dark', 'neon', 'contrast']) themeRows.push(await settleTheme(id));
+for (const id of SOLID_THEMES) {
+    const r = themeRows.find((x) => x && x.theme === id);
+    step('实色风格 ' + id + ' 下面板分组底色必须完全不透明（alpha 恰为 1）',
+        !!(r && alphaOf(r.bg) === 1), r);
+    step('实色风格 ' + id + ' 下面板分组不许用渐变当底',
+        !!(r && !/gradient\(/.test(r.bgi || '')), r && { bgi: r.bgi });
+    step('实色风格 ' + id + ' 下面板页脚必须关掉毛玻璃（backdrop-filter: none）',
+        !!(r && r.footBlur === 'none'), r && { footBlur: r.footBlur });
+}
+for (const id of SOFT_THEMES) {
+    const r = themeRows.find((x) => x && x.theme === id);
+    step('通透风格 ' + id + ' 的分组底色仍然是半透明或渐变（默认外观不许被偷偷抹平成实色）',
+        !!(r && (alphaOf(r.bg) < 1 || /gradient\(/.test(r.bgi || ''))), r);
+    step('通透风格 ' + id + ' 的页脚仍然带毛玻璃', !!(r && /blur\(/.test(r.footBlur || '')), r && { footBlur: r.footBlur });
+}
+const triples = themeRows.map((r) => (r ? [r.theme, r.bg, r.border, r.color].join('|') : '读不到'));
+const dupTriples = triples.filter((x, i) => triples.indexOf(x) !== i);
+step('五档风格各自读到的分组「底色/描边/正文色」三元组两两不同（有两档撞成一个样子就是没换过去）',
+    themeRows.every(Boolean) && themeRows.length === 5 && dupTriples.length === 0, { triples });
+const themeBack = await settleTheme('glass');
+step('换完一整轮回 glass：三列网格没被换肤弄坏（--cols 仍是 3、卡片数与换肤前一致、不出横向滚动）',
+    !!(themeBack && themeBack.theme === 'glass' && themeBack.cols === '3' && themeBase
+        && themeBack.cards === themeBase.cards && themeBack.cards > 0
+        && themeBack.sw <= themeBack.iw + 1), { base: themeBase && { cols: themeBase.cols, cards: themeBase.cards }, back: themeBack });
 
 const summary = dump();
 console.log('\n=== 汇总 ===\n' + JSON.stringify(summary, null, 1));

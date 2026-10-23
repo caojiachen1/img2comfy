@@ -7,6 +7,7 @@
 // 属于和虚拟列表的内部状态对打，已回退。所以现在只藏 article，空白保留 —— 稳定优先。
 
 import { matchWeiboFilter, normalizeWeiboFilter, describeWeiboFilter, filterAppliesTo } from '../common/weibo-filter.js';
+import { normalizeUiTheme } from '../common/theme.js';
 
 const POST_SEL = 'article, .card-wrap';
 const HIDDEN_ATTR = 'data-mtb-filtered';
@@ -146,46 +147,100 @@ function ensureChipHost() {
     host.id = 'mtb-filter-chip';
     host.style.cssText = 'all:initial;position:fixed;right:16px;bottom:16px;z-index:2147483646;pointer-events:none;';
     const shadow = host.attachShadow({ mode: 'open' });
+    // 提示条画在用户自己的页面上（走 Shadow DOM，吃不到扩展页的 theme.css），只能自带一套配色。
+    // :host 这组就是 glass —— 用户当前在用的样子，取值逐字节钉死，别按"看起来一样"合并。
+    // 半透明/blur/渐变只在 glass 与 neon 允许；fluent/fluent-dark/contrast 一律实色。
     shadow.innerHTML = `
       <style>
+        :host {
+          --cf-bw: 1px;
+          --cf-chip-bg: rgba(18, 21, 28, .92); --cf-chip-ink: #e8eef8; --cf-chip-border: rgba(255, 255, 255, .14);
+          --cf-chip-border-hover: rgba(255, 255, 255, .3); --cf-chip-shadow: 0 6px 20px rgba(0, 0, 0, .35); --cf-blur: blur(8px);
+          --cf-caret: #9fb0c7; --cf-x-ink: #9fb0c7; --cf-x-hover-bg: rgba(255, 255, 255, .12); --cf-x-hover-ink: #fff;
+          --cf-list-bg: rgba(18, 21, 28, .97); --cf-list-ink: #e8eef8; --cf-list-border: rgba(255, 255, 255, .14); --cf-list-shadow: 0 10px 32px rgba(0, 0, 0, .45);
+          --cf-lh-bg: rgba(18, 21, 28, .98); --cf-lh-ink: #9fb0c7; --cf-lh-line: rgba(255, 255, 255, .08); --cf-lh-strong: #e8eef8;
+          --cf-card-line: rgba(255, 255, 255, .06); --cf-card-hover-bg: rgba(255, 255, 255, .055);
+          --cf-av-bg: #222; --cf-name-ink: #cfe0f5; --cf-meta-ink: #8b97a8; --cf-txt-ink: #dbe6f6;
+          --cf-rt-bg: rgba(255, 255, 255, .05); --cf-rt-ink: #b9c6d8; --cf-pic-bg: #000; --cf-empty-ink: #8b97a8;
+        }
+        :host([data-theme="fluent"]) {
+          --cf-bw: 1px;
+          --cf-chip-bg: #ffffff; --cf-chip-ink: #1a1a1a; --cf-chip-border: #d6d6d6; --cf-chip-border-hover: #1a1a1a; --cf-chip-shadow: none; --cf-blur: none;
+          --cf-caret: #5c5c5c; --cf-x-ink: #5c5c5c; --cf-x-hover-bg: #f2f2f2; --cf-x-hover-ink: #000000;
+          --cf-list-bg: #ffffff; --cf-list-ink: #1a1a1a; --cf-list-border: #d6d6d6; --cf-list-shadow: none;
+          --cf-lh-bg: #ffffff; --cf-lh-ink: #5c5c5c; --cf-lh-line: #e5e5e5; --cf-lh-strong: #1a1a1a;
+          --cf-card-line: #d6d6d6; --cf-card-hover-bg: #f2f2f2;
+          --cf-av-bg: #efefef; --cf-name-ink: #1a1a1a; --cf-meta-ink: #5c5c5c; --cf-txt-ink: #1a1a1a;
+          --cf-rt-bg: #f0f0f0; --cf-rt-ink: #5c5c5c; --cf-pic-bg: #efefef; --cf-empty-ink: #5c5c5c;
+        }
+        :host([data-theme="fluent-dark"]) {
+          --cf-bw: 1px;
+          --cf-chip-bg: #000000; --cf-chip-ink: #f2f2f2; --cf-chip-border: #4d4d4d; --cf-chip-border-hover: #f2f2f2; --cf-chip-shadow: none; --cf-blur: none;
+          --cf-caret: #a0a0a0; --cf-x-ink: #a0a0a0; --cf-x-hover-bg: #1c1c1c; --cf-x-hover-ink: #ffffff;
+          --cf-list-bg: #000000; --cf-list-ink: #f2f2f2; --cf-list-border: #4d4d4d; --cf-list-shadow: none;
+          --cf-lh-bg: #0a0a0a; --cf-lh-ink: #a0a0a0; --cf-lh-line: #242424; --cf-lh-strong: #f2f2f2;
+          --cf-card-line: #2e2e2e; --cf-card-hover-bg: #1c1c1c;
+          --cf-av-bg: #171717; --cf-name-ink: #f2f2f2; --cf-meta-ink: #a0a0a0; --cf-txt-ink: #d0d0d0;
+          --cf-rt-bg: #1f1f1f; --cf-rt-ink: #c8c8c8; --cf-pic-bg: #000000; --cf-empty-ink: #a0a0a0;
+        }
+        :host([data-theme="neon"]) {
+          --cf-bw: 1px;
+          --cf-chip-bg: rgba(9, 16, 30, .92); --cf-chip-ink: #d9f6ff; --cf-chip-border: rgba(103, 214, 255, .35); --cf-chip-border-hover: rgba(103, 214, 255, .55); --cf-chip-shadow: 0 6px 20px rgba(0, 0, 0, .5), 0 0 16px rgba(49, 217, 255, .2); --cf-blur: blur(8px);
+          --cf-caret: #7fc6e0; --cf-x-ink: #7fc6e0; --cf-x-hover-bg: rgba(103, 214, 255, .16); --cf-x-hover-ink: #eaffff;
+          --cf-list-bg: rgba(6, 10, 20, .96); --cf-list-ink: #d9f6ff; --cf-list-border: rgba(103, 214, 255, .35); --cf-list-shadow: 0 10px 32px rgba(0, 0, 0, .55), 0 0 22px rgba(49, 217, 255, .18);
+          --cf-lh-bg: rgba(4, 8, 18, .98); --cf-lh-ink: #7fc6e0; --cf-lh-line: rgba(103, 214, 255, .2); --cf-lh-strong: #d9f6ff;
+          --cf-card-line: rgba(103, 214, 255, .14); --cf-card-hover-bg: rgba(103, 214, 255, .06);
+          --cf-av-bg: #0b1220; --cf-name-ink: #bfeeff; --cf-meta-ink: #5b93ab; --cf-txt-ink: #bfe6f5;
+          --cf-rt-bg: rgba(49, 217, 255, .1); --cf-rt-ink: #a8ecff; --cf-pic-bg: #050a14; --cf-empty-ink: #5b93ab;
+        }
+        :host([data-theme="contrast"]) {
+          --cf-bw: 2px;
+          --cf-chip-bg: #000000; --cf-chip-ink: #ffffff; --cf-chip-border: #ffffff; --cf-chip-border-hover: #ffd400; --cf-chip-shadow: none; --cf-blur: none;
+          --cf-caret: #ffffff; --cf-x-ink: #ffffff; --cf-x-hover-bg: #ffd400; --cf-x-hover-ink: #000000;
+          --cf-list-bg: #000000; --cf-list-ink: #ffffff; --cf-list-border: #ffffff; --cf-list-shadow: none;
+          --cf-lh-bg: #000000; --cf-lh-ink: #ffffff; --cf-lh-line: #ffffff; --cf-lh-strong: #ffd400;
+          --cf-card-line: #ffffff; --cf-card-hover-bg: #1a1a1a;
+          --cf-av-bg: #000000; --cf-name-ink: #ffffff; --cf-meta-ink: #ffffff; --cf-txt-ink: #ffffff;
+          --cf-rt-bg: #0d0d0d; --cf-rt-ink: #ffffff; --cf-pic-bg: #000000; --cf-empty-ink: #ffffff;
+        }
         .box { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
         .chip {
           display: flex; align-items: center; gap: 6px; padding: 7px 10px 7px 12px; border-radius: 999px;
-          background: rgba(18, 21, 28, .92); color: #e8eef8; border: 1px solid rgba(255, 255, 255, .14);
-          box-shadow: 0 6px 20px rgba(0, 0, 0, .35); font: 12px/1.4 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-          pointer-events: auto; backdrop-filter: blur(8px); cursor: pointer; user-select: none;
+          background: var(--cf-chip-bg); color: var(--cf-chip-ink); border: var(--cf-bw) solid var(--cf-chip-border);
+          box-shadow: var(--cf-chip-shadow); font: 12px/1.4 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+          pointer-events: auto; backdrop-filter: var(--cf-blur); cursor: pointer; user-select: none;
         }
         .chip[hidden] { display: none; }
-        .chip:hover { border-color: rgba(255, 255, 255, .3); }
-        .caret { color: #9fb0c7; font-size: 10px; }
-        .x { all: unset; cursor: pointer; width: 18px; height: 18px; border-radius: 50%; text-align: center; line-height: 18px; color: #9fb0c7; }
-        .x:hover { background: rgba(255, 255, 255, .12); color: #fff; }
+        .chip:hover { border-color: var(--cf-chip-border-hover); }
+        .caret { color: var(--cf-caret); font-size: 10px; }
+        .x { all: unset; cursor: pointer; width: 18px; height: 18px; border-radius: 50%; text-align: center; line-height: 18px; color: var(--cf-x-ink); }
+        .x:hover { background: var(--cf-x-hover-bg); color: var(--cf-x-hover-ink); }
         .list {
           pointer-events: auto; width: 360px; max-width: calc(100vw - 40px); max-height: 55vh; overflow: auto;
-          background: rgba(18, 21, 28, .97); color: #e8eef8; border: 1px solid rgba(255, 255, 255, .14);
-          border-radius: 12px; box-shadow: 0 10px 32px rgba(0, 0, 0, .45);
+          background: var(--cf-list-bg); color: var(--cf-list-ink); border: var(--cf-bw) solid var(--cf-list-border);
+          border-radius: 12px; box-shadow: var(--cf-list-shadow);
           font: 12px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
         }
         .list[hidden] { display: none; }
-        .lh { position: sticky; top: 0; padding: 8px 12px; color: #9fb0c7; background: rgba(18, 21, 28, .98);
-          border-bottom: 1px solid rgba(255, 255, 255, .08); }
-        .lh b { color: #e8eef8; font-weight: 600; }
-        a.card { display: block; padding: 10px 12px; color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, .06); }
-        div.card { display: block; padding: 10px 12px; border-bottom: 1px solid rgba(255, 255, 255, .06); }
-        a.card:hover { background: rgba(255, 255, 255, .055); }
+        .lh { position: sticky; top: 0; padding: 8px 12px; color: var(--cf-lh-ink); background: var(--cf-lh-bg);
+          border-bottom: var(--cf-bw) solid var(--cf-lh-line); }
+        .lh b { color: var(--cf-lh-strong); font-weight: 600; }
+        a.card { display: block; padding: 10px 12px; color: inherit; text-decoration: none; border-bottom: var(--cf-bw) solid var(--cf-card-line); }
+        div.card { display: block; padding: 10px 12px; border-bottom: var(--cf-bw) solid var(--cf-card-line); }
+        a.card:hover { background: var(--cf-card-hover-bg); }
         .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-        .av { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: none; background: #222; }
+        .av { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: none; background: var(--cf-av-bg); }
         .who { min-width: 0; }
-        .name { color: #cfe0f5; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .meta { color: #8b97a8; font-size: 11px; }
-        .txt { color: #dbe6f6; word-break: break-word; white-space: pre-wrap;
+        .name { color: var(--cf-name-ink); font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .meta { color: var(--cf-meta-ink); font-size: 11px; }
+        .txt { color: var(--cf-txt-ink); word-break: break-word; white-space: pre-wrap;
           display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden; }
-        .rt { margin-top: 6px; padding: 6px 8px; border-radius: 8px; background: rgba(255, 255, 255, .05);
-          color: #b9c6d8; font-size: 11.5px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+        .rt { margin-top: 6px; padding: 6px 8px; border-radius: 8px; background: var(--cf-rt-bg);
+          color: var(--cf-rt-ink); font-size: 11.5px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
         .pics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 7px; }
-        .pics img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 6px; background: #000; display: block; }
+        .pics img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 6px; background: var(--cf-pic-bg); display: block; }
         .pics.video img { grid-column: span 2; aspect-ratio: 16 / 9; }
-        .empty { padding: 14px 12px; color: #8b97a8; }
+        .empty { padding: 14px 12px; color: var(--cf-empty-ink); }
       </style>
       <div class="box">
         <div class="list" hidden><div class="lh">被筛选隐藏的微博 <b class="n"></b></div><div class="rows"></div></div>
@@ -198,6 +253,10 @@ function ensureChipHost() {
 export function mountWeiboFilter(settings) {
     if (!isWeiboHost()) return null;
     const shadow = ensureChipHost();
+    // 提示条跟随界面风格：贴到宿主上，靠 shadow CSS 的 :host([data-theme]) 选档。
+    // 设置页改完风格后 storage 会推回这里，已打开的页面不用刷新就能跟着换肤。
+    const applyChipTheme = (s) => { shadow.host.dataset.theme = normalizeUiTheme(((s || {}).ui || {}).theme); };
+    applyChipTheme(settings);
     const chip = shadow.querySelector('.chip');
     const textEl = shadow.querySelector('.t');
     const caret = shadow.querySelector('.caret');
@@ -401,6 +460,7 @@ export function mountWeiboFilter(settings) {
 
     return {
         apply(nextSettings) {
+            applyChipTheme(nextSettings);
             state.filter = normalizeWeiboFilter(nextSettings && nextSettings.weiboFilter);
             state.sigs = new WeakMap();
             void queueApply();

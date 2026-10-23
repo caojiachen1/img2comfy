@@ -1,5 +1,6 @@
 // 纯 JS 层的 Node 单测：不需要浏览器，直接 import src/common/*.js。
 // 用法：node test/unit_pure.mjs
+import { readFileSync } from 'node:fs';
 import { mkPx, resize, rotate, flip, crop, pad, trimBorder, place, clonePx, resolveSize } from '../src/common/imgops/geometry.js';
 import * as C from '../src/common/imgops/color.js';
 import * as F from '../src/common/imgops/filter.js';
@@ -10,6 +11,7 @@ import { buildToolbar, migrateSettings, DEFAULT_SETTINGS, TOOLS, DEFAULT_COLLAPS
 import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.js';
 import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64, bytesFingerprint, uniqueUploadName, extFromMime } from '../src/common/util.js';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial } from '../src/common/gallery.js';
+import { UI_THEMES, DEFAULT_UI_THEME, normalizeUiTheme, uiThemeLabel } from '../src/common/theme.js';
 
 let pass = 0, fail = 0;
 const notes = [];
@@ -680,6 +682,181 @@ console.log('== weibo-filter（信息流筛选判定）==');
         wf.describeWeiboFilter({ enabled: false }).includes('未启用')
         && wf.describeWeiboFilter({ ...on, types: { ...on.types, repost: false }, keywordMode: 'none', keywords: ['抽奖'] }) === '不含转发 · 不含「抽奖」'
         && wf.describeWeiboFilter(on).includes('没有条件'));
+}
+
+console.log('== theme（界面风格）==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const braceBody = (text, openIdx) => {
+        let d = 0;
+        for (let i = openIdx; i < text.length; i++) {
+            if (text[i] === '{') d++;
+            else if (text[i] === '}' && --d === 0) return text.slice(openIdx + 1, i);
+        }
+        return null;
+    };
+    const declKeys = (body) => [...String(body).matchAll(/(--[A-Za-z0-9-]+)\s*:/g)].map((x) => x[1]);
+    const keySetOf = (body) => new Set(declKeys(body));
+    const sorted = (ks) => [...ks].sort().join(',');
+
+    ok('界面风格清单恰好五档且顺序就是下拉顺序（glass 打头）',
+        UI_THEMES.length === 5 && UI_THEMES.map((t) => t.id).join(',') === 'glass,fluent,fluent-dark,neon,contrast',
+        UI_THEMES.map((t) => t.id).join(','));
+    ok('界面风格清单的 id 不许重复（重复会让下拉框出现两个同名选项）',
+        new Set(UI_THEMES.map((t) => t.id)).size === UI_THEMES.length);
+    ok('界面风格清单每项都有非空 label 与 hint（下拉框的文字和悬浮说明直接读这两个字段）',
+        UI_THEMES.every((t) => typeof t.label === 'string' && t.label.trim() === t.label
+            && typeof t.hint === 'string' && t.hint.trim() === t.hint));
+    ok('默认风格是 glass 且它就是清单第一项（theme.css 的 :root 兜底必须是同一套）',
+        DEFAULT_UI_THEME === 'glass' && UI_THEMES[0].id === 'glass');
+
+    for (const t of UI_THEMES) ok('normalizeUiTheme 认得 ' + t.id + ' 并原样返回', normalizeUiTheme(t.id) === t.id);
+    const junk = [undefined, null, 'glasss', '', 'FLUENT', ' glass', 42, {}, [], NaN, true];
+    ok('normalizeUiTheme 对认不出的输入（拼错/空串/大小写/带空格/数字/对象/数组）一律回落 glass',
+        junk.every((v) => normalizeUiTheme(v) === DEFAULT_UI_THEME),
+        junk.map((v) => String(v) + '→' + normalizeUiTheme(v)).join(' '));
+    ok('uiThemeLabel 兜底给第一项的名字，不许回 undefined 或空串',
+        junk.every((v) => uiThemeLabel(v) === UI_THEMES[0].label) && UI_THEMES.every((t) => uiThemeLabel(t.id) === t.label));
+
+    const themeCss = read('src/common/theme.css');
+    const blocks = new Map();
+    const selRe = /(^|\n)[ \t]*((?::root\s*,\s*)?html\[data-theme="([a-z-]+)"\])[ \t]*\{/g;
+    let sm;
+    while ((sm = selRe.exec(themeCss))) blocks.set(sm[3], { sel: sm[2], body: braceBody(themeCss, sm.index + sm[0].length - 1) });
+    ok('theme.css 里恰好五块 html[data-theme] 且 id 与清单一一对应（多一块少一块都算）',
+        blocks.size === UI_THEMES.length && UI_THEMES.every((t) => blocks.has(t.id)), [...blocks.keys()].join(','));
+    ok('glass 那块确实同时挂着 :root（JS 还没贴上 data-theme 时的兜底）',
+        (blocks.get('glass') || {}).sel === ':root, html[data-theme="glass"]', (blocks.get('glass') || {}).sel);
+    ok('除 glass 外的四块只挂 html[data-theme=…]，不许再蹭 :root（否则兜底会被后面那块盖掉）',
+        UI_THEMES.filter((t) => t.id !== 'glass').every((t) => blocks.get(t.id).sel === 'html[data-theme="' + t.id + '"]'),
+        UI_THEMES.map((t) => t.id + '=' + (blocks.get(t.id) || {}).sel).join(' '));
+    ok('每块内部不许重复定义同一个 token（后一条会静默盖掉前一条，看着有值其实是错的）',
+        UI_THEMES.every((t) => declKeys(blocks.get(t.id).body).length === keySetOf(blocks.get(t.id).body).size),
+        UI_THEMES.map((t) => t.id + ':' + declKeys(blocks.get(t.id).body).length + '/' + keySetOf(blocks.get(t.id).body).size).join(' '));
+    ok('每块至少 100 个 token（掉下 100 就是整块被人删过一截）',
+        UI_THEMES.every((t) => declKeys(blocks.get(t.id).body).length >= 100),
+        UI_THEMES.map((t) => t.id + '=' + declKeys(blocks.get(t.id).body).length).join(' '));
+    const glassKeys = keySetOf(blocks.get('glass').body);
+    const keyDiff = UI_THEMES.filter((t) => sorted(keySetOf(blocks.get(t.id).body)) !== sorted(glassKeys)).map((t) => {
+        const b = keySetOf(blocks.get(t.id).body);
+        return t.id + ' 缺[' + [...glassKeys].filter((k) => !b.has(k)).join(',') + '] 多[' + [...b].filter((k) => !glassKeys.has(k)).join(',') + ']';
+    });
+    ok('五块的 token 键集两两完全相等（少一个键的那个主题会去兜 :root，切过去就缺一块底色）',
+        keyDiff.length === 0, keyDiff.join(' | '));
+
+    const SOLID = ['fluent', 'fluent-dark', 'contrast'];
+    for (const id of SOLID) {
+        const body = blocks.get(id).body || '';
+        const dirty = ['rgba(', 'rgb(', 'linear-gradient', 'radial-gradient', 'gradient(', 'blur('].filter((t) => body.includes(t));
+        ok('实色主题 ' + id + ' 整块不许出现半透明/渐变/毛玻璃（--shadow: none 这种写法不算）',
+            dirty.length === 0, dirty.join(','));
+        const soft = [...body.matchAll(/(--(?:blur|glow|shadow)[A-Za-z0-9-]*)\s*:\s*([^;]*);/g)]
+            .filter((x) => x[2].trim() !== 'none').map((x) => x[1] + '=' + x[2].trim());
+        ok('实色主题 ' + id + ' 的 --blur*/--glow*/--shadow* 必须逐个写 none（漏一个就继承 glass 的毛玻璃）',
+            soft.length === 0, soft.join(','));
+    }
+    ok('默认外观不许被偷偷抹平：glass 与 neon 两块仍然各自留着半透明与毛玻璃',
+        ['glass', 'neon'].every((id) => (blocks.get(id).body || '').includes('rgba(') && (blocks.get(id).body || '').includes('blur(')));
+
+    // 只扫声明块内部：options.css 里 `#faceGallery .f {` 这类 ID 选择器长得像十六进制，混进来检测结果会既有假阳性也看不出真假阴性。
+    const valuesOnly = (css) => css.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/[^{}]*\{/g, '').replace(/[{}]/g, ' ');
+    const COLOR_RE = /#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(|\bblur\(/g;
+    const probeCss = '.x{ color:#fff; background:rgba(0,0,0,.5); border-color:rgb(1,2,3); filter:blur(4px); } #faceGallery .y{ a:#d6d6d6 }';
+    ok('颜色检测器自己必须是活的（拿一段明知有颜色的 CSS 当正对照，防止正则写废成永远 0 命中）',
+        (valuesOnly(probeCss).match(COLOR_RE) || []).join('|') === '#fff|rgba(|rgb(|blur(|#d6d6d6',
+        (valuesOnly(probeCss).match(COLOR_RE) || []).join('|'));
+    ok('颜色检测器只认声明块：同一段文本里 #faceGallery 这种 ID 选择器一个都不许算命中',
+        !valuesOnly(probeCss).includes('#faceGallery'));
+    const pageCss = { 'src/options/options.css': read('src/options/options.css'), 'src/gallery/gallery.css': read('src/gallery/gallery.css') };
+    for (const [f, raw] of Object.entries(pageCss)) {
+        const hits = valuesOnly(raw).match(COLOR_RE) || [];
+        ok(f + ' 里一个字面颜色都不许出现（颜色只能进 src/common/theme.css，漏一处切主题就花一块）',
+            hits.length === 0, hits.slice(0, 8).join(' | '));
+    }
+    ok('options.css 里那些 #faceGallery 确实是 ID 选择器而不是颜色（守的是上面那条别只靠运气绿）',
+        pageCss['src/options/options.css'].includes('#faceGallery')
+        && !(valuesOnly(pageCss['src/options/options.css']).match(/#[0-9a-fA-F]{3,8}\b/g) || []).length);
+
+    const usedKeys = new Set();
+    for (const raw of Object.values(pageCss)) for (const x of raw.matchAll(/var\(\s*(--[A-Za-z0-9-]+)/g)) usedKeys.add(x[1]);
+    const LAYOUT = ['--cols', '--header-h', '--panel-h', '--panel-w'];
+    const outside = [...usedKeys].filter((k) => !glassKeys.has(k)).sort();
+    ok('两个页面样式表里 var() 用到的 token 必须全在 theme.css 有定义，例外只能逐个点名（不许通配放过）',
+        sorted(outside) === sorted(LAYOUT), '实际豁免=[' + outside.join(',') + '] 清单=[' + LAYOUT.join(',') + ']');
+    const ownSrc = Object.values(pageCss).join('\n') + read('src/gallery/gallery.mjs') + read('src/options/options.mjs');
+    ok('被豁免的四个布局变量必须确实在别处定义过（只豁免不定义＝用到空值）',
+        LAYOUT.every((v) => ownSrc.includes(v + ':') || ownSrc.includes("'" + v + "'")),
+        LAYOUT.filter((v) => !(ownSrc.includes(v + ':') || ownSrc.includes("'" + v + "'"))).join(','));
+    ok('页面样式表真的在大批量引用 token（少于 100 个说明大部分颜色根本没走主题）',
+        usedKeys.size >= 100, 'used=' + usedKeys.size);
+
+    const chipCss = (/<style>([\s\S]*?)<\/style>/.exec(read('src/content/weibo-filter.mjs')) || [])[1] || '';
+    ok('提示条的 shadow CSS 取得到（<style> 写法改了要同步改这里）', chipCss.length > 500, 'len=' + chipCss.length);
+    const chipBlocks = new Map();
+    const cbRe = /:host(?:\(\[data-theme="([a-z-]+)"\]\))?[ \t]*\{/g;
+    let cm;
+    while ((cm = cbRe.exec(chipCss)) !== null) chipBlocks.set(cm[1] || '@base', braceBody(chipCss, cm.index + cm[0].length - 1));
+    const baseKeys = keySetOf(chipBlocks.get('@base') || '');
+    ok('除 glass 外每一档都有 :host([data-theme=…]) 块（缺一个档提示条会跟着页面一起换成玻璃）',
+        UI_THEMES.filter((t) => t.id !== 'glass').every((t) => chipBlocks.has(t.id)), [...chipBlocks.keys()].join(','));
+    const chipStray = UI_THEMES.filter((t) => t.id !== 'glass')
+        .map((t) => t.id + '=' + declKeys(chipBlocks.get(t.id)).filter((k) => !baseKeys.has(k)).join(','))
+        .filter((s) => !s.endsWith('='));
+    ok('提示条各档块里不许出现基线没有的 --cf-* 键（拼错的键会被静默忽略，切过去完全看不出）',
+        chipStray.length === 0, chipStray.join(' '));
+    const chipKeyDiff = UI_THEMES.filter((t) => t.id !== 'glass' && sorted(keySetOf(chipBlocks.get(t.id))) !== sorted(baseKeys)).map((t) => {
+        const b = keySetOf(chipBlocks.get(t.id));
+        return t.id + ' 缺[' + [...baseKeys].filter((k) => !b.has(k)).join(',') + '] 多[' + [...b].filter((k) => !baseKeys.has(k)).join(',') + ']';
+    });
+    ok('提示条各档的 --cf-* 键集与 :host 基线严格相等（缺一个键就会在那个主题下花一块，级联继承不算数）',
+        chipKeyDiff.length === 0, chipKeyDiff.join(' | '));
+    ok('contrast 档必须真的把 --cf-bw 提到 2px（不然高对比的粗描边是空的）',
+        /--cf-bw:\s*2px/.test(chipBlocks.get('contrast') || ''));
+    for (const id of SOLID) {
+        const body = chipBlocks.get(id) || '';
+        const dirty = ['rgba(', 'blur(', 'gradient('].filter((t) => body.includes(t));
+        ok('提示条 ' + id + ' 档不含半透明/毛玻璃/渐变', dirty.length === 0, dirty.join(','));
+    }
+    ok('提示条默认档（:host 基线）仍是半透明 + 毛玻璃，钉住用户当前在用的样子',
+        (chipBlocks.get('@base') || '').includes('rgba(') && (chipBlocks.get('@base') || '').includes('blur('));
+    ok('提示条列表的分隔线必须走 --cf-bw（contrast 的 2px 不许只作用一半）',
+        (chipCss.match(/border-bottom:\s*var\(--cf-bw\)\s+solid\s+var\(--cf/g) || []).length === 3
+        && !/border-bottom:\s*1px\s+solid\s+var\(--cf/.test(chipCss),
+        'var=' + (chipCss.match(/border-bottom:\s*var\(--cf-bw\)/g) || []).length + ' 死值=' + (chipCss.match(/border-bottom:\s*1px/g) || []).length);
+
+    const TB_THEMES = ['dark', 'light', 'glass', 'neon', 'fluent', 'contrast'];
+    const tbCss = (/export const CSS = `([\s\S]*?)\n`;/.exec(read('src/content/ui.mjs')) || [])[1] || '';
+    ok('ui.mjs 的工具栏 CSS 字符串取得到（模板串写法改了要同步改这里）', tbCss.length > 4000, 'len=' + tbCss.length);
+    const tbBlocks = new Map();
+    const tbRe = /\.wrap\[data-theme="([a-z-]+)"\][ \t]*\{/g;
+    let tm;
+    while ((tm = tbRe.exec(tbCss)) !== null) tbBlocks.set(tm[1], braceBody(tbCss, tm.index + tm[0].length - 1));
+    for (const id of TB_THEMES.filter((x) => x !== 'dark')) ok('工具栏 CSS 有 .wrap[data-theme="' + id + '"] 那一块', !!tbBlocks.get(id));
+    ok('工具栏 dark 是 :host 默认值，CSS 里不该再出现 .wrap[data-theme="dark"]（出现即两处定义）',
+        !tbCss.includes('.wrap[data-theme="dark"]') && /^:host\s*\{/m.test(tbCss));
+    for (const id of ['fluent', 'contrast']) {
+        const body = tbBlocks.get(id) || '';
+        ok('工具栏 ' + id + ' 档显式关掉毛玻璃', /(?:^|[\s;{])backdrop-filter\s*:\s*none/.test(body));
+        const surfLines = (body.match(/--tb-(?:surface|menu-surface|gear-surface|border|gear-border)\s*:[^;]*;/g) || []);
+        const dirty = surfLines.filter((s) => s.includes('rgba(') || s.includes('gradient('));
+        ok('工具栏 ' + id + ' 档的底/菜单面/齿轮面/描边这些 token 必须是实色', dirty.length === 0 && surfLines.length >= 4, dirty.join(' ') + ' | 命中行=' + surfLines.length);
+    }
+    const selOpts = (/<select id="theme">([\s\S]*?)<\/select>/.exec(read('options.html')) || [])[1] || '';
+    const tbVals = [...selOpts.matchAll(/value="([^"]+)"/g)].map((x) => x[1]);
+    ok('options.html 的 <select id="theme"> 选项恰好等于工具栏那六档（多一档没 CSS、少一档选不到都是 bug）',
+        sorted(tbVals) === sorted(TB_THEMES) && tbVals.length === 6, 'HTML=' + tbVals.join(','));
+    ok('界面风格下拉框不在 HTML 里写死选项（必须由 UI_THEMES 生成，否则清单与 CSS 两边会对不上）',
+        /<select id="uiTheme"><\/select>/.test(read('options.html')) && read('src/options/options.mjs').includes('for (const t of UI_THEMES)'));
+
+    ok('没有旧设置时 ui.theme 就是默认风格', migrateSettings(undefined).ui.theme === DEFAULT_UI_THEME);
+    ok('只有 toolbar.theme 的老 v2 设置要补出 ui.theme=glass，且不许把工具栏皮肤带跑',
+        (() => { const s = migrateSettings({ version: 2, toolbar: { theme: 'neon' } }); return s.ui.theme === 'glass' && s.toolbar.theme === 'neon'; })());
+    ok('已经存了 ui.theme=fluent 的设置迁移后原样保留',
+        migrateSettings({ version: 2, ui: { theme: 'fluent' } }).ui.theme === 'fluent');
+    ok('存了不认识的值时迁移不改写它，由渲染侧经 normalizeUiTheme 回落 glass',
+        (() => { const s = migrateSettings({ version: 2, ui: { theme: 'nope' } }); return s.ui.theme === 'nope' && normalizeUiTheme(s.ui.theme) === 'glass'; })());
+    ok('界面风格与工具栏皮肤是两个独立字段（改一个不许动另一个）',
+        DEFAULT_SETTINGS.ui.theme === DEFAULT_UI_THEME && DEFAULT_SETTINGS.toolbar.theme === 'dark');
 }
 
 __summary();

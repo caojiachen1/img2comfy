@@ -1,6 +1,7 @@
 // 工具目录与默认设置。工具栏按钮、设置页清单、host 分发都以本文件为唯一真值。
 
 import { DEFAULT_WEIBO_FILTER } from './weibo-filter.js';
+import { DEFAULT_UI_THEME } from './theme.js';
 
 export const ICONS = {
     copy: '📋', link: '🔗', download: '💾', open: '🗗', info: 'ℹ️', eye: '👁️',
@@ -113,6 +114,8 @@ export function defaultToolbarState() {
 
 export const DEFAULT_SETTINGS = {
     version: 2,
+    // 扩展自己页面（设置页 + 图片面板）的界面风格；跟 toolbar.theme（悬浮工具栏皮肤）互不相干
+    ui: { theme: DEFAULT_UI_THEME },
     toolbar: {
         layout: 'horizontal',        // horizontal | vertical | grid
         anchor: 'top-right',         // top-left top-right bottom-left bottom-right center top-edge bottom-edge
@@ -123,7 +126,7 @@ export const DEFAULT_SETTINGS = {
         opacity: 0.92,
         radius: 8,
         iconMode: 'both',            // icon | both | text
-        theme: 'dark',               // dark | light | glass | neon
+        theme: 'dark',               // dark | light | glass | neon | fluent | contrast
         showOn: 'hover',             // hover | always | hover-key (按住 Alt)
         showKey: 'Alt',
         hideDelay: 120,
