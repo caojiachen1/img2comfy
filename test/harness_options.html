@@ -52,6 +52,17 @@ const clickIf = (sel, label) => {
 
 // ---- 后台/宿主桩响应：够让处理函数跑到头，而不是提前 return
 Object.assign(window.__mtbStubHandlers, {
+    // 后台的 LLM 通道：把收到的请求形状留下来给断言用，应答照 OpenAI 兼容的样子回
+    llmChat: async (msg) => {
+        const body = msg.body || {};
+        window.__llmReq = {
+            url: msg.url, auth: (msg.headers || {}).authorization || '', model: body.model || '',
+            hasImage: JSON.stringify(body).indexOf('image_url') >= 0,
+            maxTokens: body.max_tokens, timeoutMs: msg.timeoutMs,
+        };
+        if (window.__llmFail) return { ok: false, status: 401, error: '密钥不对或被拒：检查设置里的 API 密钥（返回：Unauthorized）' };
+        return { ok: true, status: 200, text: '连接成功', model: body.model, usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } };
+    },
     mtbHost: async (msg) => {
         if (msg.type === 'runtime') return { ok: true, runtime: { webgpu: false, reason: 'stub 里无 GPU', device: 'wasm', hub: 'hf-mirror' } };
         if (msg.type === 'ai' && msg.task === 'cacheSummary') return { ok: true, result: { entries: [{ bytes: 12345, model: 'Xenova/stub' }], count: 1, totalText: '12.1 KB' } };
@@ -124,9 +135,34 @@ try {
     await until(() => !/探测中/.test(txt('#comfyTestOut')));
     step('测试连接（走后台代理桩）', !anyBug(txt('#comfyTestOut')) && /OK ·/.test(txt('#comfyTestOut')), { out: txt('#comfyTestOut').slice(0, 140) });
 
+    // ---- 4a″) LLM API：自检与「测试连接」现在都只调一个 HTTP 接口，不再碰多模态权重
+    const setVal = (id, v) => { const e = $(id); if (!e) return; e.value = v; e.dispatchEvent(new Event('input', { bubbles: true })); };
     clickIf('#btnAiSelfTest') && $('#btnAiSelfTest').click();
-    await until(() => /识别结果|自检失败|被预算|需要提高预算/.test(txt('#aiTestOut')));
-    step('看图说话自检（宿主返回 stub 文本）', !anyBug(txt('#aiTestOut')) && /识别结果/.test(txt('#aiTestOut')), { out: txt('#aiTestOut').slice(0, 140), hint: txt('#selfTestHint') });
+    await wait(600);
+    step('没填端点时自检不空跑：直接说清要先接 API', /先把端点填上/.test(txt('#aiTestOut')), { out: txt('#aiTestOut').slice(0, 90) });
+    setVal('#llmEndpoint', 'https://api.stub.test/v1');
+    setVal('#llmKey', 'sk-harness-secret');
+    setVal('#llmModel', 'stub-llm');
+    clickIf('#btnLlmTest') && $('#btnLlmTest').click();
+    await until(() => /通了|失败/.test(txt('#llmTestHint')), 8000);
+    const lr = window.__llmReq || {};
+    step('「测试连接」补全端点路径、密钥只进请求头、这条一次图片都不带',
+        lr.url === 'https://api.stub.test/v1/chat/completions' && lr.auth === 'Bearer sk-harness-secret'
+            && lr.model === 'stub-llm' && lr.hasImage === false && lr.maxTokens === 64 && lr.timeoutMs === 90000
+            && /通了/.test(txt('#llmTestHint')) && /连接成功/.test(txt('#llmTestOut')) && /用量 5 \+ 2 = 7/.test(txt('#llmTestOut')),
+        { lr, hint: txt('#llmTestHint'), out: txt('#llmTestOut').slice(0, 160) });
+    window.__llmFail = true;
+    $('#btnLlmTest').click();
+    await until(() => /失败/.test(txt('#llmTestHint')), 8000);
+    step('接口 401：文案说清是密钥问题、明文密钥一个字符都不出现',
+        /密钥不对或被拒/.test(txt('#llmTestOut')) && txt('#llmTestOut').indexOf('sk-harness-secret') < 0,
+        { out: txt('#llmTestOut').slice(0, 160) });
+    window.__llmFail = false;
+    clickIf('#btnAiSelfTest') && $('#btnAiSelfTest').click();
+    await until(() => /识别结果|自检失败|被预算|需要提高预算/.test(txt('#aiTestOut')), 12000);
+    step('填好端点后看图说话自检出文（宿主 stub 返回文本，全程没有模型下载）',
+        !anyBug(txt('#aiTestOut')) && /识别结果/.test(txt('#aiTestOut')) && /api\.stub\.test/.test(txt('#aiTestOut')),
+        { out: txt('#aiTestOut').slice(0, 140), hint: txt('#selfTestHint') });
 
     // ---- 4b) 运行时安装卡片：状态、文件清单、安装按钮、进度条、ModelScope 源
     const hubSel2 = $('#aiHub');
@@ -150,17 +186,19 @@ try {
 
     // ---- 4c) 模型逐个下载：每个模型一行、各自一个下载按钮与进度条
     const modelRows = $$('#modelList .m');
-    step('模型清单每个模型一行且带独立下载按钮', modelRows.length === 7 && modelRows.every((r) => !!r.querySelector('.dl') && !!r.querySelector('.mbar i')),
+    step('模型清单每个模型一行且带独立下载按钮（多模态已经下线，这里不该再有 vlm 那一行）',
+        modelRows.length === 6 && modelRows.every((r) => !!r.querySelector('.dl') && !!r.querySelector('.mbar i'))
+            && !modelRows.some((r) => r.dataset.kind === 'vlm'),
         { rows: modelRows.length, kinds: modelRows.map((r) => r.dataset.kind).join(',') });
     window.__mp = 0;
     chrome.runtime.onMessage.addListener((m) => { if (m?.action === 'mtbHostEvent' && m.type === 'modelProgress') window.__mp++; });
-    const vlmRow = $('#modelList .m[data-kind="vlm"]');
-    vlmRow && vlmRow.querySelector('.dl').click();
-    await until(() => /已下载|失败|下载失败/.test(txt('#modelList .m[data-kind="vlm"] .st')), 12000);
-    const vlmSt = txt('#modelList .m[data-kind="vlm"] .st');
+    const dlRow = $('#modelList .m[data-kind="sam"]');
+    dlRow && dlRow.querySelector('.dl').click();
+    await until(() => /已下载|失败|下载失败/.test(txt('#modelList .m[data-kind="sam"] .st')), 12000);
+    const dlSt = txt('#modelList .m[data-kind="sam"] .st');
     step('点某个模型的「下载」：该行进度条走动且状态更新（下载进度只出现在设置页）',
-        /已下载/.test(vlmSt) && window.__mp >= 2 && ($('#modelList .m[data-kind="vlm"] .mbar i') || {}).style?.width === '100%',
-        { st: vlmSt.slice(0, 70), events: window.__mp, bar: ($('#modelList .m[data-kind="vlm"] .mbar i') || {}).style?.width });
+        /已下载/.test(dlSt) && window.__mp >= 2 && ($('#modelList .m[data-kind="sam"] .mbar i') || {}).style?.width === '100%',
+        { st: dlSt.slice(0, 70), events: window.__mp, bar: ($('#modelList .m[data-kind="sam"] .mbar i') || {}).style?.width });
 
     // ---- 4d) 人脸库：空库提示 → 灌三条特征 → 出行/能删/过像提醒/阈值可改
     const { packVector } = await import('/src/common/ai/face.js');

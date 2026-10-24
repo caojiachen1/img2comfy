@@ -6,7 +6,7 @@ import { uid, formatBytes, escapeHtml as _esc } from '../common/util.js';
 import { friendlyText } from '../common/ext-state.js';
 import { STEPS } from '../common/steps.js';
 import { CONTEXT_API_DOC, BUILTIN_SCRIPTS, BUILTIN_LINKS } from '../common/builtin-scripts.js';
-import { VLM_PRESETS, resolveVlm } from '../common/ai/vlm.js';
+import { normalizeLlm, buildChatRequest, chatEndpoint } from '../common/ai/llm-api.js';
 import { SAM_PRESETS, resolveSam } from '../common/ai/sam.js';
 import { SR_PRESETS, resolveSr } from '../common/ai/sr.js';
 import { FACE_MODEL_PRESETS, FACE_EMBED_PRESETS, resolveFaceModel, resolveEmbedModel, unpackVector, cosineSim } from '../common/ai/face.js';
@@ -180,8 +180,12 @@ export function renderAiPanel(S_, helpers) {
         ['ai.enabled', 'aiEnabled', 'chk'], ['ai.device', 'aiDevice'], ['ai.dtype', 'aiDtype'],
         ['ai.maxDim', 'aiMaxDim', 'num'], ['ai.hub', 'aiHub'], ['ai.hubCustom', 'aiHubCustom'],
         ['ai.downloadBudgetMB', 'aiBudget', 'num'], ['ai.autoUnloadAfter', 'aiUnload', 'num'],
-        ['ai.vlmPrompt', 'vlmPrompt'], ['ai.askPrompt', 'askPrompt'], ['ai.faceConfidence', 'faceConfidence', 'num'],
+        ['ai.describePrompt', 'describePrompt'], ['ai.askPrompt', 'askPrompt'], ['ai.faceConfidence', 'faceConfidence', 'num'],
         ['ai.srTile', 'srTile', 'num'], ['ai.samGrid', 'samGrid', 'num'],
+        ['ai.llm.endpoint', 'llmEndpoint'], ['ai.llm.apiKey', 'llmKey'], ['ai.llm.model', 'llmModel'],
+        ['ai.llm.temperature', 'llmTemperature', 'num'], ['ai.llm.maxTokens', 'llmMaxTokens', 'num'],
+        ['ai.llm.imageMaxDim', 'llmImageDim', 'num'], ['ai.llm.imageQuality', 'llmImageQuality', 'num'],
+        ['ai.llm.timeoutSec', 'llmTimeout', 'num'],
     ];
     if (!aiTabInited) {
         aiTabInited = true;
@@ -205,6 +209,7 @@ export function renderAiPanel(S_, helpers) {
             doCacheSummary();
         };
         $('#btnAiSelfTest').onclick = doSelfTest;
+        $('#btnLlmTest').onclick = doLlmTest;
     } else {
         for (const [path, id, kind] of binds) {
             const el = $('#' + id);
@@ -250,7 +255,6 @@ function presetRow(label, presets, current, onChange, extraNote) {
 // ---------------------------------------------------------------- 模型逐个下载
 // 每个模型一行，可单独下载；下载进度只写在这里和控制台，不再挤到工具栏按钮旁边。
 const MODEL_KINDS = [
-    { kind: 'vlm', label: '多模态 · 看图说话/提问', pick: (ai) => resolveVlm(ai) },
     { kind: 'sam', label: 'SAM · 点选抠图', pick: (ai) => resolveSam(ai) },
     { kind: 'face', label: '人脸检测', pick: (ai) => resolveFaceModel(ai) },
     { kind: 'embed', label: '人脸识别（认出是谁）', pick: (ai) => resolveEmbedModel(ai) },
@@ -413,12 +417,6 @@ function renderModelSelects(S_) {
     if (!box) return;
     box.innerHTML = '';
     const ai = S_.settings.ai;
-    const vlm = presetRow('多模态模型（看图说话/提问/OCR）', VLM_PRESETS, ai.vlmPreset || 'qwen3vl-2b', (v) => { ai.vlmPreset = v; markDirty(); });
-    vlm.model.placeholder = '覆盖仓库 ID';
-    vlm.model.value = ai.vlmModel || '';
-    vlm.model.onchange = () => { ai.vlmModel = vlm.model.value.trim() || undefined; markDirty(); };
-    box.appendChild(vlm.wrap);
-
     const sam = presetRow('分割模型（抠图）', SAM_PRESETS, ai.samPreset || 'slimsam', (v) => { ai.samPreset = v; markDirty(); });
     sam.model.value = ai.samModel || ''; sam.model.onchange = () => { ai.samModel = sam.model.value.trim() || undefined; markDirty(); };
     box.appendChild(sam.wrap);
@@ -447,10 +445,33 @@ function renderModelSelects(S_) {
 
     const summary = document.createElement('p');
     summary.className = 'note';
-    const r1 = resolveVlm(ai), r2 = resolveSam(ai), r3 = resolveSr(ai);
-    summary.innerHTML = `当前生效：<code>${esc(r1.model)}</code>（${esc(r1.dtype)}）· <code>${esc(r2.model)}</code> · <code>${esc(r3.model || r3.preset.name)}</code><br>` +
-        `设备 ${esc(ai.device)}，源 ${esc(ai.hub)}，预算 ${esc(String(ai.downloadBudgetMB))}MB`;
+    const llm = normalizeLlm(ai.llm);
+    const r2 = resolveSam(ai), r3 = resolveSr(ai);
+    summary.innerHTML = `当前生效：<code>${esc(r2.model)}</code> · <code>${esc(r3.model || r3.preset.name)}</code><br>` +
+        `本地模型：设备 ${esc(ai.device)}，源 ${esc(ai.hub)}，预算 ${esc(String(ai.downloadBudgetMB))}MB<br>` +
+        `看图说话/提问/OCR：<code>${esc(llm.endpoint ? chatEndpoint(llm.endpoint) : '未填端点（这三个按钮现在还不能用）')}</code> · 模型 ${esc(llm.model)}`;
     box.appendChild(summary);
+}
+
+/** 测试连接：只发一句文本，验端点/密钥/模型名通不通，不动任何模型 */
+async function doLlmTest() {
+    const out = $('#llmTestOut'), hint = $('#llmTestHint');
+    const llm = normalizeLlm(S.settings.ai.llm);
+    if (!llm.endpoint) { out.textContent = '端点是空的：先填一个 OpenAI 兼容地址（如 https://api.deepseek.com/v1）'; hint.textContent = '没填端点'; return; }
+    hint.textContent = '请求中…';
+    out.textContent = `POST ${chatEndpoint(llm.endpoint)}\n模型 ${llm.model} · ${llm.apiKey ? '带密钥' : '不带密钥'}`;
+    const req = buildChatRequest(llm, { system: '', user: '只回答两个字：成功', imageDataUrl: '' });
+    req.body.max_tokens = Math.min(req.body.max_tokens, 64);
+    const t0 = Date.now();
+    const r = await bg({ action: 'llmChat', ...req, maskSecret: llm.apiKey });
+    if (r?.ok) {
+        hint.textContent = `通了 (${Math.round((Date.now() - t0) / 100) / 10}s)`;
+        const u = r.usage || {};
+        out.textContent += `\n应答：${r.text}` + (u.total_tokens ? `\n用量 ${u.prompt_tokens || '?'} + ${u.completion_tokens || '?'} = ${u.total_tokens} tokens` : '');
+    } else {
+        hint.textContent = '失败';
+        out.textContent += `\n\n失败：${(r && r.error) || '后台没有响应'}`;
+    }
 }
 
 async function doRuntimeProbe() {
@@ -489,14 +510,13 @@ async function doCacheSummary() {
     } catch (e) { out.textContent = '缓存统计失败: ' + e.message; }
 }
 
-// 自检：真跑一次模型（首次会下 GB 级权重，先确认）
+// 自检：画一张带文字的测试图，完整走一遍「宿主取图 → JPEG → LLM API → 应答」这条链路
 async function doSelfTest() {
     const out = $('#aiTestOut');
-    const v = resolveVlm(S.settings.ai);
-    const size = (VLM_PRESETS.find((p) => p.id === S.settings.ai.vlmPreset) || {}).bytes;
-    if (!confirm(`自检会下载并使用多模态模型：\n${v.model}\n预计首次下载约 ${formatBytes(size || 0)}（走 ${S.settings.ai.hub}）\n\n继续？`)) return;
+    const llm = normalizeLlm(S.settings.ai.llm);
+    if (!llm.endpoint) { out.textContent = '先把端点填上（上面「接 LLM API」那一栏），自检跑的是真接口调用'; toast('还没填端点', true); return; }
     const hint = $('#selfTestHint');
-    hint.textContent = '下载/推理中，进度看下面';
+    hint.textContent = '取图并请求模型中…';
     const c = document.createElement('canvas');
     c.width = 320; c.height = 200;
     const g = c.getContext('2d');
@@ -515,10 +535,14 @@ async function doSelfTest() {
     chrome.runtime.onMessage.addListener(onMsg);
     out.textContent = '';
     try {
-        const r = await hostCall('ai', { task: 'describe', dataUrl, ai: S.settings.ai, confirmBudget: v.model });
-        if (r?.blocked) { out.textContent = '被预算挡下: ' + (r.blocked.reason || ''); hint.textContent = '需要提高预算'; }
-        else if (r?.ok === false) throw new Error(r.error + (r.stack ? '\n' + r.stack : ''));
-        else { out.textContent = '识别结果:\n' + (r.text || JSON.stringify(r).slice(0, 400)); hint.textContent = `完成 (${Math.round((r.ms || 0) / 100) / 10}s)`; }
+        // 接口那边可能要几十秒，宿主消息的默认 15s 超时必须跟着设置里的超时一起放宽
+        const r = await hostCall('ai', { task: 'describe', dataUrl, ai: S.settings.ai }, Math.round(llm.timeoutSec * 1000) + 30000);
+        if (r?.ok === false) throw new Error(r.error + (r.stack ? '\n' + r.stack : ''));
+        else {
+            out.textContent = '识别结果:\n' + (r.text || JSON.stringify(r).slice(0, 400))
+                + `\n\n端点 ${chatEndpoint(llm.endpoint)}\n模型 ${r.model || llm.model}`;
+            hint.textContent = `完成 (${Math.round((r.ms || 0) / 100) / 10}s)`;
+        }
     } catch (e) {
         const friendly = friendlyText(e && e.message);
         out.textContent = '自检失败: ' + friendly + (friendly === String(e && e.message) ? '\n\n' + (e.stack || '').split('\n').slice(0, 4).join('\n') : '');

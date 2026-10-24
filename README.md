@@ -315,10 +315,10 @@ MV3 扩展页的 `script-src 'self'` 挡掉了跨源脚本与 `blob:` 模块，�
 
 ```bash
 node scripts/check-imports.mjs        # 语法 + 相对路径 + 具名导入是否存在（50+ 文件）
-node test/unit_pure.mjs              # 316 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言）
+node test/unit_pure.mjs              # 362 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言）
 node test/run_browser.mjs            # 页面级：内容脚本包 + 工具栏 + 拖拽 + 算子链 + 视频取帧
 node test/run_browser.mjs --ai       # 再加：vendor + slimSAM/swin2SR/YuNet 真实推理 + 设置页
-node test/run_browser.mjs --ai --only=sr|sam|face|vlm|script|options   # 单跑某一阶段
+node test/run_browser.mjs --ai --only=sr|sam|face|llm|script|options   # 单跑某一阶段
 node test/gallery_probe.mjs --headed --weibo-host   # 本页图片下拉面板 + 九宫格抑制 + 批量发 ComfyUI（假服务端）
 ```
 
@@ -409,8 +409,11 @@ Sobel/Scharr/Laplacian/Canny/LoG；OTSU·固定·自适应均值·Sauvola·局�
 SSIM/PSNR/MSE、帧间差、内容区测量。
 
 **AI**（`vendor/` + 浏览器内推理，可切 GPU/CPU）：
-- 看图说话 / 提问 / OCR / 标签：**Qwen3-VL-2B**（默认，`cjc1887415157/Qwen3-VL-2B-Instruct-ONNX`）
-  或 Qwen2-VL-2B / SmolVLM2-500M / SmolVLM2-256M（CPU 首选，q4 约 250MB），也可手填任意仓库 ID
+- 看图说话 / 提问 / OCR：**改成直接调你自己的 LLM API**（OpenAI 兼容的 `/chat/completions`，
+  见设置页「AI → 看图说话/提问/OCR（接 LLM API）」）。浏览器里那份 Qwen-VL 权重（q4 也要 1.4GB、
+  没 WebGPU 就慢到不可用）**已经下线，不再提供下载**：这三个按钮现在零下载、零运行时，
+  填好端点就能用。图片会先夹到 `ai.llm.imageMaxDim`（默认 1024）再转 JPEG 一起发过去
+- 标签识别 / 分类：CLIP 零样本、MobileNetV4（仍是本地推理）
 - 点选抠图 / 自动分割：**slimSAM**（约 13MB，已实测跑通）、SAM ViT-B
 - 人脸识别 / 人脸打码：**YuNet 2023mar**（232KB，已实测加载+推理+多输出解码）
 - AI 超分：**swin2SR** 系列（5–10MB，已实测 256×128 → 512×256）、或自填任意 Real-ESRGAN 类 ONNX
@@ -454,7 +457,7 @@ src/common/
   steps.js         算子注册表（参数元信息驱动设置页编辑器）
   imgops/*.js      geometry / color / filter / edge —— 纯像素实现，不依赖 canvas
   cv.js            分析与测量
-  ai/*.js          vlm / sam / face / sr / vision / ort-load / ai-env / ai-io / input
+  ai/*.js          llm-api / sam / face / sr / vision / ort-load / ai-env / ai-io / input
   builtin-scripts.js  内置自定义功能（ComfyUI 两条 + 示例）
   script-vm.js     QuickJS(wasm) 用户脚本引擎：ctx 外壳、服务轮询桥、中断时限与超时
 src/host/host.html|host.mjs   offscreen 宿主：算子链执行、AI 任务、用户脚本桥接
@@ -464,7 +467,7 @@ src/gallery/*                 采集注入函数 collect.mjs + 批量窗口逻�
 src/common/gallery.js         微博图 URL 升级/去重键/域名判定等纯函数
 vendor/                       transformers.js + onnxruntime-web + QuickJS wasm（setup-vendor.mjs 生成，已 gitignore）
 scripts/                      build-content / setup-vendor / check-imports
-test/                         unit_pure（316 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
+test/                         unit_pure（362 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
                               gallery_probe（有头，本页图片/批量发送）、cdp.mjs、旧的 run_headless + harness + cors_server
 ```
 
@@ -473,13 +476,17 @@ test/                         unit_pure（316 条）、run_browser + harness_pag
   不可用时自动退回隐藏标签页承载同一份 `host.mjs`。内容脚本只做命中探测、UI、视频取帧、结果叠加与下载。
 - 图片经后台按 `Referer` 伪装 + `host_permissions` 取回，天然避开跨域污染；视频帧沿用 v1 的降级链。
 - `ai.device` = `auto|webgpu|wasm`；WebGPU 不可用自动回落 CPU，并在设置页「检测运行时」里说明原因。
+- 看图说话/提问/OCR（`ai.llm.*`）不落进这条链：宿主页只负责取图、夹边、转 JPEG，真正的 HTTP 请求由后台
+  `llmChat` 发出（`host_permissions` 下没有 CORS 问题），所以这三个任务**不会**去装 transformers.js 运行时，
+  没下过 vendor 的机器照样能用；密钥只停在 `chrome.storage.local` + 那一次请求头里，报错文案会先把密钥抹掉再回显。
 
 ## 五、已知边界（如实记录）
 
-- 端到端验证覆盖到：316 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
-  slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）、
-  多模态也跑通了真推理（`qwen3vl-2b` q4f16 约 490s、`smolvlm2-256m` 约 146s 出答案）。
-  GB 级权重在 CPU 模式下仍然很慢，建议 GPU + `q4`；断流写坏的半截缓存会在建会话时炸成
+- 端到端验证覆盖到：362 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+  slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）。
+  **看图说话/提问/OCR 不再在这条链上**：它们改调外部 LLM API，验证换成「请求形状 + 应答取字 + 报错文案」
+  （`node test/run_browser.mjs --only=llm` 拿桩后台跑 `AiEngine`，验的是没装运行时也能出文）。
+  浏览器内的大权重推理慢是常态，本地模型仍建议 GPU + `q4`；断流写坏的半截缓存会在建会话时炸成
   protobuf/内存错误，现在会丢缓存自动重下一次。
 - 扩展页（`options.html` / `host.html`）在 **headless** CfT 里打不开（返回 `chrome-error://`），这是无头模式的限制，
   不是清单/CSP 问题：`scripts/probe-manifest.mjs` 实测 8 种 manifest 变体都能正常注册 SW、扩展能被加载。
@@ -489,7 +496,7 @@ test/                         unit_pure（316 条）、run_browser + harness_pag
 - 视频位于跨域 iframe 且画布受保护时，只能退回标签页截图（会带播放器 UI）。
 - **CSP**：MV3 的 `extension_pages` **不允许 `'unsafe-eval'`**（只允许 `'wasm-unsafe-eval'`，写 unsafe-eval 会被 Edge 直接拒绝加载扩展）。
   核对结论：`@huggingface/jinja`（聊天模板）与 transformers.js 浏览器构建里 `new Function(`、`eval(`
-  命中数均为 **0**——jinja 是 AST 解释器，不生成 JS 代码，所以**没有 unsafe-eval 时 VLM 照常可用**。
+  命中数均为 **0**——jinja 是 AST 解释器，不生成 JS 代码，所以**没有 unsafe-eval 时浏览器内模型照常可用**。
   唯一需要 eval 的是用户自定义脚本，现在改为在 wasm 里跑 QuickJS 解释器（`src/common/script-vm.js`），
   因此 manifest 里既没有 `sandbox` 页也没有放松 CSP；设置页的「语法检查」同样经宿主转发给 QuickJS 编译。
 - 在 edge://extensions 里**重载扩展之后，已经打开的网页里那份内容脚本是僵尸**（它的 runtime 端口随旧扩展一起销毁），

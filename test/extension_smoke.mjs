@@ -375,29 +375,6 @@ const custom = await cdp.ev(opt, `(async()=>{
 })()`);
 step('自定义功能面板：内置 ComfyUI 示例列出且可编辑', EXT_SKIP || !!(custom && custom.editor && custom.names.length >= 3 && custom.codeLen > 50), { custom });
 
-// ---- 多模态档位对照：小模型能出文、大模型是不是把 wasm 内存撑爆（用户报的 memory access out of bounds）
-if (process.argv.includes('--vlm')) {
-    for (const preset of (process.env.VLM_PRESETS || 'smolvlm2-256m,qwen3vl-2b').split(',')) {
-        const t0 = Date.now();
-        const r = await cdp.ev(opt, `(async()=>{
-  const d=await chrome.storage.local.get(['mtbSettings']); const s=d.mtbSettings;
-  s.ai.vlmPreset=${JSON.stringify(preset)}; s.ai.downloadBudgetMB=0; s.ai.maxDim=256;
-  await chrome.storage.local.set({mtbSettings:s});
-  const c=document.createElement('canvas'); c.width=96; c.height=64; const g=c.getContext('2d');
-  g.fillStyle='#fff'; g.fillRect(0,0,96,64); g.fillStyle='#e33'; g.beginPath(); g.arc(30,32,18,0,7); g.fill();
-  const dataUrl=c.toDataURL('image/png');
-  const res=await new Promise((resolve)=>{
-    const to=setTimeout(()=>resolve({__timeout:true}), ${Number(process.env.VLM_WAIT || 420000)});
-    chrome.runtime.sendMessage({ action:'mtbHost', type:'ai', task:'describe', ai:s.ai, dataUrl, maxNewTokens:12 },
-      (x)=>{ clearTimeout(to); resolve(chrome.runtime.lastError ? { error: chrome.runtime.lastError.message } : x); });
-  });
-  return { text: res && res.text, engine: res && res.engine, model: res && res.model, error: res && (res.error || res.message), timeout: !!res.__timeout };
-})()`);
-        step(`多模态 ${preset}：真扩展里出文而不是 wasm 崩溃/超时`, !!(r && typeof r.text === 'string' && r.text.length > 0),
-            { ms: Date.now() - t0, engine: r && r.engine, text: String((r && r.text) || '').slice(0, 50), err: r && (r.error || (r.timeout ? '超时未返回' : '')) });
-    }
-}
-
 const ai = await cdp.ev(opt, `(async()=>{
   document.querySelector('#tabs button[data-tab="ai"]').click();
   await new Promise(r=>setTimeout(r,700));

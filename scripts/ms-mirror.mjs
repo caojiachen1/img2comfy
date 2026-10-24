@@ -25,7 +25,6 @@ const ONLY = (argv.find((a) => a.startsWith('--only=')) || '').split('=')[1]?.sp
 const BIG = 300 * 1048576;         // 默认不动超过这个体积的仓库
 const MB = (n) => (n / 1048576).toFixed(1);
 
-const P = (await import('../src/common/ai/vlm.js')).VLM_PRESETS;
 const S = (await import('../src/common/ai/sam.js')).SAM_PRESETS;
 const R = (await import('../src/common/ai/sr.js')).SR_PRESETS;
 const V = await import('../src/common/ai/vision.js');
@@ -35,7 +34,6 @@ const V = await import('../src/common/ai/vision.js');
  * target（ModelScope 仓库名）。元数据（config/tokenizer/json，<8MB）全带上，缺一个 transformers.js 就起不来。
  */
 const ENTRIES = [
-    ...P.map((p) => ({ key: p.id, repo: p.model, dtypes: ['q4', 'q4f16'], kind: 'vlm' })),
     ...S.map((p) => ({ key: p.id, repo: p.model, dtypes: [p.dtype || 'q4'], kind: 'sam' })),
     ...R.filter((p) => p.model).map((p) => ({ key: p.id, repo: p.model, dtypes: ['q4', 'quantized'], kind: 'sr' })),
     ...V.TAG_PRESETS.map((p) => ({ key: p.id, repo: p.model, dtypes: [p.dtype || 'q4'], kind: 'tags' })),

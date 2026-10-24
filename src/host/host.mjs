@@ -5,6 +5,7 @@ import { bytesToBase64, base64ToBytes, dataUrlToBytes, bytesToDataUrl, sniffMime
 import { mkPx, clonePx, resize } from '../common/imgops/geometry.js';
 import { runChain, STEPS } from '../common/steps.js';
 import { AiEngine } from '../common/ai/index.js';
+import { LLM_TASKS } from '../common/ai/llm-api.js';
 import { describeRuntime } from '../common/ai-env.js';
 
 const VENDOR_BASE = chrome.runtime.getURL('vendor');
@@ -83,6 +84,12 @@ async function canvasToDataUrl(canvas) {
     return bytesToDataUrl(new Uint8Array(await blob.arrayBuffer()), 'image/png');
 }
 
+// 发给 LLM 接口的图：编码成 JPEG data URL（比 PNG 小一个数量级，消息体才不会撑爆）
+async function encodeDataUrl(px, format = 'jpg', quality = 0.85) {
+    const enc = await encodePx(px, format, quality);
+    return bytesToDataUrl(enc.bytes, enc.mime);
+}
+
 // ---------------------------------------------------------------- 用户脚本（QuickJS/wasm）
 // 不引入 manifest 的 sandbox 页、也不放松 CSP：用户代码在 wasm 内的 QuickJS 解释执行。
 // VM 与 host 之间只有同步调用 + 请求队列，避免 host 回调 Promise 与 VM 作业互相等待死锁。
@@ -142,8 +149,14 @@ async function runOpTask(req) {
 }
 
 async function runAiTask(task, req) {
-    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: routeProgress });
-    if (req.ai) { aiSettings = req.ai; await engine.prepare(req.ai); }
+    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: routeProgress, bgSend: sendBg, toImage: encodeDataUrl });
+    if (req.ai) {
+        aiSettings = req.ai;
+        engine.setAi(req.ai);
+        // 看图说话/提问/OCR 只调外部接口：没装 vendor 运行时、没下过任何模型的机器上也要能用，
+        // 所以这些任务绝不触发 prepare()（那一步才会去装 transformers.js 并探 WebGPU）
+        if (!LLM_TASKS.has(task)) await engine.prepare(req.ai);
+    }
     if (req.confirmBudget) engine.confirmBudget(req.confirmBudget);
     const acquired = req.dataUrl || req.bytesB64 || req.url ? await acquireImage(req) : null;
     const payload = { ...req, px: acquired?.px };
@@ -198,11 +211,6 @@ const HANDLERS = {
     },
     clearRuntime: async () => { const m = await import('../common/runtime-install.js'); return { ok: true, cleared: await m.clearRuntimeCache() }; },
     runtime: async (req) => { const e = await ensureEngine(req.ai); return { ok: true, runtime: e.runtime || describeRuntime() }; },
-    probeVlm: async (req) => {
-        const e = await ensureEngine(req.ai);
-        const r = await e.task('describe', { ...req, px: await acquireImage(req).then((x) => x.px) });
-        return { ok: true, ...r };
-    },
     op: runOpTask,
     ai: (req) => runAiTask(req.task, req),
     encode: async (req) => {
@@ -241,7 +249,7 @@ const HANDLERS = {
 };
 
 async function ensureEngine(ai) {
-    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: routeProgress });
+    if (!engine) engine = new AiEngine({ vendorBase: VENDOR_BASE, onEvent: (t, d) => emit(t, d), onProgress: routeProgress, bgSend: sendBg, toImage: encodeDataUrl });
     if (ai && ai !== aiSettings) { aiSettings = ai; await engine.prepare(ai); }
     return engine;
 }

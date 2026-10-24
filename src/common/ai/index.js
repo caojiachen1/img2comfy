@@ -5,7 +5,7 @@ import { mkPx, resize, clonePx } from '../imgops/geometry.js';
 import { gaussianBlur, applyToRects } from '../imgops/filter.js';
 import { STEPS, runChain } from '../steps.js';
 import { installTransformers, describeRuntime, hubBase } from '../ai-env.js';
-import { VlmRunner, resolveVlm } from './vlm.js';
+import { LLM_TASKS, normalizeLlm, buildChatRequest } from './llm-api.js';
 import { SamRunner, resolveSam } from './sam.js';
 import { SrRunner, resolveSr } from './sr.js';
 import { VisionRunner, TAG_PRESETS, DEPTH_PRESETS } from './vision.js';
@@ -15,13 +15,16 @@ import { loadOrtSession, ensureOrt, fetchModelBytes } from './ort-load.js';
 import { cacheSummary, clearCache, makeProgressFetch, guardBudget } from '../ai-io.js';
 
 export class AiEngine {
-    constructor({ vendorBase, onEvent, onProgress }) {
+    constructor({ vendorBase, onEvent, onProgress, bgSend, toImage }) {
         this.vendorBase = vendorBase;
         this.onEvent = onEvent || (() => {});
         this.onProgress = onProgress || (() => {});
+        // LLM API 的取图编码与请求都靠宿主注入：引擎本身不碰 DOM，也不该知道 chrome 消息通道
+        this.bgSend = bgSend || null;
+        this.toImage = toImage || null;
         this.ai = null;
         this.tf = null;
-        this.vlm = null; this.sam = null; this.sr = null; this.vision = null;
+        this.sam = null; this.sr = null; this.vision = null;
         this.faceSession = null;
         this.embedSession = null;
         this.busy = null;
@@ -29,6 +32,9 @@ export class AiEngine {
         this.warmFor = null;   // 进度事件要能归到具体模型，设置页才知道刷哪一行
         this.lastUse = 0;
     }
+
+    /** 只记住设置；装 transformers.js 是 prepare() 的事（纯 API 任务不需要运行时） */
+    setAi(ai) { this.ai = ai || {}; }
 
     async prepare(ai) {
         this.ai = ai;
@@ -51,7 +57,7 @@ export class AiEngine {
     // 假图当然认不出东西，所以只有「下载类」错误算失败，推理跑挂只当警告。
     async warm(payload = {}) {
         const kind = payload.kind || 'face';
-        const map = { vlm: 'describe', sam: 'samPick', sr: 'superResolve', face: 'face', embed: 'recognize', tags: 'tags', depth: 'depth' };
+        const map = { sam: 'samPick', sr: 'superResolve', face: 'face', embed: 'recognize', tags: 'tags', depth: 'depth' };
         const task = map[kind] || kind;
         const side = 64;
         const px = mkPx(side, side);
@@ -79,7 +85,8 @@ export class AiEngine {
     }
 
     async task(name, payload = {}) {
-        if (!this.tf) await this.prepare(this.ai || payload.ai || {});
+        // LLM 那三个任务只要设置里有端点就能跑：不装 transformers.js，没有 WebGPU、没下过运行时的机器也照样用
+        if (!LLM_TASKS.has(name) && !this.tf) await this.prepare(this.ai || payload.ai || {});
         this.lastUse = Date.now();
         this.taskKind = name;
         const px = payload.px;
@@ -107,14 +114,56 @@ export class AiEngine {
         }
     }
 
-    async ensureVlm() {
-        const r = resolveVlm(this.ai);
-        const budget = await this.checkBudget(r.preset.bytes, r.model);
-        if (!budget.ok) return { blocked: budget };
-        if (!this.vlm || this.vlm.modelId !== r.model) {
-            this.vlm = new VlmRunner({ tf: this.tf, device: this.device, dtype: r.dtype || this.dtype, modelId: r.model, vendorBase: this.vendorBase, progress: (p) => this.progress('下载 ' + short(r.model), p?.loaded || 0, p?.total || 0, p?.url || ''), onEvent: this.onEvent });
-        }
-        return { runner: this.vlm, resolved: r };
+    // 看图说话 / 提问 / OCR 全走外部 LLM API：不再下多模态权重，也不参与下载预算。
+    async callLlm(px, { system, user, maxNewTokens }) {
+        const llm = normalizeLlm(this.ai?.llm);
+        if (!llm.endpoint) throw new Error('还没接 LLM API：在设置页「AI」里填端点（要鉴权的再填密钥）');
+        if (!this.toImage || !this.bgSend) throw new Error('宿主没接上（取图或发消息的通道缺失）');
+        // 送进接口的图单独一个上限：base64 太长会把消息体撑爆，而多模态模型自己也会先缩图
+        const side = Math.max(px.width, px.height);
+        const cap = llm.imageMaxDim;
+        const mpx = side > cap
+            ? resize(px, Math.max(1, Math.round(px.width * cap / side)), Math.max(1, Math.round(px.height * cap / side)), 'lanczos3')
+            : px;
+        this.progress('取图编码');
+        const imageDataUrl = await this.toImage(mpx, 'jpg', llm.imageQuality);
+        const req = buildChatRequest(llm, { system, user, imageDataUrl });
+        const want = toInt(maxNewTokens || 0, 0);
+        if (want) req.body.max_tokens = clamp(want, 16, 8192);
+        this.progress('等待模型回答');
+        const t0 = Date.now();
+        const r = await this.bgSend({ action: 'llmChat', ...req, maskSecret: llm.apiKey });
+        if (!r || !r.ok) throw new Error((r && r.error) || 'LLM 接口没有响应');
+        this.progress('完成');
+        return { text: r.text, ms: Date.now() - t0, model: r.model || llm.model, usage: r.usage };
+    }
+
+    async runDescribe(px, payload) {
+        return this.callLlm(px, {
+            system: LLM_SYSTEM,
+            user: payload.prompt || this.ai?.describePrompt || DEFAULT_DESCRIBE_PROMPT,
+            maxNewTokens: payload.maxNewTokens,
+        });
+    }
+
+    async runAsk(px, payload) {
+        const q = String(payload.question || '').trim();
+        if (!q) throw new Error('问题是空的');
+        const r = await this.callLlm(px, {
+            system: LLM_SYSTEM,
+            user: (this.ai?.askPrompt || '{question}').replace('{question}', q),
+            maxNewTokens: payload.maxNewTokens,
+        });
+        return { text: r.text, ms: r.ms, model: r.model };
+    }
+
+    async runOcr(px) {
+        const r = await this.callLlm(px, {
+            system: LLM_SYSTEM,
+            user: '只输出图片里出现的文字，逐行照抄，不要翻译、不要解释。没有文字就只输出 NONE。',
+            maxNewTokens: 600,
+        });
+        return { text: /^NONE\s*$/u.test(r.text.trim()) ? '（图中无文字）' : r.text, ms: r.ms, model: r.model };
     }
 
     async checkBudget(bytes, modelId) {
@@ -129,36 +178,6 @@ export class AiEngine {
         if (modelId === true) { this.confirmedAll = true; return; }
         this.confirmed = this.confirmed || {};
         this.confirmed[modelId] = true;
-    }
-
-    async runDescribe(px, payload) {
-        const e = await this.ensureVlm();
-        if (e.blocked) return { text: '', blocked: e.blocked };
-        const { px: mpx } = this.normalizeForModel(px);
-        this.progress('推理中');
-        const t0 = Date.now();
-        const r = await e.runner.describe(mpx, { prompt: payload.prompt || this.ai?.vlmPrompt, maxNewTokens: toInt(payload.maxNewTokens || 200, 200) });
-        this.progress('完成');
-        return { text: r.text, ms: Date.now() - t0, engine: r.engine, model: e.resolved.model };
-    }
-
-    async runAsk(px, payload) {
-        const e = await this.ensureVlm();
-        if (e.blocked) return { text: '', blocked: e.blocked };
-        const q = String(payload.question || '').trim();
-        if (!q) throw new Error('问题是空的');
-        const { px: mpx } = this.normalizeForModel(px);
-        this.progress('推理中');
-        const r = await e.runner.ask(mpx, (this.ai?.askPrompt || '{question}').replace('{question}', q), { maxNewTokens: toInt(payload.maxNewTokens || 128, 128) });
-        return { text: r.text, ms: r.ms, model: e.resolved.model };
-    }
-
-    async runOcr(px, payload) {
-        const e = await this.ensureVlm();
-        if (e.blocked) return { text: '', blocked: e.blocked };
-        const { px: mpx } = this.normalizeForModel(px);
-        const r = await e.runner.ocr(mpx, { maxNewTokens: toInt(payload.maxNewTokens || 220, 220) });
-        return { text: r.text, ms: r.ms, model: e.resolved.model };
     }
 
     async runTags(px, payload) {
@@ -339,7 +358,6 @@ export class AiEngine {
     }
 
     unload(keep = []) {
-        if (!keep.includes('vlm')) this.vlm = null;
         if (!keep.includes('sam')) this.sam = null;
         if (!keep.includes('sr')) this.sr = null;
         if (!keep.includes('vision')) this.vision = null;
@@ -350,7 +368,8 @@ export class AiEngine {
     }
 }
 
-function short(id) { return String(id).split('/').pop(); }
+const LLM_SYSTEM = '你是图像理解助手。只输出结论内容，不要复述问题。使用简体中文回答。';
+const DEFAULT_DESCRIBE_PROMPT = '请用中文详细描述这张图片：主体、场景、风格、构图，以及画面中所有可读文字。';
 
 const DEFAULT_CANDIDATES = ['人像 selfie', '风景 landscape', '食物 food', '动物 animal', '建筑 building', '城市 street', '汽车 car', '电子产品 device', '截图 screenshot', '插画 illustration', '文档 document', '动漫 anime', '图表 chart', '商品 product', '运动 sports', '艺术 artwork'];
 

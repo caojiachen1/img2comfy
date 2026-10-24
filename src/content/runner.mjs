@@ -7,6 +7,7 @@ import { runChain, STEPS } from '../common/steps.js';
 import { resize as resizePx, mkPx } from '../common/imgops/geometry.js';
 import { toast, drawBoxes, drawMask, promptFor, ResultPanel, ROOT_ID } from './ui.mjs';
 import { extAlive, friendlyError, DEAD_TEXT } from '../common/ext-state.js';
+import { LLM_TASKS, normalizeLlm } from '../common/ai/llm-api.js';
 
 // 上下文失效时不加「XX失败: 」前缀，直接把那句完整指令给用户
 const errText = (prefix, e) => { const f = friendlyError(e); return f.dead ? f.text : prefix + f.text; };
@@ -467,7 +468,18 @@ export class Runner {
             return;
         }
         try {
-            this.ctx.setStatus?.('准备模型…');
+            // 看图说话/提问/OCR 现在只是「把图发给一个 HTTP 接口」：没填端点就别去敲宿主，直接说清去哪儿配
+            if (LLM_TASKS.has(task) && !normalizeLlm(this.s.ai?.llm).endpoint) {
+                this.ctx.setStatus?.('');
+                this.ctx.panel.show({
+                    title: '还没接 LLM API',
+                    text: '「看图说话 / AI 提问 / OCR 读字」是把你设置的 OpenAI 兼容接口（端点 + 密钥 + 模型名）。\n设置 → AI → 看图说话/提问/OCR（接 LLM API）。',
+                    near: this.ctx.toolbar?.currentTarget,
+                    actions: [{ label: '打开设置', run: () => bgSend({ action: 'openOptions' }) }],
+                });
+                return;
+            }
+            this.ctx.setStatus?.(LLM_TASKS.has(task) ? '发给模型…' : '准备模型…');
             if (task === 'ask') {
                 const q = await promptFor(this.ctx.shadow, { title: '问点什么？（Enter 发送，Shift+Enter 换行）', placeholder: '例如：图里的人在做什么？', near: this.ctx.toolbar?.currentTarget });
                 if (!q) { this.ctx.setStatus?.(''); return; }
@@ -481,14 +493,14 @@ export class Runner {
             if (task === 'samPick') { this.startSamPick(); return; }
             const src = await this.currentSource();
             if (task === 'faceRegister') { await this.registerFace(src); return; }
-            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : task === 'recognize' ? '识别中…' : 'AI 推理中…');
+            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : task === 'recognize' ? '识别中…' : LLM_TASKS.has(task) ? '等待模型回答…' : 'AI 推理中…');
             const r = await this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, gallery: this.s.faceGallery || [], maxNewTokens: item.params?.maxNewTokens });
             this.ctx.setStatus?.('');
             if (r.blocked) {
                 this.ctx.panel.show({
                     title: '需要确认下载',
                     text: r.blocked.reason,
-                    actions: [{ label: '确认下载并执行', run: () => this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, confirmBudget: this.s.ai.vlm || true }).then((x) => this.applyAiResult(item, x)) }],
+                    actions: [{ label: '确认下载并执行', run: () => this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, confirmBudget: true }).then((x) => this.applyAiResult(item, x)) }],
                 });
                 return;
             }

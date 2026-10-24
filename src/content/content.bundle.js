@@ -1938,9 +1938,9 @@ __M["src/common/ext-state.js"] = (function(){
 
 const DEAD_TEXT = '扩展已更新，本页面里的旧脚本已失效：请按 F5 刷新页面后再用';
 
-// wasm 是 32 位地址空间，浏览器里一份 1.3GB 的权重 + 激活值就会越界，
+// wasm 是 32 位地址空间，浏览器里一份大权重 + 激活值就会越界，
 // ORT 崩出来只有一句 "memory access out of bounds"，用户看不出跟模型大小有关。
-const MEMORY_TEXT = '浏览器内存放不下这个模型（wasm 只有 4GB 地址空间）：请在设置里换小一点的模型/档位（如 SmolVLM2-256M/500M、q4），或改用 WebGPU 设备';
+const MEMORY_TEXT = '浏览器内存放不下这个模型（wasm 只有 4GB 地址空间）：请在设置里换小一点的模型/档位（如 q4），或改用 WebGPU 设备';
 
 const DEAD_RE = /Extension context invalidated|extension context has been invalidated|Could not establish connection\. Receiving end does not exist|message port closed|Cannot access a chrome-extension: URL of a different extension/i;
 const MEMORY_RE = /memory access out of bounds|out of memory|Aborted\(|RuntimeError: memory|Cannot allocate memory|too many bytes/i;
@@ -4519,6 +4519,142 @@ function stepGroups() {
 
 return { "P": (typeof P === 'undefined' ? undefined : P), "STEPS": (typeof STEPS === 'undefined' ? undefined : STEPS), "normalizeChain": (typeof normalizeChain === 'undefined' ? undefined : normalizeChain), "runChain": (typeof runChain === 'undefined' ? undefined : runChain), "stepParamDefaults": (typeof stepParamDefaults === 'undefined' ? undefined : stepParamDefaults), "stepLabel": (typeof stepLabel === 'undefined' ? undefined : stepLabel), "stepGroups": (typeof stepGroups === 'undefined' ? undefined : stepGroups), "clamp": (typeof clamp === 'undefined' ? undefined : clamp) };
 })();
+__M["src/common/ai/llm-api.js"] = (function(){
+// 多模态「看图说话 / 提问 / OCR」现在完全走外部 LLM API（OpenAI 兼容的 /chat/completions）。
+// 浏览器里跑不动那份 1.4GB 权重，也不再让用户下模型：这里只管三件事——
+// 把端点写成什么样子都能用、请求体形状对不对、应答里那段文字怎么取出来。
+
+const { clamp, toInt, toNum } = __M["src/common/util.js"];
+
+const LLM_DEFAULTS = {
+    endpoint: '',
+    apiKey: '',
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    maxTokens: 512,
+    // 送进 API 的图先夹到这个最长边再转 JPEG：base64 太长会把消息体撑爆，而多模态模型本来就先缩图
+    imageMaxDim: 1024,
+    imageQuality: 0.85,
+    timeoutSec: 90,
+};
+
+const MAX_TOKENS_LIMIT = 8192;
+const TIMEOUT_LIMIT = [5, 600];
+
+/** 这三个 AI 任务只调外部接口，不需要 transformers.js 运行时，也不该触发模型下载 */
+const LLM_TASKS = new Set(['describe', 'ask', 'ocr']);
+
+function normalizeLlm(raw) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const sec = toNum(src.timeoutSec, LLM_DEFAULTS.timeoutSec);
+    return {
+        endpoint: String(src.endpoint || '').trim(),
+        // 密钥留不留空格是常见误填；Bearer 后面也不许重复带
+        apiKey: String(src.apiKey || '').trim().replace(/^Bearer\s+/i, ''),
+        model: String(src.model || '').trim() || LLM_DEFAULTS.model,
+        temperature: clamp(toNum(src.temperature, LLM_DEFAULTS.temperature), 0, 2),
+        maxTokens: clamp(toInt(src.maxTokens, LLM_DEFAULTS.maxTokens), 16, MAX_TOKENS_LIMIT),
+        imageMaxDim: clamp(toInt(src.imageMaxDim, LLM_DEFAULTS.imageMaxDim), 256, 4096),
+        imageQuality: clamp(toNum(src.imageQuality, LLM_DEFAULTS.imageQuality), 0.4, 1),
+        timeoutSec: clamp(sec, TIMEOUT_LIMIT[0], TIMEOUT_LIMIT[1]),
+    };
+}
+
+/** 端点只填到主机名或 /v1 也能用；已经写全 chat/completions 的原样不动 */
+function chatEndpoint(input) {
+    const s = String(input || '').trim().replace(/\/+$/, '');
+    if (!s) return '';
+    if (/\/chat\/completions$/i.test(s)) return s;
+    let withProto = s;
+    if (!/^https?:\/\//i.test(withProto)) withProto = 'https://' + withProto;
+    let u;
+    try { u = new URL(withProto); } catch (e) { return s; }
+    const path = u.pathname.replace(/\/+$/, '');
+    if (!path || path === '/') u.pathname = '/v1/chat/completions';
+    else u.pathname = path + '/chat/completions';
+    return u.toString();
+}
+
+/** 没密钥也能跑：本机 Ollama / LM Studio / vLLM 这类默认不开鉴权 */
+function llmReady(llm) {
+    const l = normalizeLlm(llm);
+    return !!l.endpoint;
+}
+
+function buildChatRequest(llmRaw, { system, user, imageDataUrl }) {
+    const llm = normalizeLlm(llmRaw);
+    const content = [];
+    if (imageDataUrl) content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
+    content.push({ type: 'text', text: String(user || '') });
+    const messages = [];
+    if (system) messages.push({ role: 'system', content: String(system) });
+    messages.push({ role: 'user', content });
+    return {
+        url: chatEndpoint(llm.endpoint),
+        headers: {
+            'content-type': 'application/json',
+            ...(llm.apiKey ? { authorization: 'Bearer ' + llm.apiKey } : {}),
+        },
+        body: {
+            model: llm.model,
+            messages,
+            temperature: llm.temperature,
+            max_tokens: llm.maxTokens,
+            stream: false,
+        },
+        timeoutMs: Math.round(llm.timeoutSec * 1000),
+        model: llm.model,
+    };
+}
+
+function joinParts(c) {
+    if (typeof c === 'string') return c;
+    if (!Array.isArray(c)) return '';
+    return c.map((p) => (typeof p === 'string' ? p : String((p && (p.text || p.content)) || ''))).join('');
+}
+
+/** OpenAI 兼容应答里文字可能出现的位置有好几种，逐个试；全空就报「应答里没有文字」 */
+function parseChatReply(json) {
+    const j = json && typeof json === 'object' ? json : {};
+    const choice = Array.isArray(j.choices) ? j.choices[0] : null;
+    const msg = choice && (choice.message || choice.delta);
+    let text = '';
+    if (msg) text = joinParts(msg.content);
+    if (!text && choice && typeof choice.text === 'string') text = choice.text;
+    if (!text && typeof j.output_text === 'string') text = j.output_text;
+    if (!text && Array.isArray(j.results)) text = joinParts(j.results);
+    return {
+        text: String(text || '').trim(),
+        model: j.model || (msg && msg.model) || '',
+        usage: j.usage || null,
+        finish: (choice && choice.finish_reason) || '',
+    };
+}
+
+const clip = (t, n = 180) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+/** 把 HTTP 状态码翻译成「下一步该改哪里」，而不是只甩一个 401 */
+function llmErrorText(status, payload) {
+    const body = clip(payload, 200);
+    const hint = body ? '（返回：' + body + '）' : '';
+    if (status === 401 || status === 403) return '密钥不对或被拒：检查设置里的 API 密钥' + hint;
+    if (status === 404) return '端点或模型名不存在：检查端点路径与模型名（本机服务要先跑起来）' + hint;
+    if (status === 429) return '被限流了：稍后再试，或把并发/额度调低' + hint;
+    if (status === 400) return '请求被拒（多半是模型不支持图片或 max_tokens 超限）' + hint;
+    if (status >= 500) return '服务端出错 ' + status + hint;
+    return 'HTTP ' + status + hint;
+}
+
+/** 出错时把密钥从任何日志/回显里抹掉 */
+function redactKey(text, apiKey) {
+    const s = String(text || '');
+    const k = String(apiKey || '').trim();
+    if (!k) return s;
+    return s.split(k).join('***');
+}
+
+return { "LLM_DEFAULTS": (typeof LLM_DEFAULTS === 'undefined' ? undefined : LLM_DEFAULTS), "LLM_TASKS": (typeof LLM_TASKS === 'undefined' ? undefined : LLM_TASKS), "normalizeLlm": (typeof normalizeLlm === 'undefined' ? undefined : normalizeLlm), "chatEndpoint": (typeof chatEndpoint === 'undefined' ? undefined : chatEndpoint), "llmReady": (typeof llmReady === 'undefined' ? undefined : llmReady), "buildChatRequest": (typeof buildChatRequest === 'undefined' ? undefined : buildChatRequest), "parseChatReply": (typeof parseChatReply === 'undefined' ? undefined : parseChatReply), "llmErrorText": (typeof llmErrorText === 'undefined' ? undefined : llmErrorText), "redactKey": (typeof redactKey === 'undefined' ? undefined : redactKey) };
+})();
 __M["src/content/runner.mjs"] = (function(){
 // 工具执行分发：内置能力（内容脚本本地做）、算子链与 AI（宿主页面做）、
 // 用户脚本（宿主里的 QuickJS 解释执行）、链接型工具（模板替换后开标签/POST）。
@@ -4529,6 +4665,7 @@ const { runChain, STEPS } = __M["src/common/steps.js"];
 const { resize: resizePx, mkPx } = __M["src/common/imgops/geometry.js"];
 const { toast, drawBoxes, drawMask, promptFor, ResultPanel, ROOT_ID } = __M["src/content/ui.mjs"];
 const { extAlive, friendlyError, DEAD_TEXT } = __M["src/common/ext-state.js"];
+const { LLM_TASKS, normalizeLlm } = __M["src/common/ai/llm-api.js"];
 
 // 上下文失效时不加「XX失败: 」前缀，直接把那句完整指令给用户
 const errText = (prefix, e) => { const f = friendlyError(e); return f.dead ? f.text : prefix + f.text; };
@@ -4989,7 +5126,18 @@ class Runner {
             return;
         }
         try {
-            this.ctx.setStatus?.('准备模型…');
+            // 看图说话/提问/OCR 现在只是「把图发给一个 HTTP 接口」：没填端点就别去敲宿主，直接说清去哪儿配
+            if (LLM_TASKS.has(task) && !normalizeLlm(this.s.ai?.llm).endpoint) {
+                this.ctx.setStatus?.('');
+                this.ctx.panel.show({
+                    title: '还没接 LLM API',
+                    text: '「看图说话 / AI 提问 / OCR 读字」是把你设置的 OpenAI 兼容接口（端点 + 密钥 + 模型名）。\n设置 → AI → 看图说话/提问/OCR（接 LLM API）。',
+                    near: this.ctx.toolbar?.currentTarget,
+                    actions: [{ label: '打开设置', run: () => bgSend({ action: 'openOptions' }) }],
+                });
+                return;
+            }
+            this.ctx.setStatus?.(LLM_TASKS.has(task) ? '发给模型…' : '准备模型…');
             if (task === 'ask') {
                 const q = await promptFor(this.ctx.shadow, { title: '问点什么？（Enter 发送，Shift+Enter 换行）', placeholder: '例如：图里的人在做什么？', near: this.ctx.toolbar?.currentTarget });
                 if (!q) { this.ctx.setStatus?.(''); return; }
@@ -5003,14 +5151,14 @@ class Runner {
             if (task === 'samPick') { this.startSamPick(); return; }
             const src = await this.currentSource();
             if (task === 'faceRegister') { await this.registerFace(src); return; }
-            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : task === 'recognize' ? '识别中…' : 'AI 推理中…');
+            this.ctx.setStatus?.(task === 'superResolve' ? '超分中…' : task === 'faceBlur' ? '打码中…' : task === 'recognize' ? '识别中…' : LLM_TASKS.has(task) ? '等待模型回答…' : 'AI 推理中…');
             const r = await this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, gallery: this.s.faceGallery || [], maxNewTokens: item.params?.maxNewTokens });
             this.ctx.setStatus?.('');
             if (r.blocked) {
                 this.ctx.panel.show({
                     title: '需要确认下载',
                     text: r.blocked.reason,
-                    actions: [{ label: '确认下载并执行', run: () => this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, confirmBudget: this.s.ai.vlm || true }).then((x) => this.applyAiResult(item, x)) }],
+                    actions: [{ label: '确认下载并执行', run: () => this.sendToHost({ type: 'ai', task, ...src, ai: this.s.ai, confirmBudget: true }).then((x) => this.applyAiResult(item, x)) }],
                 });
                 return;
             }
@@ -5663,10 +5811,10 @@ const TOOLS = [
     { id: 'regions', group: '分析', label: '连通域', icon: '🧩', media: ['image'], action: { type: 'step', chain: [{ op: 'regions', params: { threshold: 128, minArea: 120 } }] } },
 
     // —— AI ——
-    { id: 'ai-describe', group: 'AI', label: '看图说话', icon: ICONS.ask, media: ['image', 'video'], ai: 'describe', action: { type: 'ai', task: 'describe' }, needsHost: true, hint: '多模态模型生成画面描述' },
-    { id: 'ai-ask', group: 'AI', label: 'AI 提问', icon: '❓', media: ['image', 'video'], ai: 'ask', action: { type: 'ai', task: 'ask' }, needsHost: true, hint: '弹出输入框，把问题连同图片发给多模态模型' },
+    { id: 'ai-describe', group: 'AI', label: '看图说话', icon: ICONS.ask, media: ['image', 'video'], ai: 'describe', action: { type: 'ai', task: 'describe' }, needsHost: true, hint: '把图发给你接的 LLM API，让它生成画面描述' },
+    { id: 'ai-ask', group: 'AI', label: 'AI 提问', icon: '❓', media: ['image', 'video'], ai: 'ask', action: { type: 'ai', task: 'ask' }, needsHost: true, hint: '弹出输入框，把问题连同图片发给 LLM API' },
     { id: 'ai-tags', group: 'AI', label: '标签识别', icon: ICONS.tag, media: ['image'], ai: 'tags', action: { type: 'ai', task: 'tags' }, needsHost: true },
-    { id: 'ai-ocr', group: 'AI', label: 'OCR 读字', icon: '🔤', media: ['image', 'video'], ai: 'ocr', action: { type: 'ai', task: 'ocr' }, needsHost: true },
+    { id: 'ai-ocr', group: 'AI', label: 'OCR 读字', icon: '🔤', media: ['image', 'video'], ai: 'ocr', action: { type: 'ai', task: 'ocr' }, needsHost: true, hint: '照抄图里的文字，走的也是 LLM API' },
     { id: 'ai-sam', group: 'AI', label: '点选抠图', icon: ICONS.sam, media: ['image'], ai: 'sam', action: { type: 'ai', task: 'samPick' }, needsHost: true, hint: '进入取点模式，在图上点击目标生成遮罩' },
     { id: 'ai-sam-auto', group: 'AI', label: '自动分割', icon: '🪄', media: ['image'], ai: 'samauto', action: { type: 'ai', task: 'samAuto' }, needsHost: true },
     { id: 'ai-face', group: 'AI', label: '人脸识别', icon: ICONS.face, media: ['image', 'video'], ai: 'face', action: { type: 'ai', task: 'face' }, needsHost: true },
@@ -5778,12 +5926,23 @@ const DEFAULT_SETTINGS = {
         keepAwake: true,
         downloadBudgetMB: 4096,
         autoUnloadAfter: 0,
-        vlmPreset: 'qwen3vl-2b',
+        // 看图说话 / 提问 / OCR 一律走外部 LLM API（OpenAI 兼容的 /chat/completions）。
+        // 浏览器里那份 1.4GB 多模态权重已经下线：不再有 vlmPreset，也不再提供该模型下载。
+        llm: {
+            endpoint: '',            // 填到主机名或 /v1 都行，会自动补成 …/chat/completions
+            apiKey: '',              // 本机 Ollama / LM Studio 这类可以留空
+            model: 'gpt-4o-mini',
+            temperature: 0.2,
+            maxTokens: 512,
+            imageMaxDim: 1024,       // 送进接口的图先夹到这个最长边再转 JPEG
+            imageQuality: 0.85,
+            timeoutSec: 90,
+        },
         samPreset: 'slimsam',
         srPreset: 'swin2sr-x2',
         tagsPreset: 'clip-zero-shot',
         depthPreset: 'depth-anything-small',
-        vlmPrompt: '请用中文详细描述这张图片的主体、场景、风格、构图与可见文字。',
+        describePrompt: '请用中文详细描述这张图片的主体、场景、风格、构图与可见文字。',
         askPrompt: '{question}',
         samPointsPerTarget: 1,
         faceModel: 'scrfd-500m',
@@ -5852,6 +6011,13 @@ function migrateSettings(raw) {
         return s;
     }
     const out = mergeDeep(s, raw);
+    // 多模态权重已经下线：老设置里的 vlmPreset/vlmModel/vlmDtype 没有对应功能了，直接摘掉；
+    // 但用户自己改过的「看图说话」提示词要接着用（换了个名字存到 describePrompt）
+    if (out.ai) {
+        const old = out.ai.vlmPrompt;
+        if (typeof old === 'string' && old.trim() && old !== DEFAULT_SETTINGS.ai.describePrompt) out.ai.describePrompt = old;
+        for (const k of ['vlmPrompt', 'vlmPreset', 'vlmModel', 'vlmDtype']) delete out.ai[k];
+    }
     // 老设置的 tools 里每个 id 都写死了 collapsed:false，会把新默认（视频长尾折叠）整个盖掉，
     // 于是升级后「还是所有按钮平铺」。只对用户没动过的按钮补上新默认，动过的保持原样。
     if (!out.collapseSeed) {

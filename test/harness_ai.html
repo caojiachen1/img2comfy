@@ -22,7 +22,56 @@ const px = { width: 256, height: 128, data: new Uint8ClampedArray(id.data) };
 window.__mtbPx = px;
 
 const base = location.origin + '/';
+
+// 看图说话 / 提问 / OCR 已经改成纯 LLM API 调用。这一组必须在 import transformers.js 之前跑完 ——
+// 「没装 vendor 运行时的机器也要能用」就是这次改动的全部意义，顺手把它钉成断言。
+async function runLlmChecks() {
+    const { AiEngine } = await import('/src/common/ai/index.js');
+    const { mkPx } = await import('/src/common/imgops/geometry.js');
+    const sent = [];
+    const reply = { ok: true, text: '一张绿圆测试图', model: 'stub-1', usage: { total_tokens: 9 } };
+    const mk = (r) => {
+        const e = new AiEngine({
+            vendorBase: '/vendor', onEvent: () => {}, onProgress: () => {},
+            toImage: async (p, format, quality) => { sent.push({ encode: { w: p.width, h: p.height, format, quality } }); return 'data:image/jpeg;base64,AAAA'; },
+            bgSend: async (msg) => { sent.push(msg); return r; },
+        });
+        e.setAi({ llm: { endpoint: 'api.example.com/v1', apiKey: 'sk-secret-123', model: 'stub-1', imageMaxDim: 512, imageQuality: 0.7, maxTokens: 300, timeoutSec: 42 } });
+        return e;
+    };
+    const big = mkPx(1200, 600);
+    const eng = mk(reply);
+    const r = await eng.task('describe', { px: big, prompt: '描述这张图' });
+    step('看图说话走 LLM API：文本从接口应答取回，而且全程没装 transformers.js（engine.tf 仍是 null）',
+        !!(r && r.text === '一张绿圆测试图' && eng.tf === null), { tfNull: eng.tf === null, text: String(r && r.text), ms: r && r.ms });
+    const msg = sent.find((x) => x && x.action === 'llmChat') || {};
+    const last = (msg.body && msg.body.messages && msg.body.messages[msg.body.messages.length - 1]) || { content: [] };
+    step('端点只写 api.example.com/v1 也补成 /chat/completions；密钥进 Authorization、图进 image_url、超时跟着设置',
+        msg.url === 'https://api.example.com/v1/chat/completions'
+            && msg.headers && msg.headers.authorization === 'Bearer sk-secret-123'
+            && msg.body && msg.body.model === 'stub-1' && msg.body.max_tokens === 300
+            && msg.timeoutMs === 42000 && msg.maskSecret === 'sk-secret-123'
+            && last.content[0] && last.content[0].type === 'image_url' && last.content[1] && last.content[1].text === '描述这张图',
+        { url: msg.url, auth: msg.headers && msg.headers.authorization, maxTokens: msg.body && msg.body.max_tokens });
+    const enc = (sent.find((x) => x && x.encode) || {}).encode || {};
+    step('送进接口的图按 llm.imageMaxDim 夹过（1200×600 → 512×256）并按设置的质量转 JPEG',
+        enc.w === 512 && enc.h === 256 && enc.format === 'jpg' && enc.quality === 0.7, enc);
+    let failed = null;
+    try { await mk({ ok: false, error: '密钥不对或被拒：检查设置里的 API 密钥' }).task('ask', { px: big, question: '这是什么？' }); }
+    catch (e) { failed = String(e && e.message); }
+    step('接口报错原样顶到工具栏，不许咽成「空回答」', !!failed && /密钥不对/.test(failed), { err: failed });
+    let noEndpoint = null;
+    try {
+        const e2 = new AiEngine({ vendorBase: '/vendor', toImage: async () => 'data:image/jpeg;base64,AAAA', bgSend: async () => { throw new Error('不该发请求'); } });
+        e2.setAi({ llm: {} });
+        await e2.task('ocr', { px: big });
+    } catch (e) { noEndpoint = String(e && e.message); }
+    step('没填端点：一句话讲清去设置里接 API，一次请求都不发', !!noEndpoint && /端点/.test(noEndpoint), { err: noEndpoint });
+}
+
 (async () => {
+    const only = new URLSearchParams(location.search).get('only');
+    if (only === 'llm') { await runLlmChecks(); window.__aiDone = out; window.__aiFinished = true; return; }
     const { findCft } = {};
     let tf;
     try {
@@ -51,8 +100,6 @@ const base = location.origin + '/';
     const { SamRunner } = await import('/src/common/ai/sam.js');
     const { loadOrtSession } = await import('/src/common/ai/ort-load.js');
     const { detectFaces } = await import('/src/common/ai/face.js');
-
-    const only = new URLSearchParams(location.search).get('only');
 
     if (!only || only === 'sr') {
         const t0 = Date.now();
@@ -209,15 +256,13 @@ const base = location.origin + '/';
         // Access-Control-Allow-Origin:*，所以普通网页宿主可以直连，不必再走测试服务器的权重代理。
         const { AiEngine } = await import('/src/common/ai/index.js');
         const tasks = (new URLSearchParams(location.search).get('tasks') || 'sam,sr,tags,depth,face').split(',');
-        const vp = new URLSearchParams(location.search).get('vp');
         const ai = {
             hub: 'modelscope', device: 'wasm', dtype: 'q4', maxDim: 512, downloadBudgetMB: 0,
             samPreset: 'slimsam', srPreset: 'swin2sr-light-x2', tagsPreset: 'mobilenetv4',
             depthPreset: 'depth-anything-small', faceModel: 'scrfd-500m', faceEmbedModel: 'w600k-mbf',
-            faceConfidence: 0.5, faceMatchThreshold: 0.4, ...(vp ? { vlmPreset: vp } : {}),
+            faceConfidence: 0.5, faceMatchThreshold: 0.4,
         };
-        const evs = [];
-        const engine = new AiEngine({ vendorBase: '/vendor', onEvent: (t, d) => { if (/vlm/.test(t)) evs.push({ t, d }); }, onProgress: () => { } });
+        const engine = new AiEngine({ vendorBase: '/vendor', onEvent: () => {}, onProgress: () => { } });
         await engine.prepare(ai);
         const run = async (name, payload) => {
             const t0 = performance.now();
@@ -244,38 +289,9 @@ const base = location.origin + '/';
             const x = await run('depth', { px });
             step('深度图：从自建镜像下载 Depth-Anything 并出图', x.ok && !!x.r.image, { ms: x.ms, out: x.r && x.r.image && (x.r.image.width + 'x' + x.r.image.height), err: x.err });
         }
-        if (tasks.includes('vlm')) {
-            const x = await run('describe', { px, maxNewTokens: 12 });
-            step('多模态看图说话：Qwen3-VL q4 从自建镜像整条下载并出文（用户报的 Failed to fetch 就在这条链上）',
-                x.ok && typeof x.r.text === 'string' && x.r.text.length > 0, { err: x.err, engine: x.r && x.r.engine, cps: Array.from(String(x.r.text || '')).slice(0, 24).map((c) => c.codePointAt(0)), text: x.r && String(x.r.text).slice(0, 50), ms: x.ms, evs: evs.map((e) => `${e.t}:${String(e.d && (e.d.error || e.d.task)).slice(0, 70)}`) });
-        }
         if (tasks.includes('face')) {
             const det = await run('face', { px: await (async () => { const el = new Image(); el.src = location.origin + '/test/media/face_lena.jpg'; await el.decode(); const c = document.createElement('canvas'); c.width = el.naturalWidth; c.height = el.naturalHeight; c.getContext('2d', { willReadFrequently: true }).drawImage(el, 0, 0); const id = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, c.width, c.height); return { width: id.width, height: id.height, data: new Uint8ClampedArray(id.data) }; })() });
             step('人脸检测：SCRFD 权重从自建 mtb-face 仓库取到并检出人脸', det.ok && det.r.count >= 1, { ms: det.ms, faces: det.r && det.r.count, backend: det.r && det.r.backend, err: det.err });
-        }
-    }
-
-    if (only === 'vlm') {
-        const { VlmRunner } = await import('/src/common/ai/vlm.js');
-        const cv2 = document.createElement('canvas'); cv2.width = 320; cv2.height = 200;
-        const gg = cv2.getContext('2d');
-        gg.fillStyle = '#123'; gg.fillRect(0, 0, 320, 200);
-        gg.fillStyle = '#e8b04b'; gg.beginPath(); gg.arc(90, 70, 34, 0, 7); gg.fill();
-        gg.fillStyle = '#4ec97e'; gg.fillRect(150, 90, 120, 70);
-        gg.fillStyle = '#fff'; gg.font = '15px sans-serif'; gg.fillText('YELLOW CIRCLE GREEN RECT', 12, 186);
-        const id3 = gg.getImageData(0, 0, 320, 200);
-        const px3 = { width: 320, height: 200, data: new Uint8ClampedArray(id3.data) };
-        for (const [model, dtype] of [['HuggingFaceTB/SmolVLM2-500M-Video-Instruct', 'q4'], ['onnx-community/Qwen3-VL-2B-Instruct-ONNX', 'q4']]) {
-            const t0 = Date.now();
-            const evts = [];
-            try {
-                const r = new VlmRunner({ tf, device: 'wasm', dtype, modelId: model, progress: () => {}, onEvent: (k, d) => evts.push(k + ':' + JSON.stringify(d).slice(0, 110)) });
-                const a = await r.describe(px3, { maxNewTokens: 40 });
-                step('VLM 看图说话 ' + model, true, { text: (a.text || '').slice(0, 220), ms: Date.now() - t0, engine: a.engine, evts: evts.slice(0, 5) });
-                break;
-            } catch (e) {
-                step('VLM 看图说话 ' + model, false, { err: String(e.message || e).slice(0, 460), ms: Date.now() - t0, evts: evts.slice(0, 8) });
-            }
         }
     }
 

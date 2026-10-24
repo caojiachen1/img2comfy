@@ -1,7 +1,7 @@
 // 页面级验证：起静态服务器（带 hf 权重代理）+ Chrome for Testing，
 // 跑内容脚本包（工具栏/拖拽/算子链/取帧）、AI 宿主（vendor + slimSAM/YuNet/swin2SR 真实推理）、
 // 以及设置页（普通网页 + chrome 桩，逐个点按钮）。
-// 用法：node test/run_browser.mjs [--ai] [--options] [--only=sr|sam|face|vlm|script|options|warm|faceid|ms]
+// 用法：node test/run_browser.mjs [--ai] [--options] [--only=sr|sam|face|llm|script|options|warm|faceid|ms]
 //      环境变量 AI_WAIT / OPT_WAIT = 轮询次数；MS_TASKS=sam,sr,tags,depth,face 指定 --only=ms 要验的源
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -376,7 +376,7 @@ const progSplit = await cdp.ev(page, `(async()=>{
   const fire=(type,extra)=>chrome.runtime.sendMessage(Object.assign({action:'mtbEvent', type}, extra));
   const dock=shadow.querySelector('.logbox');
   const texts=()=>[...(dock?dock.querySelectorAll('.ln .tx'):[])].map((x)=>x.textContent.trim());
-  fire('modelProgress', { warmFor:'vlm', phase:'download', loaded:1, total:100, text:'download 1/100' });
+  fire('modelProgress', { warmFor:'sam', phase:'download', loaded:1, total:100, text:'download 1/100' });
   await new Promise(r=>setTimeout(r,300));
   const afterDownload=texts().some((t)=>/download 1\\/100/.test(t));
   fire('aiProgress', { text:'推理中…' });
@@ -490,7 +490,7 @@ step('内容脚本阶段无页面异常', contentErrors.length === 0, { errors: 
 
 // ============================================ 2) AI 宿主与真实模型
 if (DO_AI) {
-    const url = `http://127.0.0.1:${PORT}/test/harness_ai.html${ONLY ? '?only=' + ONLY : ''}${ONLY === 'ms' && process.env.MS_TASKS ? '&tasks=' + process.env.MS_TASKS : ''}${process.env.VP ? '&vp=' + process.env.VP : ''}`;
+    const url = `http://127.0.0.1:${PORT}/test/harness_ai.html${ONLY ? '?only=' + ONLY : ''}${ONLY === 'ms' && process.env.MS_TASKS ? '&tasks=' + process.env.MS_TASKS : ''}`;
     try { fs.writeFileSync(PLOG, ''); } catch (e) { /* ignore */ }
     const ap = await cdp.open(url);
     const LIMIT = process.env.AI_WAIT ? parseInt(process.env.AI_WAIT, 10) : 320;

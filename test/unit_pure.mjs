@@ -569,12 +569,78 @@ console.log('== face（识别数学）==');
         return src.modelIdFor({ hub: 'modelscope' }, p) === p.ms && src.modelIdFor({ hub: 'hf-mirror' }, p) === p.model
             && src.modelIdFor({}, p) === p.model && DEFAULT_SETTINGS.ai.hub === 'modelscope';
     })(), { ms: (await import('../src/common/ai/sam.js')).SAM_PRESETS[0].ms });
-    ok('WebGPU 的默认档位跟着源走：自建镜像取 q4f16、HF 源才取 fp16（否则必然 404）', await (async () => {
-        const { resolveVlm } = await import('../src/common/ai/vlm.js');
-        return resolveVlm({ hub: 'modelscope', device: 'webgpu' }).dtype === 'q4f16'
-            && resolveVlm({ hub: 'hf-mirror', device: 'webgpu' }).dtype === 'fp16'
-            && resolveVlm({ hub: 'modelscope', device: 'wasm' }).dtype === 'q4';
-    })(), { ms: (await import('../src/common/ai/vlm.js')).resolveVlm({ hub: 'modelscope', device: 'webgpu' }).dtype });
+    ok('看图说话/提问/OCR 是纯接口任务：只有这三个名字不装运行时，别的照样要 transformers.js', await (async () => {
+        const { LLM_TASKS } = await import('../src/common/ai/llm-api.js');
+        return LLM_TASKS.has('describe') && LLM_TASKS.has('ask') && LLM_TASKS.has('ocr')
+            && !LLM_TASKS.has('samPick') && !LLM_TASKS.has('face') && !LLM_TASKS.has('superResolve') && LLM_TASKS.size === 3;
+    })());
+    ok('LLM 端点四种写法都能落到 /chat/completions（含不给协议、已经写全、带别的子路径）', await (async () => {
+        const { chatEndpoint } = await import('../src/common/ai/llm-api.js');
+        return chatEndpoint('api.example.com') === 'https://api.example.com/v1/chat/completions'
+            && chatEndpoint('https://api.example.com/v1/') === 'https://api.example.com/v1/chat/completions'
+            && chatEndpoint('https://x.test/v1/chat/completions') === 'https://x.test/v1/chat/completions'
+            && chatEndpoint('https://x.test/proxy/keep') === 'https://x.test/proxy/keep/chat/completions'
+            && chatEndpoint('') === '' && chatEndpoint('   ') === '';
+    })());
+    ok('LLM 配置夹范围：脏数字回落到边界，密钥去掉误粘的 Bearer 前缀', await (async () => {
+        const { normalizeLlm } = await import('../src/common/ai/llm-api.js');
+        const n = normalizeLlm({ endpoint: ' https://a.b/v1 ', apiKey: 'Bearer  sk-1 ', temperature: 9, maxTokens: 10, imageMaxDim: 99999, timeoutSec: 0 });
+        return n.endpoint === 'https://a.b/v1' && n.apiKey === 'sk-1' && n.temperature === 2
+            && n.maxTokens === 16 && n.imageMaxDim === 4096 && n.timeoutSec === 5
+            && normalizeLlm(null).model === 'gpt-4o-mini' && normalizeLlm({}).apiKey === '';
+    })());
+    ok('请求体是 OpenAI 兼容形状：system 是字符串、user 带 image_url + 文本，密钥没有就不发 Authorization', await (async () => {
+        const { buildChatRequest } = await import('../src/common/ai/llm-api.js');
+        const r = buildChatRequest({ endpoint: 'https://a.b/v1', apiKey: 'sk-1', model: 'm', temperature: 0.3, maxTokens: 200, timeoutSec: 30 },
+            { system: '别复述问题', user: '图里有什么？', imageDataUrl: 'data:image/jpeg;base64,AA' });
+        const noKey = buildChatRequest({ endpoint: 'https://a.b/v1', model: 'm' }, { user: 'hi' });
+        return r.url === 'https://a.b/v1/chat/completions' && r.headers.authorization === 'Bearer sk-1'
+            && r.headers['content-type'] === 'application/json' && r.timeoutMs === 30000
+            && r.body.model === 'm' && r.body.max_tokens === 200 && r.body.temperature === 0.3 && r.body.stream === false
+            && r.body.messages[0].role === 'system' && typeof r.body.messages[0].content === 'string'
+            && r.body.messages[1].content[0].type === 'image_url' && r.body.messages[1].content[0].image_url.url === 'data:image/jpeg;base64,AA'
+            && r.body.messages[1].content[1].text === '图里有什么？'
+            && noKey.headers.authorization === undefined;
+    })());
+    ok('应答取字要认四种形状，全取不到就直说「没有文字」而不是回一个空串', await (async () => {
+        const { parseChatReply } = await import('../src/common/ai/llm-api.js');
+        const a = parseChatReply({ choices: [{ message: { content: '一句话' } }] });
+        const b = parseChatReply({ choices: [{ message: { content: [{ type: 'text', text: '第一段' }, { type: 'text', text: '第二段' }] } }] });
+        const c = parseChatReply({ choices: [{ text: '补全式应答' }] });
+        const d = parseChatReply({ output_text: ' Responses API 的形状' });
+        const e = parseChatReply({ choices: [{ message: { content: '' } }] });
+        return a.text === '一句话' && b.text === '第一段第二段' && c.text === '补全式应答' && d.text === 'Responses API 的形状'
+            && a.model === '' && e.text === '' && parseChatReply(null).text === '';
+    })());
+    ok('接口报错翻成「下一步改哪里」，并且任何文案里都不许回显密钥', await (async () => {
+        const { llmErrorText, redactKey } = await import('../src/common/ai/llm-api.js');
+        return /密钥/.test(llmErrorText(401, 'Unauthorized')) && /模型名/.test(llmErrorText(404, 'not found'))
+            && /限流/.test(llmErrorText(429, '')) && /图片|max_tokens/.test(llmErrorText(400, 'x'))
+            && /服务端出错 599/.test(llmErrorText(599, 'boom'))
+            && redactKey('Authorization: Bearer sk-secret-123 failed', 'sk-secret-123').indexOf('sk-secret-123') < 0;
+    })());
+    ok('默认设置里没有多模态权重了：vlmPreset/vlmPrompt 不见，换成 ai.llm 一整套', await (async () => {
+        return DEFAULT_SETTINGS.ai.vlmPreset === undefined && DEFAULT_SETTINGS.ai.vlmPrompt === undefined
+            && DEFAULT_SETTINGS.ai.llm && DEFAULT_SETTINGS.ai.llm.endpoint === '' && DEFAULT_SETTINGS.ai.llm.model === 'gpt-4o-mini'
+            && DEFAULT_SETTINGS.ai.llm.imageMaxDim === 1024 && typeof DEFAULT_SETTINGS.ai.describePrompt === 'string';
+    })());
+    ok('老设置迁移：用户改过的 vlmPrompt 换名活下来，多模态权重那几个键被清干净', await (async () => {
+        const old = { version: 2, ai: { vlmPreset: 'qwen3vl-2b', vlmModel: 'x/y', vlmPrompt: '我自己写的提示词', device: 'wasm' } };
+        const m = migrateSettings(old);
+        const kept = migrateSettings({ version: 2, ai: { vlmPreset: 'qwen2vl-2b', vlmDtype: 'q4' } });
+        return m.ai.describePrompt === '我自己写的提示词' && m.ai.device === 'wasm'
+            && m.ai.vlmPrompt === undefined && m.ai.vlmPreset === undefined && m.ai.vlmModel === undefined
+            && m.ai.llm.endpoint === '' && kept.ai.describePrompt === DEFAULT_SETTINGS.ai.describePrompt;
+    })());
+    ok('多模态权重的代码与引用一起下线（src/ 里不许再 import ai/vlm.js，宿主对 LLM 任务不装运行时）', await (async () => {
+        const rd = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+        let vlmFileThere = true;
+        try { rd('src/common/ai/vlm.js'); } catch (e) { vlmFileThere = false; }
+        const texts = ['src/common/ai/index.js', 'src/host/host.mjs', 'src/options/panels.mjs', 'src/content/runner.mjs', 'src/common/registry.js'].map(rd).join('\n');
+        const hostGate = /if \(!LLM_TASKS\.has\(task\)\) await engine\.prepare\(req\.ai\)/.test(rd('src/host/host.mjs'));
+        const engineGate = /if \(!LLM_TASKS\.has\(name\) && !this\.tf\) await this\.prepare/.test(rd('src/common/ai/index.js'));
+        return !vlmFileThere && !/ai\/vlm\.js/.test(texts) && !/ensureVlm|new VlmRunner|VLM_PRESETS/.test(texts) && hostGate && engineGate;
+    })(), {});
     ok('分类/零样本结果归一化：单图扁平数组不再被误当批量', await (async () => {
         const { listOf } = await import('../src/common/ai/vision.js');
         const flat = [{ label: 'cat', score: 0.9 }, { label: 'dog', score: 0.1 }];

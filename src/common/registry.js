@@ -63,10 +63,10 @@ export const TOOLS = [
     { id: 'regions', group: '分析', label: '连通域', icon: '🧩', media: ['image'], action: { type: 'step', chain: [{ op: 'regions', params: { threshold: 128, minArea: 120 } }] } },
 
     // —— AI ——
-    { id: 'ai-describe', group: 'AI', label: '看图说话', icon: ICONS.ask, media: ['image', 'video'], ai: 'describe', action: { type: 'ai', task: 'describe' }, needsHost: true, hint: '多模态模型生成画面描述' },
-    { id: 'ai-ask', group: 'AI', label: 'AI 提问', icon: '❓', media: ['image', 'video'], ai: 'ask', action: { type: 'ai', task: 'ask' }, needsHost: true, hint: '弹出输入框，把问题连同图片发给多模态模型' },
+    { id: 'ai-describe', group: 'AI', label: '看图说话', icon: ICONS.ask, media: ['image', 'video'], ai: 'describe', action: { type: 'ai', task: 'describe' }, needsHost: true, hint: '把图发给你接的 LLM API，让它生成画面描述' },
+    { id: 'ai-ask', group: 'AI', label: 'AI 提问', icon: '❓', media: ['image', 'video'], ai: 'ask', action: { type: 'ai', task: 'ask' }, needsHost: true, hint: '弹出输入框，把问题连同图片发给 LLM API' },
     { id: 'ai-tags', group: 'AI', label: '标签识别', icon: ICONS.tag, media: ['image'], ai: 'tags', action: { type: 'ai', task: 'tags' }, needsHost: true },
-    { id: 'ai-ocr', group: 'AI', label: 'OCR 读字', icon: '🔤', media: ['image', 'video'], ai: 'ocr', action: { type: 'ai', task: 'ocr' }, needsHost: true },
+    { id: 'ai-ocr', group: 'AI', label: 'OCR 读字', icon: '🔤', media: ['image', 'video'], ai: 'ocr', action: { type: 'ai', task: 'ocr' }, needsHost: true, hint: '照抄图里的文字，走的也是 LLM API' },
     { id: 'ai-sam', group: 'AI', label: '点选抠图', icon: ICONS.sam, media: ['image'], ai: 'sam', action: { type: 'ai', task: 'samPick' }, needsHost: true, hint: '进入取点模式，在图上点击目标生成遮罩' },
     { id: 'ai-sam-auto', group: 'AI', label: '自动分割', icon: '🪄', media: ['image'], ai: 'samauto', action: { type: 'ai', task: 'samAuto' }, needsHost: true },
     { id: 'ai-face', group: 'AI', label: '人脸识别', icon: ICONS.face, media: ['image', 'video'], ai: 'face', action: { type: 'ai', task: 'face' }, needsHost: true },
@@ -178,12 +178,23 @@ export const DEFAULT_SETTINGS = {
         keepAwake: true,
         downloadBudgetMB: 4096,
         autoUnloadAfter: 0,
-        vlmPreset: 'qwen3vl-2b',
+        // 看图说话 / 提问 / OCR 一律走外部 LLM API（OpenAI 兼容的 /chat/completions）。
+        // 浏览器里那份 1.4GB 多模态权重已经下线：不再有 vlmPreset，也不再提供该模型下载。
+        llm: {
+            endpoint: '',            // 填到主机名或 /v1 都行，会自动补成 …/chat/completions
+            apiKey: '',              // 本机 Ollama / LM Studio 这类可以留空
+            model: 'gpt-4o-mini',
+            temperature: 0.2,
+            maxTokens: 512,
+            imageMaxDim: 1024,       // 送进接口的图先夹到这个最长边再转 JPEG
+            imageQuality: 0.85,
+            timeoutSec: 90,
+        },
         samPreset: 'slimsam',
         srPreset: 'swin2sr-x2',
         tagsPreset: 'clip-zero-shot',
         depthPreset: 'depth-anything-small',
-        vlmPrompt: '请用中文详细描述这张图片的主体、场景、风格、构图与可见文字。',
+        describePrompt: '请用中文详细描述这张图片的主体、场景、风格、构图与可见文字。',
         askPrompt: '{question}',
         samPointsPerTarget: 1,
         faceModel: 'scrfd-500m',
@@ -252,6 +263,13 @@ export function migrateSettings(raw) {
         return s;
     }
     const out = mergeDeep(s, raw);
+    // 多模态权重已经下线：老设置里的 vlmPreset/vlmModel/vlmDtype 没有对应功能了，直接摘掉；
+    // 但用户自己改过的「看图说话」提示词要接着用（换了个名字存到 describePrompt）
+    if (out.ai) {
+        const old = out.ai.vlmPrompt;
+        if (typeof old === 'string' && old.trim() && old !== DEFAULT_SETTINGS.ai.describePrompt) out.ai.describePrompt = old;
+        for (const k of ['vlmPrompt', 'vlmPreset', 'vlmModel', 'vlmDtype']) delete out.ai[k];
+    }
     // 老设置的 tools 里每个 id 都写死了 collapsed:false，会把新默认（视频长尾折叠）整个盖掉，
     // 于是升级后「还是所有按钮平铺」。只对用户没动过的按钮补上新默认，动过的保持原样。
     if (!out.collapseSeed) {

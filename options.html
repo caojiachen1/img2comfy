@@ -242,11 +242,28 @@
             <button id="btnRuntimeClear" class="danger">清除已装</button>
           </div>
           <div class="rtbar"><i id="runtimeBar"></i></div>
-          <div class="rthint" id="runtimeSpeed">进度显示在这里；装完 AI 按钮就能直接用，不必再跑 node 脚本</div>
+          <div class="rthint" id="runtimeSpeed">进度显示在这里；这份运行时只服务于抠图/人脸/超分/标签/深度这几个本地模型，装完就能用，不必再跑 node 脚本。看图说话 / AI 提问 / OCR 不在这儿——它们只调你在上面接的 LLM API，一个权重都不下</div>
           <div id="runtimeFiles" class="rtfiles"></div>
         </div>
       </div>
       <div class="col form">
+        <h3>看图说话 / 提问 / OCR（接 LLM API）</h3>
+        <p class="note">这三个按钮不在浏览器里跑多模态模型了（原来那份权重 1.4GB 起，还要 WebGPU 才勉强能用），
+          改成直接调你自己的 <strong>OpenAI 兼容</strong> 接口。<code>/chat/completions</code> 之外的部分都可以不写：
+          填 <code>https://api.deepseek.com</code> 或 <code>https://api.openai.com/v1</code> 都能自动补全。
+          DeepSeek、通义 compatible-mode、Kimi、智谱、OpenRouter、本地 Ollama / LM Studio / vLLM 都是这一种格式。</p>
+        <div class="grid2">
+          <label class="span2">端点 <input type="text" id="llmEndpoint" placeholder="https://api.deepseek.com/v1 或 https://…/chat/completions"></label>
+          <label class="span2">密钥 <input type="password" id="llmKey" placeholder="本机服务可留空" autocomplete="off" spellcheck="false"></label>
+          <label>模型名 <input type="text" id="llmModel" placeholder="deepseek-chat / gpt-4o-mini / qwen-vl-plus"></label>
+          <label>超时(秒) <input type="number" id="llmTimeout" min="5" max="600" step="5"></label>
+          <label>温度 <input type="number" id="llmTemperature" min="0" max="2" step="0.1"></label>
+          <label>最大输出 <input type="number" id="llmMaxTokens" min="16" max="8192" step="64"></label>
+          <label>图片最长边 <input type="number" id="llmImageDim" min="256" max="4096" step="128"></label>
+          <label>图片质量 <input type="number" id="llmImageQuality" min="0.4" max="1" step="0.05"></label>
+        </div>
+        <div class="row"><button id="btnLlmTest" class="primary">测试连接</button><span class="hint" id="llmTestHint"></span></div>
+        <pre id="llmTestOut" class="out"></pre>
         <h3>模型选择</h3>
         <div id="modelSelects"></div>
         <h3>模型单独下载</h3>
@@ -254,7 +271,7 @@
         <h3>人脸库</h3>
         <div id="faceGallery"></div>
         <h3>提示词</h3>
-        <label>看图说话 <textarea id="vlmPrompt" rows="3"></textarea></label>
+        <label>看图说话 <textarea id="describePrompt" rows="3"></textarea></label>
         <label>提问模板 <input type="text" id="askPrompt"></label>
         <h3>功能参数</h3>
         <div class="grid2">

@@ -3,6 +3,7 @@
 
 import { migrateSettings, DEFAULT_SETTINGS } from './src/common/registry.js';
 import { keywordExprOf } from './src/common/weibo-filter.js';
+import { llmErrorText, parseChatReply, redactKey } from './src/common/ai/llm-api.js';
 import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
 
@@ -384,6 +385,38 @@ const HANDLERS = {
 
     proxyPost: async (req) => HANDLERS.proxyFetch({ options: { ...req, method: 'POST', as: 'text' } }),
 
+    // 看图说话/提问/OCR 的模型调用统一走这里：扩展页 fetch 有 <all_urls> 主机权限，不受 CORS 限制，
+    // 密钥也只停在后台这一次请求里（错误文案一律过一遍 redact，别把密钥回显到设置页/工具栏）。
+    llmChat: async (req) => {
+        const url = String(req.url || '');
+        if (!/^https?:\/\//i.test(url)) throw new Error('LLM 端点必须是 http(s) 地址');
+        const timeoutMs = Math.min(Math.max(Number(req.timeoutMs) || 90000, 5000), 600000);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        const headers = { ...(req.headers || {}) };
+        let bodyText = '';
+        try {
+            bodyText = JSON.stringify(req.body || {});
+            const res = await fetch(url, { method: 'POST', headers, body: bodyText, redirect: 'follow', signal: ctrl.signal });
+            const text = await res.text();
+            if (!res.ok) return { ok: false, status: res.status, error: redactKey(llmErrorText(res.status, text), req.maskSecret) };
+            let json = null;
+            try { json = JSON.parse(text); } catch (e) {
+                return { ok: false, status: res.status, error: redactKey('应答不是 JSON（端点填错、或这个地址不是 chat/completions）：' + clipText(text), req.maskSecret) };
+            }
+            const r = parseChatReply(json);
+            if (!r.text) return { ok: false, status: res.status, error: redactKey('应答里没有文字内容' + (r.finish ? '（finish_reason=' + r.finish + '，多半被 max_tokens 截断或模型不支持图片）' : ''), req.maskSecret) };
+            return { ok: true, status: res.status, text: r.text, model: r.model || '', usage: r.usage || null };
+        } catch (e) {
+            const aborted = e && (e.name === 'AbortError' || /abort/i.test(String(e.message || e)));
+            const msg = aborted ? `请求超过 ${Math.round(timeoutMs / 1000)} 秒已中断（端点太慢或图片太大）`
+                : '连不上这个端点：' + redactKey(String((e && e.message) || e), req.maskSecret);
+            return { ok: false, error: msg };
+        } finally {
+            clearTimeout(timer);
+        }
+    },
+
     // 宿主（offscreen / 宿主标签页）→ UI 的事件转发。宿主发的是 action:'mtbEvent'，
     // 这里以前没有对应 handler，消息被静默丢掉，于是模型下载进度、运行时安装进度、
     // 以及 ctx.openUrl / ctx.panel（toolUi）全都不通。
@@ -702,6 +735,11 @@ function bytesToDataUrl(bytes, mime) {
 async function safeJson(res) {
     const text = await res.text();
     try { return JSON.parse(text); } catch (e) { return text; }
+}
+
+// 报错文案里带回的应答只留一行、截个短，别把整包 HTML 甩进工具栏
+function clipText(t, n = 160) {
+    return String(t || '').replace(/\s+/g, ' ').trim().slice(0, n);
 }
 
 async function downloadSettled(id, ms = 3000) {

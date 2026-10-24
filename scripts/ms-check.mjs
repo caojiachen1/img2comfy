@@ -1,10 +1,6 @@
 // 查 ModelScope 上是否已有这些仓库（含同名/常见镜像前缀），避免白搬几十小时带宽。
 // 用法：node scripts/ms-check.mjs
 const REPOS = [
-    'onnx-community/Qwen3-VL-2B-Instruct-ONNX',
-    'onnx-community/Qwen2-VL-2B-Instruct',
-    'HuggingFaceTB/SmolVLM2-500M-Video-Instruct',
-    'HuggingFaceTB/SmolVLM2-2.2B-Instruct',
     'Xenova/slimsam-77-uniform',
     'onnx-community/mobilesam-1.0.0-hf',
     'Xenova/sam-vit-base',
