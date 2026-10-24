@@ -55,6 +55,8 @@ function scheduleSave() {
 // ---------------------------------------------------------------- 绑定
 const BINDINGS = [
     ['ui.theme', 'uiTheme'],
+    ['gallery.jumpMode', 'jumpMode'],
+    ['gallery.jumpMissing', 'jumpMissing'],
     ['toolbar.showOn', 'showOn'], ['toolbar.showKey', 'showKey'], ['toolbar.layout', 'layout'],
     ['toolbar.iconMode', 'iconMode'], ['toolbar.theme', 'theme'], ['toolbar.anchor', 'anchor'],
     ['toolbar.offsetX', 'offsetX', 'num'], ['toolbar.offsetY', 'offsetY', 'num'],

@@ -348,6 +348,26 @@ export async function collectPageImages(options = {}) {
         return '';
     }
 
+        // 这条微博自己的地址，给面板「跳转」按钮用。优先页面上现成的永久链接
+    // （微博把时间、正文标题都包成指向本条的链接；移动版是 /status/<id>），
+    // 一条都没有再用 uid + 帖子 id 拼 —— 被虚拟列表回收掉的帖子只能靠拼。
+    const POST_LINK = /\/(?:status|detail|pics)\/\w{5,}/i;
+    const WEIBO_PERMA = /^https?:\/\/(?:www\.)?weibo\.(?:com|cn)\/\d{5,}\/\w{5,}/i;
+    function postUrlOf(card, uid, sid) {
+        let perma = '';
+        try {
+            for (const a of card.querySelectorAll('a[href]')) {
+                const href = String(a.href || '').split('#')[0];
+                if (!/^https?:/i.test(href)) continue;
+                if (POST_LINK.test(href)) return href;
+                if (!perma && weibo && WEIBO_PERMA.test(href)) perma = href;
+            }
+        } catch (e) { }
+        if (perma) return perma;
+        if (weibo && uid && sid) return 'https://weibo.com/' + uid + '/' + sid;
+        return '';
+    }
+
     function postOf(card, author) {
         const text = postText(card);
         const sid = postIdOf(card);
@@ -355,7 +375,11 @@ export async function collectPageImages(options = {}) {
         const seed = sid || text;
         for (let i = 0; i < seed.length; i++) h = ((h << 5) + h + seed.charCodeAt(i)) >>> 0;
         const sub = text.replace(author.label || '', ' ').replace(/\s+/g, ' ').trim().slice(0, 72);
-        return { key: author.key + '#p' + (sid ? 's' + sid : 'h' + h.toString(36)), label: author.label, sub };
+        const uid = author.key.indexOf('acct:') === 0 ? author.key.slice(5) : '';
+        return {
+            key: author.key + '#p' + (sid ? 's' + sid : 'h' + h.toString(36)), label: author.label, sub,
+            url: postUrlOf(card, /^\d{5,}$/.test(uid) ? uid : '', sid),
+        };
     }
 
     const cardCache = new WeakMap();
@@ -424,7 +448,7 @@ export async function collectPageImages(options = {}) {
             y: Math.round(y || 0),
             width: Math.round(width) || 0, height: Math.round(height) || 0,
             kind: kind || 'image', alt: cleanText(alt).slice(0, 120),
-            pageUrl, groupKey: info.key, groupLabel: info.label, groupSub: info.sub || '',
+            pageUrl, groupKey: info.key, groupLabel: info.label, groupSub: info.sub || '', groupUrl: info.url || '',
         });
         if (weibo && !postCards.has(info.key)) {
             const card = findCard(el);
@@ -520,7 +544,7 @@ export async function collectPageImages(options = {}) {
     for (const it of items) {
         let g = groupMap.get(it.groupKey);
         if (!g) {
-            g = { key: it.groupKey, label: it.groupLabel, sub: it.groupSub || '', y: it.y, items: [] };
+            g = { key: it.groupKey, label: it.groupLabel, sub: it.groupSub || '', url: it.groupUrl || '', y: it.y, items: [] };
             groupMap.set(it.groupKey, g);
         } else if (it.y < g.y) g.y = it.y;
         g.items.push({
@@ -743,6 +767,186 @@ export function weiboFeedPage(arg) {
         return { ok: true, total: list.length, posts };
     } catch (e) {
         return { ok: false, error: String((e && e.message) || e || '').slice(0, 160) };
+    }
+}
+
+// 注入到目标页执行：把用户的页面滚到那条微博，并临时描一圈高亮。
+// 只有用户点了分组头的「↗ 微博」才会走到这里 —— 采集阶段绝不碰页面滚动位置，那条不变量不受影响。
+// 认这条微博靠帖子 id：先看容器自己的 mid/bid 属性，再看里面那条指向本条的永久链接。
+// opt.loadMissing（设置里「页面上还没有这条时：一直往下滚找它」）：没找到就一步一屏往下滚，
+// 微博的虚拟列表滚到才挂载，一路重新扫；到底了还找不到就滚回原来的位置，交回面板开新标签。
+export async function scrollToPost(arg) {
+    const opt = arg || {};
+    const out = { ok: false, found: false, how: '', top: 0, centerDelta: 0, articles: 0, smooth: false, scrolled: false, searched: 0, restored: false, endNote: '', error: '' };
+    const ids = [];
+    for (const v of (Array.isArray(opt.ids) ? opt.ids : [])) {
+        const s = String(v || '');
+        if (s.length >= 5 && ids.indexOf(s) < 0) ids.push(s);
+    }
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const HL_ID = 'mtb-jump-hl';
+    const POST_SEL = 'article,[role="article"],.card9,.m-panel,.card-wrap,.vue-recycle-scroller__item-view,'
+        + '[feed-item],.WB_feed_type,.weibo-main,.mwb-list-item';
+    const vh = () => window.innerHeight || 600;
+    const visible = !document.hidden;
+    const findPost = () => {
+        const nodes = [...document.querySelectorAll(POST_SEL)];
+        out.articles = nodes.length;
+        for (const el of nodes) {
+            let attrs = [];
+            try {
+                attrs = ['mid', 'data-mid', 'bid', 'data-bid'].map((a) => String(el.getAttribute(a) || ''));
+            } catch (e) { continue; }
+            if (attrs.some((a) => a && ids.indexOf(a) >= 0)) { out.how = 'attr'; return el; }
+        }
+        const re = ids.map((x) => new RegExp('/' + x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:[/?#]|$)'));
+        for (const el of nodes) {
+            let links = [];
+            try { links = [...el.querySelectorAll('a[href]')]; } catch (e) { continue; }
+            for (const a of links) {
+                const href = String(a.href || '');
+                if (re.some((r) => r.test(href))) { out.how = 'link'; return el; }
+            }
+        }
+        out.how = '';
+        return null;
+    };
+    const deltaOf = (el) => {
+        const r = el.getBoundingClientRect();
+        return Math.abs(r.top + r.height / 2 - vh() / 2);
+    };
+    // 按文档坐标算出「让这条居中」的滚动位置，硬滚过去（帖子可能很高，往下留一半它自己的高度）
+    const centerOn = (el) => {
+        const r = el.getBoundingClientRect();
+        window.scrollTo(0, Math.max(0, Math.round(r.top + (window.scrollY || 0) - (vh() - r.height) / 2)));
+    };
+    // 高亮描在自己的浮层上，不写进微博那一条的 style：outline 画在元素外框上，会被下一条不透明、
+    // 后绘制的帖子压掉底边（用户报的就是"最下面那条线被挡住了"），浮层永远画在最上面、也跟着滚动重新定位
+    const hl = document.createElement('div');
+    hl.id = HL_ID;
+    hl.setAttribute('style', 'position:fixed;z-index:2147483647;pointer-events:none;box-sizing:border-box;'
+        + 'border:3px solid ' + (opt.color || '#6ea8fe') + ';border-radius:8px;box-shadow:0 0 0 2px rgba(255,255,255,.9), 0 0 0 5px rgba(0,0,0,.55);'
+        + 'left:0;top:0;width:0;height:0');
+    let hlEl = null;
+    const place = () => {
+        if (!hlEl || !hlEl.isConnected) { stopHl(); return; }
+        const r = hlEl.getBoundingClientRect();
+        const top = Math.max(2, Math.round(r.top) - 5);
+        const bottom = Math.min(vh() - 2, Math.round(r.bottom) + 5);
+        if (bottom - top < 4) { stopHl(); return; }
+        hl.style.top = top + 'px';
+        hl.style.left = Math.max(2, Math.round(r.left) - 5) + 'px';
+        hl.style.width = Math.max(0, Math.round(r.width) + 10) + 'px';
+        hl.style.height = (bottom - top) + 'px';
+    };
+    const stopHl = () => { hlEl = null; if (hl.parentNode) hl.parentNode.removeChild(hl); };
+    const startHl = (el) => {
+        hlEl = el;
+        if (!document.getElementById(HL_ID)) document.documentElement.appendChild(hl);
+        place();
+        const t0 = Date.now();
+        const loop = () => {
+            if (!hlEl || Date.now() - t0 > 2600) { stopHl(); return; }
+            place();
+            setTimeout(loop, 80);
+        };
+        setTimeout(loop, 80);
+    };
+    // 一路往下翻可能要几十秒，页面上得有个东西说明"是扩展在滚我的页面、在找哪条"，不然用户只看到页面自己在动
+    const BADGE_ID = 'mtb-jump-search';
+    let badgeEl = null;
+    const badge = (text) => {
+        if (!badgeEl || !badgeEl.isConnected) {
+            badgeEl = document.createElement('div');
+            badgeEl.id = BADGE_ID;
+            badgeEl.setAttribute('style', 'position:fixed;z-index:2147483647;pointer-events:none;right:16px;bottom:16px;'
+                + 'padding:8px 12px;border-radius:8px;font:13px/1.5 system-ui,sans-serif;max-width:60vw;'
+                + 'background:rgba(0,0,0,.82);color:#fff;border:1px solid rgba(255,255,255,.4)');
+            document.documentElement.appendChild(badgeEl);
+        }
+        badgeEl.textContent = text;
+    };
+    const clearBadge = () => { if (badgeEl && badgeEl.parentNode) badgeEl.parentNode.removeChild(badgeEl); badgeEl = null; };
+    try {
+        if (!ids.length) { out.error = '没有可用的帖子 id'; return out; }
+        const start = Math.round(window.scrollY || 0);
+        let hit = findPost();
+        if (!hit && opt.loadMissing) {
+            // **不设「翻几屏就算了」的天花板**：这条既然出现在图片面板里，就是微博那份数据里真有的帖子，
+            // 翻不到只可能是还没滚到它（2026-10-24 用户就是被「往下翻了 24 屏也没加载出这条」惹的）。
+            // 只有三种情况才停：① 已经贴着文档底、连翻 8 屏页面一点没长（这个分组真到底了）；
+            // ② 页面根本滚不动；③ 滚动位置被用户自己抢走了（那说明他在滚，立刻让开）。
+            const HARD_CAP = Math.max(50, Math.min(4000, opt.maxScreens | 0 || 4000));
+            let still = 0;
+            let lastH = document.documentElement.scrollHeight;
+            let lastArts = out.articles;
+            for (let k = 0; k < HARD_CAP && !hit; k++) {
+                const maxY = Math.max(0, document.documentElement.scrollHeight - vh());
+                if (!maxY) { out.endNote = '这个页面本身滚不动'; break; }
+                const want = Math.min(maxY, Math.round(window.scrollY || 0) + Math.round(vh() * 0.85));
+                window.scrollTo(0, want);
+                out.searched++;
+                badge('正在往下翻找这条微博…已经翻了 ' + out.searched + ' 屏');
+                await sleep(visible ? 240 : 620);
+                if (Math.abs(Math.round(window.scrollY || 0) - want) > 140) { out.endNote = '你自己在滚页面，已经停下让开'; break; }
+                hit = findPost();
+                if (hit) break;
+                const h = document.documentElement.scrollHeight;
+                const atBottom = Math.round(window.scrollY || 0) >= maxY - 2;
+                if (h > lastH + 4 || out.articles > lastArts) {
+                    still = 0; lastH = h; lastArts = out.articles;
+                } else if (atBottom && ++still >= 8) {
+                    out.endNote = '微博这个分组已经到底了';
+                    break;
+                }
+            }
+            clearBadge();
+            if (!hit) {
+                window.scrollTo(0, start);
+                out.restored = true;
+                out.error = '往下翻了 ' + out.searched + ' 屏也没加载出这条';
+                return out;
+            }
+        }
+        if (!hit) return out;
+        // 页面在后台时 rAF 根本不跑：scrollIntoView 的平滑滚动会一直悬在半空（连补一次瞬时的都不动），
+        // 而 window.scrollTo 照常生效。面板自己是独立标签页/窗口，用户点 ↗ 的那一刻微博多半正是后台那个，
+        // 所以按 document.hidden 选路，不能描完高亮却一动不动。
+        if (visible) hit.scrollIntoView({ behavior: 'smooth', block: 'center' }); else centerOn(hit);
+        let delta = Infinity;
+        const t0 = Date.now();
+        while (Date.now() - t0 < (visible ? 1200 : 320)) {
+            await sleep(70);
+            delta = deltaOf(hit);
+            if (delta < 24) break;
+        }
+        // 隐藏页不一定立刻接受这一次，所以每补一次都重新量；
+        // 但滚动位置已经不再变化（页面已经滚到头了）就立刻收手，别把用户晾在六次补滚上
+        if (delta >= 24) {
+            let lastY = -1;
+            for (let k = 0; k < 6 && delta >= 24; k++) {
+                centerOn(hit);
+                await sleep(90);
+                delta = deltaOf(hit);
+                const y = Math.round(window.scrollY || 0);
+                if (y === lastY) break;
+                lastY = y;
+            }
+        }
+        startHl(hit);
+        out.found = true;
+        out.top = Math.round(hit.getBoundingClientRect().top);
+        out.centerDelta = Math.round(delta);
+        out.smooth = visible;
+        out.scrolled = Math.round(window.scrollY || 0) !== start;
+        // 找到了却一点没滚、又没落在中间（页面被什么钉住了）不能报成功：
+        // 那样提示条会对用户说「已经滚到那条微博」，而屏幕上什么都没发生
+        out.ok = delta < 24 || out.scrolled;
+        if (!out.ok) out.error = '找到了这条，但页面滚不动';
+        return out;
+    } catch (e) {
+        out.error = String((e && e.message) || e || '').slice(0, 120);
+        return out;
     }
 }
 

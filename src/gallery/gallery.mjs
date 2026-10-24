@@ -2,10 +2,10 @@
 // 页面本身不注入内容脚本：用 chrome.scripting.executeScript 把 collectPageImages 投进去。
 // 批量发送由后台执行，面板关掉也不会中断。
 
-import { collectPageImages, weiboFeedPage, weiboLoadMorePages } from './collect.mjs';
+import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './collect.mjs';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, clampLoadPages } from '../common/gallery.js';
 import { baseNameFromUrl, sanitizeFilename } from '../common/util.js';
-import { normalizeWeiboFilter, splitKeywords, describeWeiboFilter } from '../common/weibo-filter.js';
+import { normalizeWeiboFilter, describeWeiboFilter, keywordExprOf, exprSource } from '../common/weibo-filter.js';
 import { normalizeUiTheme } from '../common/theme.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -52,6 +52,8 @@ const S = {
     extraPosts: [],
     moreBusy: false,
     moreDetail: '',
+    jumpMode: 'scroll',
+    jumpMissing: 'scroll',
 };
 
 // 下拉面板被 Chromium 锁在 800×600，想要更大的浏览面就另开一个普通扩展窗口
@@ -165,10 +167,19 @@ function bindEvents() {
         }
     });
     window.addEventListener('resize', settlePanelSize);
-    // 设置页改了界面风格，已经开着的面板立刻跟着换肤，不用等下次重开
+    // 设置页改了界面风格或跳转方式，已经开着的面板立刻跟着改，不用等下次重开
     chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === 'local' && changes.mtbSettings) applyUiTheme(changes.mtbSettings.newValue);
+        if (area !== 'local' || !changes.mtbSettings) return;
+        applyUiTheme(changes.mtbSettings.newValue);
+        const g = (changes.mtbSettings.newValue || {}).gallery || {};
+        S.jumpMode = normJumpMode(g.jumpMode);
+        S.jumpMissing = g.jumpMissing === 'tab' ? 'tab' : 'scroll';
     });
+}
+
+/** 点「↗ 微博」的三档：滚到那条 / 直接开新标签 / 只滚且绝不新开标签。脏值一律按默认的滚 */
+function normJumpMode(v) {
+    return v === 'tab' || v === 'scrollOnly' ? v : 'scroll';
 }
 
 async function loadSettings() {
@@ -181,6 +192,8 @@ async function loadSettings() {
     $('#sendTier').value = ((S.settings.gallery || {}).sendTier) || 'card';
     S.feedAll = (S.settings.gallery || {}).feedAll !== false;
     $('#feedAll').checked = S.feedAll;
+    S.jumpMode = normJumpMode((S.settings.gallery || {}).jumpMode);
+    S.jumpMissing = (S.settings.gallery || {}).jumpMissing === 'tab' ? 'tab' : 'scroll';
     $('#morePages').value = String(clampLoadPages((S.settings.gallery || {}).loadPages));
 }
 
@@ -345,6 +358,54 @@ async function restoreSelection() {
     refreshSelectionUI();
 }
 
+// 拼这条微博的固定地址要用当前站点域名（桌面版 weibo.com/<uid>/<bid>，移动版 m.weibo.cn/status/<id>）
+function pageHost() {
+    try { return new URL((S.tab && S.tab.url) || (S.data && S.data.pageUrl) || '').hostname; } catch (e) { return ''; }
+}
+
+// 认页面里那条微博用得到的 id：分组键里那个（采集器从属性或永久链接取的）+ 地址最后一段
+function groupIdsOf(g) {
+    const ids = [];
+    const m = /#ps(.+)$/.exec(String(g.key || ''));
+    if (m) ids.push(m[1]);
+    const seg = /weibo\.(?:com|cn)\/(?:\d{5,}\/)?([\w]{5,})(?:[?#]|$)/.exec(String(g.url || ''));
+    if (seg) ids.push(seg[1]);
+    const tail = String(g.url || '').split('/').pop() || '';
+    if (tail.length >= 5) ids.push(tail);
+    return [...new Set(ids.filter((x) => x && x.length >= 5))];
+}
+
+async function jumpToGroup(g) {
+    if (S.jumpMode === 'tab') {
+        chrome.tabs.create({ url: g.url, active: true });
+        return;
+    }
+    // scrollOnly = 只滚页面、**任何情况下都不新开标签**：滚不到就只说清为什么，不背着用户开标签
+    const tail = S.jumpMode === 'scrollOnly' ? '，按你的设置没有新开标签页' : '，改成新标签打开';
+    let r = null;
+    try {
+        const res = await chrome.scripting.executeScript({
+            target: { tabId: S.tabId, allFrames: false }, func: scrollToPost,
+            args: [{
+                ids: groupIdsOf(g), url: g.url, loadMissing: S.jumpMissing !== 'tab',
+                color: (getComputedStyle(document.documentElement).getPropertyValue('--accent') || '').trim() || '#6ea8fe',
+            }],
+        });
+        r = res && res[0] && res[0].result;
+    } catch (e) { r = null; }
+    if (r && r.ok) {
+        toast(`已经滚到那条微博（${r.centerDelta <= 24 ? '居中' : '尽量对齐了'}，高亮 2.6 秒`
+            + ((r.searched | 0) > 0 ? `，往下翻了 ${r.searched} 屏才挂出来` : '') + '）');
+        return;
+    }
+    toast(((r && r.found ? '这条微博找到了，但页面没能滚过去'
+        : (S.jumpMissing !== 'tab' && (r && r.searched | 0) > 0
+            ? `往下翻了 ${(r && r.searched) | 0} 屏也没加载出这条` + (r && r.restored ? '，已滚回原位' : '')
+                + (r && r.endNote ? `（${r.endNote}）` : '')
+            : '页面上没有这条微博（多半被虚拟列表回收了）')) + tail));
+    if (S.jumpMode !== 'scrollOnly') chrome.tabs.create({ url: g.url, active: true });
+}
+
 // 问页面自己那份信息流数据要图（只在主世界读，不碰页面数据）：虚拟列表把滚过去的帖子整条摘掉，
 // 光扫 DOM 拿不到，而列表里每条都带 pic_ids/pic_infos。读不到就算了，不影响正常扫描。
 async function readFeedPosts() {
@@ -364,8 +425,9 @@ async function readFeedPosts() {
         // 之前按「帮我翻页」直接问后端要来的那些帖子接在列表末尾，插值才会排在正确的位置上
         const seen = new Set();
         const list = [];
+        const host = pageHost();
         for (const [i, it] of (Array.isArray(r.posts) ? r.posts : []).entries()) {
-            const p = weiboStatusToPost(it, Number(it.index) || i);
+            const p = weiboStatusToPost(it, Number(it.index) || i, host);
             if (!p.pics.length) continue;
             if (p.mid) seen.add(p.mid);
             list.push(p);
@@ -406,7 +468,7 @@ async function loadMorePages() {
     if (res && res.route === 'fetch' && Array.isArray(res.statuses) && res.statuses.length) {
         const seen = new Set(S.extraPosts.map((p) => p.mid).filter(Boolean));
         for (const s of res.statuses) {
-            const p = weiboStatusToPost(s, 0);
+            const p = weiboStatusToPost(s, 0, pageHost());
             if (!p.pics.length || (p.mid && seen.has(p.mid))) continue;
             if (p.mid) seen.add(p.mid);
             S.extraPosts.push(p);
@@ -533,10 +595,10 @@ function mergeResults(results, tab, feed) {
         for (const g of res.groups) {
             let target = byKey.get(g.key);
             if (!target) {
-                target = { key: g.key, label: g.label || '本页图片', sub: g.sub || '', items: [], junk: !!g.junk };
+                target = { key: g.key, label: g.label || '本页图片', sub: g.sub || '', url: g.url || '', items: [], junk: !!g.junk };
                 byKey.set(g.key, target);
                 groups.push(target);
-            }
+            } else if (!target.url && g.url) target.url = g.url;
             for (const raw of g.items || []) {
                 const url = upgradeWeiboImageUrl(raw.url || '');
                 if (!url) continue;
@@ -716,6 +778,21 @@ function renderGroups() {
             refreshSelectionUI();
         };
         head.append(avatar, title, sp);
+        // 「跳转」：默认把用户的页面滚到这一条并描一圈高亮；页面上没有它的 DOM（被虚拟列表回收了）
+        // 或设置里选了「新标签打开」，就开新标签 —— 那条地址是按 uid+bid 拼出来的，照样能打开
+        if (!g.junk && g.url) {
+            const open = document.createElement('button');
+            open.className = 'g-group-open';
+            open.type = 'button';
+            open.textContent = (S.data && S.data.weibo) ? '↗ 微博' : '↗ 原帖';
+            open.title = `${S.jumpMode === 'tab' ? '在新标签打开这条微博'
+                : S.jumpMode === 'scrollOnly'
+                    ? '滚到页面上这条微博（绝不新开标签页）'
+                    : '滚到页面上这条微博' + (S.jumpMissing === 'tab' ? '（页面上没有就开新标签）' : '（页面上还没有就先往下滚找它）')}：${g.url}`;
+            open.dataset.url = g.url;
+            open.onclick = () => { void jumpToGroup(g); };
+            head.append(open);
+        }
         if (!g.junk) head.append(inv);
         head.append(checkLabel);
 
@@ -1339,28 +1416,70 @@ function setWfStatus(text, ok) {
     el.classList.toggle('ok', !!ok);
 }
 
+function updateExprUi(f) {
+    const row = $('#wfExprRow');
+    const hint = $('#wfExprHint');
+    const box = $('#wfKeywords');
+    if (f.keywordMode !== 'expr') {
+        row.hidden = true;
+        box.placeholder = '搜索微博内容（一行一个也行）';
+        box.classList.remove('bad');
+        return;
+    }
+    row.hidden = false;
+    box.placeholder = '例：(抽奖 或 转发) 且 非 广告';
+    const src = exprSource(f);
+    if (!src) {
+        box.classList.remove('bad');
+        hint.textContent = '只留下式子成立的微博，其余全部挡掉。并排写就是「且」；认 或/且/非、|| / && / !、括号，"引号" 里整串算一个词';
+        return;
+    }
+    const parsed = keywordExprOf(src);
+    box.classList.toggle('bad', !parsed.ok);
+    hint.classList.toggle('bad', !parsed.ok);
+    hint.textContent = parsed.ok
+        ? `看懂了（只留成立的）：${describeExpr(parsed.node)}`
+        : `看不懂（${parsed.error}），这一条现在不筛任何东西`;
+}
+
+// 把解析出来的树讲回人话，让用户一眼确认「我写的确实是这个意思」
+function describeExpr(node) {
+    const w = (n, top) => {
+        if (!n) return '';
+        if (n.k === 'term') return `含「${n.v}」`;
+        if (n.k === 'not') return `不含${w(n.a, false)}`;
+        const a = w(n.a, false), b = w(n.b, false);
+        if (n.k === 'and') return top ? `${a} 且 ${b}` : `${a} 且 ${b}`;
+        return top ? `${a} 或 ${b}` : `(${a} 或 ${b})`;
+    };
+    return w(node, true);
+}
+
 function syncFilterForm() {
     const f = normalizeWeiboFilter((S.settings || {}).weiboFilter);
     for (const el of document.querySelectorAll('[data-wf-type]')) el.checked = f.types[el.dataset.wfType] !== false;
-    $('#wfKeywords').value = f.keywords.join(' ');
+    $('#wfKeywords').value = f.keywords.join(f.keywordMode === 'expr' ? ' ' : '\n');
     $('#wfKeywordMode').value = f.keywordMode;
     $('#wfFrom').value = f.dateFrom;
     $('#wfTo').value = f.dateTo;
     $('#wfAllSites').checked = f.allSites;
     $('#wfExperimental').checked = f.experimental;
     $('#wfSiteHint').textContent = f.allSites ? '对所有微博站点生效' : `只对当前站点生效（${S.filterSite || filterHost() || '未知'}）`;
+    updateExprUi(f);
 }
 
 function readFilterForm() {
     const types = {};
     for (const el of document.querySelectorAll('[data-wf-type]')) types[el.dataset.wfType] = el.checked;
+    const keywordMode = $('#wfKeywordMode').value;
     return normalizeWeiboFilter({
         enabled: true,
         site: S.filterSite || filterHost(),
         allSites: $('#wfAllSites').checked,
         types,
-        keywordMode: $('#wfKeywordMode').value,
-        keywords: splitKeywords($('#wfKeywords').value),
+        keywordMode,
+        // 表达式档整句原样交给 normalize 处理（按逗号拆开会把表达式拆坏）
+        keywords: $('#wfKeywords').value,
         dateFrom: $('#wfFrom').value,
         dateTo: $('#wfTo').value,
         experimental: !!$('#wfExperimental').checked,
@@ -1383,6 +1502,7 @@ let wfTimer = 0;
 function onFilterFormChanged() {
     const filter = readFilterForm();
     S.settings.weiboFilter = filter;
+    updateExprUi(filter);
     clearTimeout(wfTimer);
     wfTimer = setTimeout(() => {
         chrome.runtime.sendMessage({ action: 'patchSettings', patch: { weiboFilter: filter } }).catch(() => {});

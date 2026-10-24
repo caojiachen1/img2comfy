@@ -2,6 +2,7 @@
 // 下载、离屏宿主生命周期、ComfyUI 上传与注入。
 
 import { migrateSettings, DEFAULT_SETTINGS } from './src/common/registry.js';
+import { keywordExprOf } from './src/common/weibo-filter.js';
 import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
 
@@ -72,14 +73,27 @@ function weiboFilterPage(arg) {
             const t = src.types && typeof src.types === 'object' ? src.types : {};
             const types = {};
             for (const k of ['original', 'repost', 'text', 'image', 'video', 'music']) types[k] = t[k] !== false;
+            const keywordMode = src.keywordMode === 'none' ? 'none' : src.keywordMode === 'expr' ? 'expr' : 'has';
+            const rawKw = Array.isArray(src.keywords) ? src.keywords.join(keywordMode === 'expr' ? ' ' : '\n') : src.keywords;
             return {
                 enabled: !!src.enabled,
                 types,
-                keywordMode: src.keywordMode === 'none' ? 'none' : 'has',
-                keywords: splitKeywords(Array.isArray(src.keywords) ? src.keywords.join('\n') : src.keywords),
+                keywordMode,
+                keywords: keywordMode === 'expr' ? [String(rawKw || '').trim()].filter(Boolean) : splitKeywords(rawKw),
                 dateFrom: normDay(src.dateFrom),
                 dateTo: normDay(src.dateTo),
             };
+        };
+        // 逻辑表达式在后台就解析好了（这段函数会被序列化注入，带不走解析器），这里只 walk 那棵树。
+        // 节点为空（表达式看不懂）就等于「这条规则不筛」，绝不因为语法写错把整页微博藏掉。
+        const exprNode = (arg && arg.expr) || null;
+        const evExpr = (n, low) => {
+            if (!n) return true;
+            if (n.k === 'term') return !n.v || low.indexOf(n.v) >= 0;
+            if (n.k === 'not') return !evExpr(n.a, low);
+            if (n.k === 'and') return evExpr(n.a, low) && evExpr(n.b, low);
+            if (n.k === 'or') return evExpr(n.a, low) || evExpr(n.b, low);
+            return true;
         };
         const match = (it, f) => {
             const page = it.page_info || {};
@@ -93,7 +107,9 @@ function weiboFilterPage(arg) {
             const textOnly = !hasImage && !hasVideo && !hasMusic;
             const passMedia = (f.types.text && textOnly) || (f.types.image && hasImage) || (f.types.video && hasVideo) || (f.types.music && hasMusic);
             if (!passMedia) return false;
-            if (f.keywords.length) {
+            if (f.keywordMode === 'expr') {
+                if (exprNode && !evExpr(exprNode, text.toLowerCase())) return false;
+            } else if (f.keywords.length) {
                 const low = text.toLowerCase();
                 const hit = f.keywords.some((k) => low.indexOf(String(k).toLowerCase()) >= 0);
                 if (f.keywordMode === 'has' && !hit) return false;
@@ -520,12 +536,22 @@ const HANDLERS = {
     applyWeiboFilterPage: async (req, sender) => {
         const tabId = Number((req && req.tabId) || (sender && sender.tab && sender.tab.id));
         if (!tabId) return { ok: false, error: '缺少 tabId' };
+        const f = (req && req.filter) || null;
+        // 表达式在这里解析成树再注入：注入的那段函数是序列化的，带不走解析器，只会 walk 树
+        let expr = null;
+        try {
+            if (f && f.keywordMode === 'expr') {
+                const src = Array.isArray(f.keywords) ? f.keywords.join(' ') : String((f && f.keywords) || '');
+                const parsed = keywordExprOf(src);
+                if (parsed.ok) expr = parsed.node;
+            }
+        } catch (e) { expr = null; }
         try {
             const r = await chrome.scripting.executeScript({
                 target: { tabId, allFrames: false },
                 world: 'MAIN',
                 func: weiboFilterPage,
-                args: [{ filter: (req && req.filter) || null, enabled: !!(req && req.enabled) }],
+                args: [{ filter: f, enabled: !!(req && req.enabled), expr }],
             });
             return (r && r[0] && r[0].result) || { ok: false, error: '页面没有返回结果' };
         } catch (e) {

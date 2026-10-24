@@ -37,6 +37,23 @@
           <label>风格 <select id="uiTheme"></select></label>
         </div>
         <p class="note">这里只换扩展自己的页面（设置页 + 本页图片面板），改完立刻生效，切到别的风格就是预览；悬浮工具栏长什么样用下面「显示与布局」里的「主题」。实验性筛选在页面右下角的提示条会跟随界面风格。</p>
+        <h3>本页图片面板 <small>图片菜单的行为</small></h3>
+        <div class="grid2">
+          <label>点「↗ 微博」时
+            <select id="jumpMode">
+              <option value="scroll">滚到那条微博（找不到就开新标签）</option>
+              <option value="scrollOnly">只滚动，绝不新开标签页</option>
+              <option value="tab">直接在新标签打开</option>
+            </select>
+          </label>
+          <label>页面上还没有这条时
+            <select id="jumpMissing">
+              <option value="scroll">一直往下滚，直到它加载出来</option>
+              <option value="tab">直接在新标签打开</option>
+            </select>
+          </label>
+        </div>
+        <p class="note">「滚到那条微博」只在你点了按钮之后才动页面滚动位置，扫描采集时永远不碰你的页面。「只滚动，绝不新开标签页」连退回都不做：页面上没有这条（被虚拟列表回收了）或滚不动时，只在面板上告诉你为什么，不会再背着你不停开标签。「页面上还没有这条时」选「一直往下滚」的话，会一步一屏滚下去、边滚边找，找到就停下描高亮 —— **会一直翻到它出现为止**（右下角实时显示已经翻了几个屏幕），只有这个分组真的到底、页面本身滚不动、或者你自己动手滚了页面才会停；翻不到就帮你滚回原来看的位置。</p>
         <h3>显示与布局</h3>
         <div class="grid2">
           <label>显示时机

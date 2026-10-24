@@ -10,7 +10,7 @@ import { STEPS, runChain } from '../src/common/steps.js';
 import { buildToolbar, migrateSettings, DEFAULT_SETTINGS, TOOLS, DEFAULT_COLLAPSED } from '../src/common/registry.js';
 import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.js';
 import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64, bytesFingerprint, uniqueUploadName, extFromMime } from '../src/common/util.js';
-import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, clampLoadPages } from '../src/common/gallery.js';
+import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, weiboStatusUrl, clampLoadPages } from '../src/common/gallery.js';
 import { UI_THEMES, DEFAULT_UI_THEME, normalizeUiTheme, uiThemeLabel } from '../src/common/theme.js';
 
 let pass = 0, fail = 0;
@@ -684,6 +684,83 @@ console.log('== weibo-filter（信息流筛选判定）==');
         && wf.describeWeiboFilter(on).includes('没有条件'));
 }
 
+console.log('== 关键字逻辑表达式（且 / 或 / 非 / 括号）==');
+{
+    const wf = await import('../src/common/weibo-filter.js');
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const on = { enabled: true, types: { original: true, repost: true, text: true, image: true, video: true, music: true } };
+    const post = (o) => ({ repost: false, hasImage: false, hasVideo: false, hasMusic: false, text: '', date: '', ...o });
+    const E = (expr) => ({ ...on, keywordMode: 'expr', keywords: expr });
+    const p = (s) => wf.keywordExprOf(s);
+    ok('并排写就是「且」：两个词都得有',
+        p('抽奖 关注').ok && !wf.matchWeiboFilter(post({ text: '只有抽奖' }), E('抽奖 关注'))
+        && wf.matchWeiboFilter(post({ text: '抽奖并关注' }), E('抽奖 关注')));
+    ok('「或」的三种写法都一样：或 / || / 逗号',
+        ['抽奖 或 转发', '抽奖||转发', '抽奖,转发'].every((s) => p(s).ok
+            && wf.matchWeiboFilter(post({ text: '今天转发' }), E(s)) && wf.matchWeiboFilter(post({ text: '抽奖啦' }), E(s))
+            && !wf.matchWeiboFilter(post({ text: '日常' }), E(s))));
+    ok('「非」的三种写法都一样：非 / ! / NOT，且只作用在紧邻的那一个词上',
+        ['非 广告', '!广告', 'NOT 广告'].every((s) => p(s).ok && !wf.matchWeiboFilter(post({ text: '这条有广告' }), E(s))
+            && wf.matchWeiboFilter(post({ text: '干净的' }), E(s)))
+        && !wf.matchWeiboFilter(post({ text: '抽奖 有广告' }), E('抽奖 非 广告'))
+        && wf.matchWeiboFilter(post({ text: '抽奖 干净的' }), E('抽奖 非 广告')));
+    ok('优先级：! > 且 > 或，括号能改；a || b && c 认成 a 或 (b 且 c)',
+        wf.matchWeiboFilter(post({ text: '只有 b' }), E('a||b&&c')) === false
+        && wf.matchWeiboFilter(post({ text: 'bc' }), E('a||b&&c')) === true
+        && wf.matchWeiboFilter(post({ text: '只有 b' }), E('(a||b)&&c')) === false
+        && wf.matchWeiboFilter(post({ text: 'abc' }), E('(a||b)&&c')) === true);
+    ok('(抽奖 或 转发) 且 非 广告 这种组合真的按组合判',
+        p('(抽奖 或 转发) 且 非 广告').ok && wf.matchWeiboFilter(post({ text: '转发说明：抽奖啦' }), E('(抽奖 或 转发) 且 非 广告'))
+        && !wf.matchWeiboFilter(post({ text: '转发里夹了广告' }), E('(抽奖 或 转发) 且 非 广告'))
+        && !wf.matchWeiboFilter(post({ text: '普通日常' }), E('(抽奖 或 转发) 且 非 广告')));
+    ok('引号里的整串算一个词（里面的 或/&& 不当运算符）',
+        p('"A 或 B" 且 C').ok && JSON.stringify(p('"A 或 B" 且 C').node.a) === JSON.stringify({ k: 'term', v: 'a 或 b' })
+        && !wf.matchWeiboFilter(post({ text: 'A 还有 C' }), E('"A 或 B" 且 C'))
+        && wf.matchWeiboFilter(post({ text: '写的是 A 或 B 还有 C' }), E('"A 或 B" 且 C')));
+    ok('中文词自己含「非/或/且」时不许被当运算符（没空格就是一个词）',
+        p('非诚勿扰').ok && p('一对一').ok && p('且慢').ok
+        && wf.matchWeiboFilter(post({ text: '看了非诚勿扰' }), E('非诚勿扰'))
+        && !wf.matchWeiboFilter(post({ text: '看了别的' }), E('非诚勿扰')));
+    ok('大小写不敏感（词和正文两边都折小写）',
+        wf.matchWeiboFilter(post({ text: '今天的 GIVEAWAY 抽奖' }), E('giveaway'))
+        && !wf.matchWeiboFilter(post({ text: '今天的抽奖' }), E('GIVEAWAY 且 代购')));
+    ok('写坏了就「不筛任何东西」，并说清坏在哪（宁可多留，绝不整页误杀）',
+        p('((抽奖').error.length > 0 && p('且 抽奖').error.length > 0 && p('抽奖 且').error.length > 0
+        && p('抽奖 且 关注)').error.length > 0 && p('"没关引号').error.length > 0
+        && ['((抽奖', '且 抽奖', '抽奖 且', '抽奖 且 关注)', '"没关引号'].every((s) => wf.matchWeiboFilter(post({ text: '随便什么' }), E(s)))
+        && wf.matchWeiboFilter(post({ text: '随便什么' }), E('抽奖')) === false);
+    ok('空表达式 = 这条规则不生效（不是「什么都不要」）',
+        p('   ').empty === true && p('').ok === false && wf.matchWeiboFilter(post({ text: '随便什么' }), E('   ')));
+    ok('表达式太长就拒解析（免得被人贴一整篇正文进去）',
+        p('A 且 ' + '字'.repeat(wf.EXPR_MAX_LEN)).error.includes('太长'));
+    ok('expr 档整句原样存着：normalize 绝不按逗号/顿号把它拆开',
+        (() => { const n = wf.normalizeWeiboFilter({ keywordMode: 'expr', keywords: '(抽奖, 关注) 或 !广告' });
+            return n.keywordMode === 'expr' && n.keywords.length === 1 && n.keywords[0] === '(抽奖, 关注) 或 !广告'; })()
+        && (() => { const n = wf.normalizeWeiboFilter({ keywordMode: 'expr', keywords: ['(A 或 B)', '且 C'] });
+            return n.keywords[0] === '(A 或 B) 且 C'; })());
+    ok('has / none 两档的老语义一点没变（升级不许改已有筛法）',
+        wf.matchWeiboFilter(post({ text: '抽奖' }), { ...on, keywordMode: 'has', keywords: '抽奖, 代购' })
+        && !wf.matchWeiboFilter(post({ text: '抽奖' }), { ...on, keywordMode: 'none', keywords: ['抽奖'] })
+        && wf.normalizeWeiboFilter({ keywordMode: 'has', keywords: '抽奖、代购' }).keywords.join('|') === '抽奖|代购'
+        && wf.normalizeWeiboFilter({ keywordMode: 'xx' }).keywordMode === 'has');
+    ok('描述文案会把逻辑式念出来，坏了就念「看不懂」',
+        wf.describeWeiboFilter(E('(抽奖 或 转发) 且 非 广告')).includes('逻辑式「(抽奖 或 转发) 且 非 广告」')
+        && wf.describeWeiboFilter(E('((抽奖')).includes('看不懂'));
+    ok('面板第三档真的在 HTML 里，语法行 + 实时校验都在',
+        /<option value="expr">/.exec(read('gallery.html')) !== null
+        && read('gallery.html').includes('id="wfExprRow"') && read('gallery.html').includes('id="wfExprHint"')
+        && read('src/gallery/gallery.mjs').includes('function updateExprUi')
+        && read('src/gallery/gallery.mjs').includes('updateExprUi(filter)'));
+    ok('表达式原文要当整句交给 normalize（面板侧不再先 splitKeywords 拆一遍）',
+        read('src/gallery/gallery.mjs').includes('keywords: $(\'#wfKeywords\').value')
+        && !read('src/gallery/gallery.mjs').includes('splitKeywords'));
+    ok('注入页面的那份函数只 walk 树，绝不重复实现解析器（后台已经编译好）',
+        read('background.js').includes('func: weiboFilterPage')
+        && read('background.js').includes('expr = parsed.node')
+        && read('background.js').includes('const evExpr = (n, low) =>')
+        && !read('background.js').includes('parseKeywordExpr'));
+}
+
 console.log('== theme（界面风格）==');
 {
     const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
@@ -1008,6 +1085,120 @@ console.log('== 微博翻页（映射与页数）==');
         clampLoadPages(0) === 1 && clampLoadPages(99) === 10 && clampLoadPages('5') === 5
         && clampLoadPages('x') === 3 && clampLoadPages(undefined) === 3 && clampLoadPages(-2) === 1
         && clampLoadPages(4.6) === 5);
+
+    const st = (o) => ({ mid: '5000001111', bid: 'AbCdEfG', mblogid: 'HjKlMnO', user: { id: '7000001111', screen_name: '甲' }, ...o });
+    ok('跳转地址优先用 mblogid（微博地址栏里显示的那个），桌面版拼成 weibo.com/<uid>/<id>',
+        weiboStatusUrl(st({}), 'weibo.com') === 'https://weibo.com/7000001111/HjKlMnO'
+        && weiboStatusUrl(st({ mblogid: '' }), 'weibo.com') === 'https://weibo.com/7000001111/AbCdEfG'
+        && weiboStatusUrl(st({ mblogid: '', bid: '' }), 'weibo.com') === 'https://weibo.com/7000001111/5000001111');
+    ok('认不出 uid 就退到 m.weibo.cn/status/<id>（那个形状只靠 id 也能打开），移动版页面直接走它',
+        weiboStatusUrl(st({ user: null }), 'weibo.com') === 'https://m.weibo.cn/status/HjKlMnO'
+        && weiboStatusUrl(st({ user: { screen_name: '没有 id' } }), 'www.weibo.com') === 'https://m.weibo.cn/status/HjKlMnO'
+        && weiboStatusUrl(st({}), 'm.weibo.cn') === 'https://m.weibo.cn/status/HjKlMnO');
+    ok('id 短到不像话或缺失时不给地址（宁可不显示「跳转」，也别拼出一个 404）',
+        weiboStatusUrl({ user: { id: '7000001111' } }, 'weibo.com') === ''
+        && weiboStatusUrl(st({ mid: '12', bid: 'ab', mblogid: '' }), 'weibo.com') === ''
+        && weiboStatusUrl(null, 'weibo.com') === '');
+    const pUrl = weiboStatusToPost({ mid: '5000002222', mblogid: 'Zz11223', user: { id: '7000002222', screen_name: '乙' }, pic_ids: ['K'], pic_infos: { K: { large: { url: 'https://wx1.sinaimg.cn/large/K.jpg' } } } }, 1, 'weibo.com');
+    ok('帖子形状带着跳转地址走（mergeFeedPosts 建组时要用它）',
+        pUrl.url === 'https://weibo.com/7000002222/Zz11223' && pUrl.pics.length === 1, JSON.stringify(pUrl));
+    const accU = { groups: [], byKey: new Map(), seen: new Set(), byPid: new Map() };
+    const domUrlKey = 'acct:7000003333#psNn990011';
+    {
+        const g = { key: domUrlKey, label: '丙', sub: '', items: [], junk: false, y: 800 };
+        accU.byKey.set(domUrlKey, g);
+        accU.groups.push(g);
+        const url = 'https://wx1.sinaimg.cn/large/JJ1.jpg';
+        const dk = imageDedupeKey(url);
+        accU.seen.add(domUrlKey + '|' + dk);
+        accU.byPid.set(dk, domUrlKey);
+        g.items.push({ key: domUrlKey + '|' + dk, url, y: 800 });
+    }
+    mergeFeedPosts(accU, [
+        {
+            index: 0, mid: '5000003333', bid: 'Nn990011', id: '', uid: '7000003333', name: '丙', text: '',
+            pics: [{ url: 'https://wx1.sinaimg.cn/large/JJ1.jpg', width: 0, height: 0 }], url: 'https://weibo.com/7000003333/Nn990011',
+        },
+        {
+            index: 1, mid: '5000003334', bid: '', id: '', uid: '7000003334', name: '丁', text: '',
+            pics: [{ url: 'https://wx1.sinaimg.cn/large/JJ2.jpg', width: 0, height: 0 }], url: 'https://weibo.com/7000003334/Pp778899',
+        },
+    ], {});
+    ok('补来的组带跳转地址；DOM 组自己没认出链接时用数据里那个补上（页面上没 DOM 的帖子照样能跳）',
+        accU.groups.find((g) => g.key === 'acct:7000003333#psNn990011').url === 'https://weibo.com/7000003333/Nn990011'
+        && accU.groups.find((g) => g.key === 'feed:5000003334').url === 'https://weibo.com/7000003334/Pp778899',
+        JSON.stringify(accU.groups.map((g) => [g.key, g.url])));
+}
+
+console.log('== 面板跳转方式 ==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    ok('默认跳转方式是「滚到那条微博」，老设置迁移时自动补上',
+        DEFAULT_SETTINGS.gallery.jumpMode === 'scroll' && migrateSettings(undefined).gallery.jumpMode === 'scroll');
+    ok('存过的 jumpMode 原样保留，脏值由面板侧兜成 scroll（只有显式 tab 才开标签）',
+        migrateSettings({ version: 2, gallery: { jumpMode: 'tab' } }).gallery.jumpMode === 'tab'
+        && ((settings) => settings.gallery.jumpMode === 'nope')(migrateSettings({ version: 2, gallery: { jumpMode: 'nope' } })));
+    const jumpSel = (/<select id="jumpMode">([\s\S]*?)<\/select>/.exec(read('options.html')) || [])[1] || '';
+    const vals = [...jumpSel.matchAll(/value="([^"]+)"/g)].map((x) => x[1]);
+    ok('设置页「点 ↗ 微博时」下拉恰好三档，且和 options.mjs 的绑定字段对得上',
+        vals.join(',') === 'scroll,scrollOnly,tab' && read('src/options/options.mjs').includes('[\'gallery.jumpMode\', \'jumpMode\']'), 'HTML=' + vals.join(','));
+    ok('面板侧只认显式的 tab / scrollOnly，其余（含脏值）一律按滚到那条微博处理',
+        read('src/gallery/gallery.mjs').includes("return v === 'tab' || v === 'scrollOnly' ? v : 'scroll'"));
+    ok('只有真「tab」档才直接开标签；scrollOnly 必须继续走滚动（旧写法 !== scroll 会把 scrollOnly 当 tab）',
+        read('src/gallery/gallery.mjs').includes("if (S.jumpMode === 'tab') {")
+        && !read('src/gallery/gallery.mjs').includes("if (S.jumpMode !== 'scroll') {"));
+    ok('scrollOnly 档：滚不到也绝不新开标签，只在提示条上说清为什么',
+        /if \(S\.jumpMode !== 'scrollOnly'\) chrome\.tabs\.create/.test(read('src/gallery/gallery.mjs'))
+        && read('src/gallery/gallery.mjs').includes('按你的设置没有新开标签页'));
+    ok('默认「页面上还没有这条」也是先往下滚找，老设置迁移时自动补上',
+        DEFAULT_SETTINGS.gallery.jumpMissing === 'scroll' && migrateSettings(undefined).gallery.jumpMissing === 'scroll');
+    ok('存过的 jumpMissing 原样保留（选了开新标签的老用户不会被偷偷改成滚动）',
+        migrateSettings({ version: 2, gallery: { jumpMissing: 'tab' } }).gallery.jumpMissing === 'tab');
+    const missSel = (/<select id="jumpMissing">([\s\S]*?)<\/select>/.exec(read('options.html')) || [])[1] || '';
+    const mvals = [...missSel.matchAll(/value="([^"]+)"/g)].map((x) => x[1]);
+    ok('设置页「页面上还没有这条时」下拉恰好两档，且和 options.mjs 的绑定字段对得上',
+        mvals.join(',') === 'scroll,tab' && read('src/options/options.mjs').includes('[\'gallery.jumpMissing\', \'jumpMissing\']'), 'HTML=' + mvals.join(','));
+    const jumpSrc = read('src/gallery/gallery.mjs');
+    ok('面板把 jumpMissing 当成 loadMissing 传给页面侧，两档真的分流',
+        /loadMissing:\s*S\.jumpMissing/.test(jumpSrc) && jumpSrc.includes("S.jumpMissing = (S.settings.gallery || {}).jumpMissing === 'tab'"));
+    ok('找齐一条微博是「边滚边重新扫」，不是扫一次就算（loadMissing 那条路必须回头再 findPost）',
+        /if \(!hit && opt\.loadMissing\) \{[\s\S]{0,1800}?hit = findPost\(\)/.test(read('src/gallery/collect.mjs')));
+}
+
+console.log('== 跳转高亮浮层（不许被下一条帖子盖住）==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const src = read('src/gallery/collect.mjs');
+    ok('高亮不再写 outline 到微博那一条上（outline 画在外框，会被下一条不透明、后绘制的帖子压掉底边 —— 用户报的现场）',
+        !src.includes("hit.style.setProperty('outline'") && !src.includes('hit.style.removeProperty'));
+    ok('改成自己的浮层：固定定位、pointer-events:none、跟着滚动重定位、2.6 秒后整块摘掉',
+        /const HL_ID = 'mtb-jump-hl'/.test(src) && src.includes('position:fixed') && src.includes('pointer-events:none')
+        && /Date\.now\(\) - t0 > 2600/.test(src) && src.includes('removeChild(hl)'));
+    ok('浮层带一圈明暗双环（白页面、黑页面都看得见），颜色跟着界面风格的 --accent 走',
+        /box-shadow:0 0 0 2px/.test(src) && /box-shadow[\s\S]{0,80}rgba\(0, ?0, ?0/.test(src)
+        && read('src/gallery/gallery.mjs').includes("getPropertyValue('--accent')"));
+    ok('滚到底也没找到时必须滚回用户原来看的位置，并把这件事写进结果（面板据此提示）',
+        /window\.scrollTo\(0, start\)/.test(src) && /restored = true/.test(src) && src.includes('out.searched'));
+}
+
+console.log('== 往下翻找：没有「翻几屏就算了」的上限 ==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const src = read('src/gallery/collect.mjs');
+    ok('不许再有几十屏就收手的天花板（用户就是被「往下翻了 24 屏也没加载出这条」惹的），只留一个防死循环的天花板',
+        !/Math\.min\(40,/.test(src) && /opt\.maxScreens \| 0 \|\| 4000/.test(src) && /HARD_CAP/.test(src));
+    ok('只有三种情况才允许停：贴着文档底连翻 8 屏没长（真到底了）、页面本身滚不动、用户自己在滚（要立刻让开）',
+        src.includes('这个页面本身滚不动') && src.includes('你自己在滚页面，已经停下让开')
+        && src.includes('微博这个分组已经到底了') && /still >= 8/.test(src));
+    ok('「没长新东西」只有在已经贴着底时才计数 —— 否则页面里本来就有一段很长的空白（或已加载但未渲染），会被误判成到底',
+        /else if \(atBottom && \+\+still/.test(src));
+    ok('几十秒的自动滚动必须在页面上说清是谁在滚、翻到第几屏，收尾把浮标摘掉',
+        /const BADGE_ID = 'mtb-jump-search'/.test(src) && src.includes('正在往下翻找这条微博')
+        && /clearBadge\(\);/.test(src));
+    ok('面板把翻找结果念全：翻了几屏、有没有滚回原位、为什么停（endNote 只在页面侧说了才写）',
+        read('src/gallery/gallery.mjs').includes('屏也没加载出这条')
+        && /r\.restored \? '，已滚回原位'/.test(read('src/gallery/gallery.mjs'))
+        && /r\.endNote \? `（\$\{r\.endNote\}）`/.test(read('src/gallery/gallery.mjs')));
 }
 
 __summary();process.exit(fail ? 1 : 0);

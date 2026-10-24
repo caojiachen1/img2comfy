@@ -263,7 +263,16 @@ window.__mtbRerender = function () {
 // 「全部微博」夹具：真虚拟列表只把屏幕上那几条挂进 DOM，滚过去的整条摘掉 —— 光扫 DOM 就拿不到它们的图。
 // 这里 DOM 里只挂两条（甲、乙）+ 一条被筛选挡掉的（庚），另外四条只存在于页面自己那份信息流数据里。
 // 数据里同时演：转发微博的图在原帖对象上（己）、纯文字帖子（戊，不该建组）、已经采到的帖子不许重复。
-function feedHtml() {
+// 虚拟列表「滚到才挂载」的那种帖子：只带它自己的 data-bid（scrollToPost 认这个），不带图，
+// 免得挂进 DOM 之后干扰面板的卡片计数
+function mountPost(uid, bid, name) {
+    return `<article class="post card9 weibo-main" data-bid="${bid}" style="height:520px"><header>${authorHtml({ uid, name })}</header>`
+        + `<p>${name}：这条要滚到这儿才挂进 DOM</p></article>`;
+}
+function feedHtml(mount = false, deep = false) {
+    // deep：把「丁」推到 20000 px 之外（要翻 30 多屏才挂出来）—— 专门钉「没有翻几屏就算了的上限」
+    const SPACER = deep ? 24000 : 2600;
+    const DING_AT = deep ? 20000 : 1500;
     const a1 = { uid: '6000006101', name: '甲在屏上' };
     const a2 = { uid: '6000006102', name: '乙在屏上' };
     const infos = (...pids) => {
@@ -300,12 +309,29 @@ header a{color:#8ab4ff;text-decoration:none;margin-right:6px}
 ${postHtml(a1, 0, 611)}
 ${postHtml(a2, 1, 621)}
 ${hiddenPost}
+${mount ? `<div style="height:${SPACER}px">这段空白只是让「一直往下滚找它」一定滚得动</div>\n<div id="mtbSlot"></div>` : ''}
 <div id="app"></div>
 <script>
 // weiboFeedPage 在主世界里找的就是这个形状：#app._vnode.component.data.list
 window.__mtbFeed = ${JSON.stringify(items)};
 document.getElementById('app')._vnode = { component: { type: { name: 'Home' }, data: { list: window.__mtbFeed }, subTree: null } };
 </script>
+${mount ? `<script>
+// 真虚拟列表就是「滚到某个位置才把后面那条挂进 DOM」——挂载时带上它自己的 data-bid，
+// 正是「页面上还没有这条时一直往下滚找它」要撞上的东西。己（Pm6000006107）故意永远不挂，用来演滚到底也没有。
+window.__mtbMounts = [
+    { at: 500, bid: 'Pm6000006103', html: ${JSON.stringify(mountPost('6000006103', 'Pm6000006103', '丙已回收'))} },
+    { at: ${DING_AT}, bid: 'Pm6000006104', html: ${JSON.stringify(mountPost('6000006104', 'Pm6000006104', '丁已回收'))} },
+];
+window.__mtbMounted = [];
+const mtbTick = function () {
+    const y = window.scrollY || 0; const slot = document.getElementById('mtbSlot');
+    for (const m of window.__mtbMounts) {
+        if (!m.done && y >= m.at) { m.done = true; slot.insertAdjacentHTML('beforeend', m.html); window.__mtbMounted.push(m.bid); }
+    }
+};
+addEventListener('scroll', mtbTick, true); setInterval(mtbTick, 120); mtbTick();
+</script>` : ''}
 </body></html>`;
 }
 
@@ -454,7 +480,7 @@ const server = http.createServer((req, res) => {
         res.end(u.searchParams.get('shapes') === '1' ? shapesHtml()
             : u.searchParams.get('fold') === '1' ? foldHtml()
                 : u.searchParams.get('filter') === '1' ? filterHtml()
-                : u.searchParams.get('feed') === '1' ? feedHtml()
+                : u.searchParams.get('feed') === '1' ? feedHtml(u.searchParams.get('mount') === '1', u.searchParams.get('deep') === '1')
                 : u.searchParams.get('more') === '1' ? moreHtml(1)
                     : u.searchParams.get('more') === '2' ? moreHtml(2)
                         : u.searchParams.get('more') === '3' ? moreHtml(3)
@@ -1376,6 +1402,35 @@ async function runWeiboFilterChecks() {
         !!(f5 && f5.hidden.length === 0 && f5.shown.length === 6
             && f5.chip && f5.chip.hidden === true && cleared.stored.enabled === false), { cleared: { enabled: cleared.stored.enabled, status: cleared.status }, f5 });
 
+    // —— 关键字逻辑表达式（且 / 或 / 非 / 括号）——
+    const setExpr = (src) => cdp.ev(fp, `(async()=>{
+      const k=document.querySelector('#wfKeywords');k.value=${JSON.stringify(src)};k.dispatchEvent(new Event('input',{bubbles:true}));
+      const m=document.querySelector('#wfKeywordMode');m.value='expr';m.dispatchEvent(new Event('change',{bubbles:true}));
+      await new Promise(r=>setTimeout(r,700));
+      return {hint:(document.querySelector('#wfExprHint')||{}).textContent||'',
+        rowHidden:document.querySelector('#wfExprRow').hidden,
+        bad:document.querySelector('#wfKeywords').classList.contains('bad'),
+        status:document.querySelector('#wfStatus').textContent,
+        stored:(await chrome.storage.local.get(['mtbSettings'])).mtbSettings.weiboFilter};})()`);
+    const e1 = await setExpr('抽奖 或 视频');
+    const fe1 = await readFeed();
+    step('关键字逻辑式「抽奖 或 视频」：只留下含这俩的（有视频 + 抽奖），其余四条挡掉，语法行还把式子念回人话',
+        !!(e1 && e1.rowHidden === false && e1.bad === false && /看懂了（只留成立的）：含「抽奖」 或 含「视频」/.test(e1.hint)
+            && e1.stored.keywordMode === 'expr' && e1.stored.keywords.length === 1 && e1.stored.keywords[0] === '抽奖 或 视频'
+            && fe1 && fe1.shown.join(',') === '有视频账号,抽奖账号' && fe1.hidden.length === 4 && fe1.zeroed
+            && /已隐藏 4 条/.test(e1.status)), { e1, fe1 });
+    const e2 = await setExpr('转发 且 非 抽奖');
+    const fe2 = await readFeed();
+    step('逻辑式真按「且 + 非」判：只留真转发那条，正文里带「转发」二字的抽奖那条被挡掉',
+        !!(fe2 && fe2.hidden.length === 5 && fe2.shown.join(',') === '转发账号' && /已隐藏 5 条/.test(e2.status)), { e2, fe2 });
+    const e3 = await setExpr('((抽奖');
+    const fe3 = await readFeed();
+    step('表达式写坏了：一句话讲清坏在哪、输入框描上危险色，而这条规则不藏任何东西（绝不误杀整页）',
+        !!(e3 && e3.bad === true && /看不懂/.test(e3.hint) && e3.stored.keywords[0] === '((抽奖'
+            && fe3 && fe3.hidden.length === 0 && fe3.shown.length === 6), { e3, fe3 });
+    await setForm(`(()=>{document.querySelector('#wfClear').click();})()`);
+    await wait(500);
+
     // 实验模式：后台把一段代码注入页面主世界，直接改微博自己的信息流数组（夹具里是 #app._vnode.component.data.list）。
     // 这条路不碰 DOM，列表自己重排 → 被筛掉的帖子真的不存在，不留空位。失败会自动退回上面的页面隐藏。
     const readList = () => cdp.ev(filterPage, `(()=>{
@@ -1417,6 +1472,27 @@ async function runWeiboFilterChecks() {
         !!(expBack.stored.experimental === false && backList && backList.len === 6
             && backList.mids.join(',') === '9001,9002,9003,9004,9005,9006'
             && /页面隐藏/.test(expBack.status)), { status: expBack.status, list: backList });
+
+    // 实验模式那条路用的是页面里另一份判定（后台先把表达式编译成树再注入，注入的函数只会 walk 树），
+    // 所以逻辑式必须在这条路上也单独验一遍 —— 只测「页面隐藏」那条路会漏掉整份注入代码。
+    const exExprSet = await setForm(`(()=>{const t=document.querySelector('[data-wf-type="text"]');if(!t.checked)t.click();
+      const m=document.querySelector('#wfKeywordMode');m.value='expr';m.dispatchEvent(new Event('change',{bubbles:true}));
+      const k=document.querySelector('#wfKeywords');k.value='抽奖 或 视频';k.dispatchEvent(new Event('input',{bubbles:true}));
+      const c=document.querySelector('#wfExperimental');if(!c.checked)c.click();})()`);
+    const exExprList = await readList();
+    step('实验模式下逻辑式同样走通：后台把它编译成树注入，页面里那份数组只留下「抽奖 或 视频」成立的两条',
+        !!(exExprSet.stored.experimental === true && exExprSet.stored.keywordMode === 'expr'
+            && exExprSet.stored.keywords[0] === '抽奖 或 视频'
+            && exExprList && exExprList.len === 2
+            && exExprList.mids.join(',') === '9003,9004'), { status: exExprSet.status, list: exExprList });
+    // 把条件恢复成后面 SPA 换页那几步赖以成立的组合（纯文字不勾 + 不含抽奖 + 实验关），别顺手 clear 掉
+    await setForm(`(()=>{const c=document.querySelector('#wfExperimental');if(c.checked)c.click();
+      const t=document.querySelector('[data-wf-type="text"]');if(t.checked)t.click();
+      const m=document.querySelector('#wfKeywordMode');m.value='none';m.dispatchEvent(new Event('change',{bubbles:true}));
+      const k=document.querySelector('#wfKeywords');k.value='抽奖';k.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    const exExprBack = await readList();
+    step('表达式 + 实验模式收回去：数组完整回到 6 条，没把微博自己的列表改坏',
+        !!(exExprBack && exExprBack.len === 6 && exExprBack.mids.join(',') === '9001,9002,9003,9004,9005,9006'), exExprBack);
 
     // 用户报的 bug：单页应用里换到另一个微博页面（主页/分组），新列表被旧页面的帖子覆盖。
     // 夹具里模拟一次 SPA 导航：换成一个全新的数组（不同 mid）+ 改 hash，再改一次条件触发重算。
@@ -1623,6 +1699,32 @@ if (WEIBO_HOST) {
     }
     step('再打开「全部微博」又补齐成 27 张（关掉不是把数据弄丢了）', !!(back && back.chk === true && back.cards === 27), back && { chk: back.chk, cards: back.cards });
 
+    // 跳转按钮：DOM 里那两条用页面上的永久链接，被回收的三条按 uid+bid 拼
+    const jumpRead = await cdp.ev(feedGallery, `(()=>{const gs=[...document.querySelectorAll('.g-group:not(.g-junk)')];
+      return gs.map(g=>({name:(g.querySelector('.g-group-name')||{}).textContent||'',
+        url:(g.querySelector('.g-group-open')||{dataset:{}}).dataset.url||'',
+        txt:(g.querySelector('.g-group-open')||{textContent:''}).textContent||''}))})()`);
+    const wantUrl = (name, u) => { const r = jumpRead.find((x) => x.name === name); return !!(r && r.url === u && r.txt === '↗ 微博'); };
+    step('每个分组头都有「↗ 微博」，DOM 里那两条用的是页面上真实的永久链接',
+        wantUrl('@甲在屏上', 'http://weibo.com/6000006101/Pm60000061010')
+        && wantUrl('@乙在屏上', 'http://weibo.com/6000006102/Pm60000061021'), jumpRead);
+    step('被虚拟列表回收、页面上没 DOM 的三条也照样能跳（地址按 uid + bid 拼出来）',
+        wantUrl('@丙已回收', 'https://weibo.com/6000006103/Pm6000006103')
+        && wantUrl('@丁已回收', 'https://weibo.com/6000006104/Pm6000006104')
+        && wantUrl('@己转发带原帖图', 'https://weibo.com/6000006107/Pm6000006107'), jumpRead);
+    // 这一档下面「页面上还没有这条时」已经是默认往下滚找了，这里先把设置钉回「直接开新标签」，
+    // 才能干净地验「拼出来的地址真能开出标签」这一件事（往下滚找那条另有独立步骤）
+    await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+      s.gallery=Object.assign({},s.gallery||{},{jumpMissing:'tab'});await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    await wait(600);
+    await cdp.ev(feedGallery, `[...document.querySelectorAll('.g-group')].find(g=>/丙已回收/.test(g.textContent)).querySelector('.g-group-open').click()`);
+    await wait(1200);
+    const jumped = await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>/weibo\\.com\\/6000006103\\/Pm6000006103/.test(t.url||'')).map(t=>t.id))`);
+    const jumpY = await cdp.ev(swSess, `(async()=>{const r=await chrome.scripting.executeScript({target:{tabId:${feedTabId},allFrames:false},func:()=>Math.round(window.scrollY)});return r[0]&&r[0].result})()`);
+    step('页面上没有这条的 DOM 时自动退回新标签打开（默认就是「滚到那条微博」这一档），换档时也不许动页面',
+        !!(jumped && jumped.length >= 1 && jumpY === 0), { jumped, jumpY });
+    if (jumped && jumped.length) await cdp.ev(swSess, `chrome.tabs.remove([${jumped.join(',')}]).then(()=>true)`).catch(() => {});
+
     // 反向对照的落点记在这儿：把 collect.mjs 里合并转发原帖图那行删掉 → 第 1 条红；
     // 把 weiboFeedPage 的 isHidden 判断短路 → 第 2、5 条红；把 mergeFeedPosts 直接 return → 第 3、4、6、7、8、9 条全红。
     await cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
@@ -1734,6 +1836,250 @@ if (WEIBO_HOST) {
         }
         if (tid) await cdp.ev(swSess, `chrome.tabs.remove(${tid}).then(()=>true)`).catch(() => {});
     }
+}
+
+// —— 「↗ 微博」的两种跳转方式（设置项 gallery.jumpMode）——
+if (WEIBO_HOST) {
+    // 每一步都从「一次都没点过 ↗ 的全新页面」开始：
+    // ① 主夹具里「丁」那条早在「面板重开不丢」那一步被从 DOM 摘掉了（那正是那一步要测的事），
+    //    拿来验「滚到那条微博」等于验一个已经被拆掉的前提；
+    // ② 刚被滚过的后台标签页里，Chrome 之后还会把滚动位置慢慢补回去 —— 那种页面读到的 y 不是
+    //    「扩展动没动它」的证据，「新标签档一动不动」会假红。
+    // wantGroup：等到面板里真的出现「这条微博的分组」才算扫完 —— 不同夹具的卡片总数会随筛选/回收时机漂，
+    // 「目标分组在不在」才是这些步骤真正依赖的前提
+    const openJumpPage = async (tag, wantGroup = null) => {
+        await cdp.open(`http://${PAGE_HOST}:${SITE}/nine.html?${tag}`);
+        await wait(1500);
+        const ids = await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>(t.url||'').includes('nine.html?${tag}')).map(t=>t.id))`);
+        const tid = ids && ids[0];
+        const panel = tid ? await cdp.open(`chrome-extension://${extId}/gallery.html?tabId=${tid}`) : null;
+        let ready = null;
+        for (let i = 0; i < 40 && !(ready && ready.cards >= 18
+            && (!wantGroup || ready.groups.some((n) => n.indexOf(wantGroup) >= 0))); i++) {
+            await wait(400);
+            ready = panel ? await cdp.ev(panel, `(()=>({cards:document.querySelectorAll('.g-card').length,
+                groups:[...document.querySelectorAll('.g-group:not(.g-junk) .g-group-name')].map(x=>x.textContent)}))()`) : null;
+        }
+        // 高亮不再是帖子自己的 outline（画在外框、会被下一条帖子压掉底边），而是扩展描在页面最上层的浮层，
+        // 所以这里同时读「那条帖子」和「浮层」：浮层必须框住整条帖子（含底边），帖子自己反而不该有 outline
+        const read = (who = '丁当') => cdp.ev(swSess, `(async()=>{const r=await chrome.scripting.executeScript({target:{tabId:${tid},allFrames:false},func:(w)=>{
+            const arts=[...document.querySelectorAll('article')];
+            const last=arts.filter(a=>(a.textContent||'').indexOf(w)>=0).pop()||null;
+            const rr=last?last.getBoundingClientRect():null;
+            const ov=document.getElementById('mtb-jump-hl');const or=ov?ov.getBoundingClientRect():null;const oc=ov?getComputedStyle(ov):null;
+            const bd=document.getElementById('mtb-jump-search');
+            return {y:Math.round(window.scrollY),vh:Math.round(window.innerHeight),arts:arts.length,hidden:!!document.hidden,
+                badge:!!bd,badgeText:bd?(bd.textContent||''):'',
+                outline:last?getComputedStyle(last).outlineStyle:'', top:rr?Math.round(rr.top):null, bottom:rr?Math.round(rr.bottom):null,
+                h:rr?Math.round(rr.height):null, hlGone:!ov,
+                hl:or?{top:Math.round(or.top),bottom:Math.round(or.bottom),left:Math.round(or.left),width:Math.round(or.width),
+                    pos:oc.position,z:oc.zIndex,pe:oc.pointerEvents}:null};
+        },args:['${who}']});return r[0]&&r[0].result})()`);
+        const clickGroup = (which) => cdp.ev(panel, `(()=>{const gs=[...document.querySelectorAll('.g-group:not(.g-junk)')];
+            const w=${JSON.stringify(String(which))};
+            const g=w==='first'?gs[0]:w==='last'?gs[gs.length-1]:gs.find(x=>((x.querySelector('.g-group-name')||{}).textContent||'').indexOf(w)>=0);
+            if(!g)return '没分组';
+            const b=g.querySelector('.g-group-open');if(!b)return '没按钮';b.click();
+            return (g.querySelector('.g-group-name')||{}).textContent||''})()`);
+        const removeArticle = (who = '丁当') => cdp.ev(swSess, `(async()=>{const r=await chrome.scripting.executeScript({target:{tabId:${tid},allFrames:false},func:(w)=>{
+            const d=[...document.querySelectorAll('article')].filter(a=>(a.textContent||'').indexOf(w)>=0).pop();
+            if(d)d.remove();return !!d},args:['${who}']});return r[0]&&r[0].result})()`);
+        // #toast 的文字在 .show 撤掉后仍留着，读它才知道面板当下到底走的是哪一档
+        const toast = () => cdp.ev(panel, `(()=>{const e=document.querySelector('#toast');
+            return {text:e?(e.textContent||''):'',shown:!!(e&&e.classList.contains('show')),
+                href:location.href.slice(-28),cards:document.querySelectorAll('.g-card').length}})()`);
+        const close = async () => {
+            if (panel) await cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>Promise.all(ts.filter(t=>(t.url||'').includes('gallery.html?tabId=${tid}')).map(t=>chrome.tabs.remove(t.id)))).then(()=>true)`).catch(() => {});
+            if (tid) await cdp.ev(swSess, `chrome.tabs.remove(${tid}).then(()=>true)`).catch(() => {});
+        };
+        return { tid, panel, ready, read, clickGroup, removeArticle, toast, close };
+    };
+    const setJump = (v) => cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+        s.gallery=Object.assign({},s.gallery||{},{jumpMode:'${v}'});await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    const setMissing = (v) => cdp.ev(swSess, `(async()=>{const d=await chrome.storage.local.get(['mtbSettings']);const s=d.mtbSettings||{};
+        s.gallery=Object.assign({},s.gallery||{},{jumpMissing:'${v}'});await chrome.storage.local.set({mtbSettings:s});return true})()`);
+    const openTabsAt = (uid) => cdp.ev(swSess, `chrome.tabs.query({}).then(ts=>ts.filter(t=>(t.url||'').indexOf('weibo.com/${uid}/')>=0).map(t=>t.id))`);
+
+    const A = await openJumpPage('jump=1', '@丁当');
+    const before = await A.read();
+    const clicked = A.panel ? await A.clickGroup('last') : null;
+    // 滚到位置 ≠ 面板已经收到结果：注入的函数还要复量、补滚，隐藏页里这些 sleep 会被钳到 1s 一级，
+    // 所以「页面滚了」和「提示条写了」必须一起轮询到（只等页面会读到一条还没写出来的提示条）
+    let after = null;
+    let toastA = null;
+    for (let i = 0; i < 26 && !(after && after.y > 800 && toastA && /已经滚到那条微博/.test(toastA.text)); i++) {
+        await wait(250);
+        after = await A.read();
+        toastA = A.panel ? await A.toast() : null;
+    }
+    // 浮层只是一时的（2.6 秒到点自己摘）；隐藏页里那个 80ms 的巡视会被钳到 1 秒一级，所以轮询等它消失，别写死一个秒表
+    let faded = null;
+    for (let i = 0; i < 16 && !(faded && faded.hlGone === true); i++) { await wait(400); faded = await A.read(); }
+    // 前置条件写在断言里：点之前那条帖子必须本来就在页面下方（top 比视口深、一次都没滚过、页面在后台），
+    // 否则「滚了 800」这条随时可能因为夹具变矮而永远绿
+    step('默认「滚到那条微博」：点分组头的 ↗ 真的把用户页面滚到最后一条，浮层高亮框住整条（含底边），2.6 秒后自己摘掉',
+        !!(A.ready && A.ready.cards === 36 && before && after && clicked === '@丁当的摄影日记簿'
+            && before.arts === 5 && before.y === 0 && before.hidden === true
+            && before.top != null && before.top > before.vh && before.h > 300 && before.hlGone === true
+            && after.y > 800 && after.top != null && after.bottom != null
+            && Math.abs(after.top + after.h / 2 - after.vh / 2) < 260
+            && after.hl && after.hl.pos === 'fixed' && after.hl.z === '2147483647' && after.hl.pe === 'none'
+            && after.hl.top <= after.top + 1 && after.hl.bottom >= after.bottom - 1
+            && after.outline !== 'solid' && after.outline !== 'dotted'
+            && faded && faded.hlGone === true && faded.outline !== 'solid' && faded.y > 800
+            && toastA && /已经滚到那条微博/.test(toastA.text)), { clicked, before, after, faded, toastA });
+    await A.close();
+
+    await setJump('tab');
+    await wait(700);
+    const B = await openJumpPage('jump2=1', '@丁当');
+    const b0 = await B.read();
+    // 故意还是点最后那条（深在页面下方、滚档一定会把页面拽下去 1560）：
+    // 点第一条的话两档的表现都是「不动」，这一条就永远绿
+    if (B.panel) await B.clickGroup('last');
+    await wait(1500);
+    const tabMode = await B.read();
+    const opened = await openTabsAt('6000000104');
+    step('设置里换成「新标签打开」后：点同一条深帖也只开标签，绝不动用户页面的滚动位置',
+        !!(B.ready && b0 && b0.y === 0 && tabMode && tabMode.y === 0 && tabMode.hlGone === true && opened && opened.length >= 1),
+        { y0: b0 && b0.y, y: tabMode && tabMode.y, tabs: opened && opened.length });
+    if (opened && opened.length) await cdp.ev(swSess, `chrome.tabs.remove([${opened.join(',')}]).then(()=>true)`).catch(() => {});
+    // 「页面上还没有这条时」选「直接开新标签」：查无此帖必须立刻开标签，一次都不许滚页面
+    await setJump('scroll');
+    await setMissing('tab');
+    await wait(700);
+    const wiped = await B.removeArticle('丁当');
+    await wait(400);
+    const fellBack = B.panel ? await B.clickGroup('last') : null;
+    await wait(1500);
+    const fallbackTab = await openTabsAt('6000000104');
+    const stillScroll = await B.read();
+    const toastB = B.panel ? await B.toast() : null;
+    // 提示条必须是「页面上没有这条…改成新标签」那句：面板是在 tab 档下开出来的，
+    // 只有 storage.onChanged 真把新设置收进来、它才可能走到滚档的退回逻辑（不然这条断言在 tab 档也照样绿）
+    step('「页面上还没有这条时」选成新标签：查无此帖就立刻开标签，一页都不许滚（面板不重开就收到新设置）',
+        !!(wiped === true && fellBack === '@丁当的摄影日记簿' && stillScroll && stillScroll.arts === 4 && stillScroll.y === 0
+            && toastB && /页面上没有这条微博/.test(toastB.text) && !/往下翻/.test(toastB.text)
+            && fallbackTab && fallbackTab.length >= 1),
+        { wiped, fellBack, arts: stillScroll && stillScroll.arts, y: stillScroll && stillScroll.y,
+            toast: toastB && toastB.text, tabs: fallbackTab && fallbackTab.length });
+    if (fallbackTab && fallbackTab.length) await cdp.ev(swSess, `chrome.tabs.remove([${fallbackTab.join(',')}]).then(()=>true)`).catch(() => {});
+    await B.close();
+    await setMissing('scroll');
+    await wait(700);
+
+    // ④ 默认档「一直往下滚找它」：这条只存在于微博自己的信息流数据里（面板有组、页面上没 DOM），
+    //    夹具的虚拟列表要滚到 1500 才把它挂进 DOM —— 必须边滚边重新扫，挂出来就滚过去描高亮，且不许开新标签
+    const M = await openJumpPage('feed=1&mount=1&run=1', '丁已回收');
+    const m0 = M.panel ? await M.read('丁已回收') : null;
+    const mClicked = M.panel ? await M.clickGroup('丁已回收') : null;
+    let mAfter = null;
+    let mToast = null;
+    for (let i = 0; i < 70 && !(mAfter && mAfter.top != null && mAfter.hl && mToast && /往下翻了/.test(mToast.text)); i++) {
+        await wait(300);
+        mAfter = await M.read('丁已回收');
+        mToast = M.panel ? await M.toast() : null;
+    }
+    const mTabs = await openTabsAt('6000006104');
+    step('页面上还没有这条（默认档「一直往下滚」）：一步一屏滚下去，等虚拟列表把它挂出来就滚过去描高亮，一张新标签都不许多开',
+        !!(M.ready && M.ready.groups.some((n) => n.indexOf('丁已回收') >= 0) && m0 && m0.y === 0 && m0.top === null && m0.arts === 3
+            && mClicked === '@丁已回收' && mAfter && mAfter.y > 900 && mAfter.top != null
+            && mAfter.arts >= 4 && mAfter.hl && mAfter.hl.pos === 'fixed'
+            && mAfter.hl.top <= mAfter.top + 1 && mAfter.hl.bottom >= mAfter.bottom - 1
+            && mAfter.outline !== 'solid' && mToast && /往下翻了 \d+ 屏才挂出来/.test(mToast.text)
+            && (!mTabs || mTabs.length === 0)), { m0, mClicked, mAfter, toast: mToast && mToast.text, tabs: mTabs && mTabs.length });
+    await M.close();
+    if (mTabs && mTabs.length) await cdp.ev(swSess, `chrome.tabs.remove([${mTabs.join(',')}]).then(()=>true)`).catch(() => {});
+
+    // ⑤ 一路滚到底还是没有这条：必须把页面滚回用户原来看的位置，再退回新标签（不能把人丢在信息流深处）
+    const N = await openJumpPage('feed=1&mount=1&run=2', '己转发带原帖图');
+    const n0 = N.panel ? await N.read('己转发带原帖图') : null;
+    const nClicked = N.panel ? await N.clickGroup('己转发带原帖图') : null;
+    let nAfter = null;
+    let nToast = null;
+    for (let i = 0; i < 80 && !(nAfter && nToast && /也没加载出这条/.test(nToast.text)); i++) {
+        await wait(300);
+        nAfter = await N.read('己转发带原帖图');
+        nToast = N.panel ? await N.toast() : null;
+    }
+    const nTabs = await openTabsAt('6000006107');
+    step('一直滚到底也没这条：滚回用户原来看的位置（虚拟列表确实被滚出来了），再退回新标签打开',
+        !!(N.ready && N.ready.groups.some((n) => n.indexOf('己转发带原帖图') >= 0) && n0 && n0.y === 0 && n0.top === null
+            && nClicked === '@己转发带原帖图' && nAfter && nAfter.y === 0 && nAfter.top === null
+            && nAfter.arts >= 5 && nAfter.hlGone === true
+            && nToast && /往下翻了 \d+ 屏也没加载出这条，已滚回原位/.test(nToast.text) && nTabs && nTabs.length >= 1),
+        { n0, nClicked, y: nAfter && nAfter.y, arts: nAfter && nAfter.arts, toast: nToast && nToast.text, tabs: nTabs && nTabs.length });
+    if (nTabs && nTabs.length) await cdp.ev(swSess, `chrome.tabs.remove([${nTabs.join(',')}]).then(()=>true)`).catch(() => {});
+    await N.close();
+
+    // ⑥ 第三档「只滚动，绝不新开标签页」：找得到就滚过去；查无此帖时也只能说清原因，一个标签都不许多开。
+    //    把 jumpMissing 先设成 tab（不让它往下滚找），这样"开不开标签"只由这一档决定。
+    await setJump('scrollOnly');
+    await setMissing('tab');
+    await wait(700);
+    const C = await openJumpPage('jump3=1', '@丁当');
+    const baseTabs = await openTabsAt('6000000104');
+    const c0 = C.panel ? await C.read() : null;
+    const cClicked = C.panel ? await C.clickGroup('last') : null;
+    let cAfter = null;
+    let cToast = null;
+    for (let i = 0; i < 30 && !(cAfter && cAfter.y > 800 && cToast && /已经滚到那条微博/.test(cToast.text)); i++) {
+        await wait(250);
+        cAfter = await C.read();
+        cToast = C.panel ? await C.toast() : null;
+    }
+    const cTabs1 = await openTabsAt('6000000104');
+    const cWiped = await C.removeArticle('丁当');
+    const cAgain = C.panel ? await C.clickGroup('last') : null;
+    await wait(1500);
+    const cAfter2 = await C.read();
+    const cToast2 = C.panel ? await C.toast() : null;
+    const cTabs2 = await openTabsAt('6000000104');
+    step('「只滚动，绝不新开标签页」：找得到就滚过去；查无此帖时一个标签都不许多开，只在提示条上说清为什么',
+        !!(C.ready && C.ready.cards === 36 && c0 && c0.y === 0 && cClicked === '@丁当的摄影日记簿'
+            && cAfter && cAfter.y > 800 && cToast && /已经滚到那条微博/.test(cToast.text)
+            && cTabs1.length === (baseTabs ? baseTabs.length : 0)
+            && cWiped === true && cAgain === '@丁当的摄影日记簿'
+            && cAfter2 && cAfter2.top === null && cAfter2.arts === 4 && cAfter2.hlGone === true
+            && cToast2 && /按你的设置没有新开标签页/.test(cToast2.text)
+            && cTabs2.length === (baseTabs ? baseTabs.length : 0)),
+        { base: baseTabs && baseTabs.length, before: c0 && c0.y, after: cAfter && cAfter.y, tabs1: cTabs1 && cTabs1.length,
+            wiped: cWiped, after2: cAfter2 && cAfter2.top, tabs2: cTabs2 && cTabs2.length, toast2: cToast2 && cToast2.text });
+    if (cTabs2 && cTabs2.length) await cdp.ev(swSess, `chrome.tabs.remove([${cTabs2.join(',')}]).then(()=>true)`).catch(() => {});
+    await C.close();
+
+    // ⑦ **没有「翻几屏就算了」的天花板**（2026-10-24 用户就是被「往下翻了 24 屏也没加载出这条」惹的）：
+    //    夹具把「丁」推到 20000 px 之外（要翻 30 多屏才挂出来），必须一直翻到找到为止，
+    //    中途页面上还要有「正在往下翻找…已经翻了 N 屏」的浮标（几十秒的自动滚动不解释清楚，用户会以为页面坏了）
+    await setJump('scroll');
+    await setMissing('scroll');
+    await wait(700);
+    const D = await openJumpPage('feed=1&mount=1&deep=1&run=1', '丁已回收');
+    const d0 = D.panel ? await D.read('丁已回收') : null;
+    const dClicked = D.panel ? await D.clickGroup('丁已回收') : null;
+    let dAfter = null;
+    let dToast = null;
+    let dBadgeText = '';
+    for (let i = 0; i < 200 && !(dAfter && dAfter.top != null && dToast && /往下翻了/.test(dToast.text)); i++) {
+        await wait(250);
+        dAfter = await D.read('丁已回收');
+        dToast = D.panel ? await D.toast() : null;
+        if (dAfter && dAfter.badge && !dBadgeText) dBadgeText = dAfter.badgeText || '';
+    }
+    const dTabs = await openTabsAt('6000006104');
+    const dScreens = dToast && dToast.text ? Number((dToast.text.match(/往下翻了 (\d+) 屏/) || [])[1] || 0) : 0;
+    step('没有「翻几屏就算了」的上限：要翻 30 多屏才挂出来的那条也必须一直翻到找到为止，中途页面上有进度浮标',
+        !!(D.ready && D.ready.groups.some((n) => n.indexOf('丁已回收') >= 0) && d0 && d0.y === 0 && d0.top === null
+            && dClicked === '@丁已回收' && dAfter && dAfter.top != null && dAfter.y > 19000
+            && dAfter.hl && dAfter.hl.pos === 'fixed' && dBadgeText.includes('正在往下翻找这条微博')
+            && dScreens > 24 && (!dTabs || dTabs.length === 0)),
+        { before: d0 && d0.y, y: dAfter && dAfter.y, badge: dBadgeText, screens: dScreens,
+            toast: dToast && dToast.text, tabs: dTabs && dTabs.length });
+    if (dTabs && dTabs.length) await cdp.ev(swSess, `chrome.tabs.remove([${dTabs.join(',')}]).then(()=>true)`).catch(() => {});
+    await D.close();
+    await setJump('scroll');
+    await setMissing('scroll');
+    await wait(500);
 }
 
 // —— 面板换肤实测：五档风格必须真的画出五种不同的样子，而且不许把网格换坏 ——

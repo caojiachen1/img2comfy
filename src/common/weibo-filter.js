@@ -8,7 +8,7 @@ export const DEFAULT_WEIBO_FILTER = {
     site: '',            // 最近一次在哪个微博站点上配的（host）
     allSites: false,     // 勾上就作用于所有微博站点
     types: { original: true, repost: true, text: true, image: true, video: true, music: true },
-    keywordMode: 'has',  // has | none（关键字为空时整条规则不生效）
+    keywordMode: 'has',  // has | none | expr（关键字为空时整条规则不生效；expr = 一整条逻辑表达式）
     keywords: [],
     dateFrom: '',
     dateTo: '',
@@ -34,6 +34,156 @@ export function splitKeywords(text) {
     return out;
 }
 
+/* ---------------- 关键字逻辑表达式（keywordMode === 'expr'） ----------------
+ * 语法（优先级 非 > 且 > 或）：
+ *   词                    正文里含这个词
+ *   A 且 B / A && B / A B   两个都要有（并排写就是「且」）
+ *   A 或 B / A || B / A|B / A,B   有一个就行
+ *   非 A / !A / NOT A      不许有
+ *   ( ) 调优先级；"…" 或 「…」 把含运算符的词包起来
+ * 解析不出来就**不筛**（宁可多留，绝不误杀），UI 那边另给一句「看不懂」。
+ */
+export const EXPR_MAX_LEN = 200;
+const EXPR_MAX_NODES = 80;
+const EXPR_AND = ['&&', 'and', '且'];
+const EXPR_OR = ['||', 'or', '或', ',', '，', '、'];
+const EXPR_NOT = ['!', 'not', '非'];
+const EXPR_QUOTE = { '"': '"', "'": "'", '“': '”', '「': '」', '『': '』' };
+
+function exprClassify(word) {
+    const low = String(word).toLowerCase();
+    if (EXPR_AND.indexOf(low) >= 0) return 'and';
+    if (EXPR_OR.indexOf(low) >= 0) return 'or';
+    if (EXPR_NOT.indexOf(low) >= 0) return 'not';
+    return null;
+}
+
+function tokenizeExpr(s) {
+    const toks = [];
+    let i = 0;
+    while (i < s.length) {
+        const c = s[i];
+        if (/\s/.test(c)) { i++; continue; }
+        if (c === '(' || c === '（') { toks.push({ t: '(' }); i++; continue; }
+        if (c === ')' || c === '）') { toks.push({ t: ')' }); i++; continue; }
+        if (c === '&' || c === '|') {
+            toks.push({ t: c === '&' ? 'and' : 'or' });
+            i += (s[i + 1] === c) ? 2 : 1;
+            continue;
+        }
+        if (c === '!') { toks.push({ t: 'not' }); i++; continue; }
+        // 逗号是「或」：这些字符都会被上面的取词循环当断点，所以必须在这里就变成 token，
+        // 不然它们会被静默吃掉，两条关键字反而变成「并排写 = 且」
+        if (c === ',' || c === '，' || c === '、') { toks.push({ t: 'or' }); i++; continue; }
+        if (EXPR_QUOTE[c]) {
+            const close = EXPR_QUOTE[c];
+            const end = s.indexOf(close, i + 1);
+            if (end < 0) throw new Error('引号没闭合');
+            const word = s.slice(i + 1, end).trim();
+            if (!word) throw new Error('引号里是空的');
+            toks.push({ t: 'term', v: word.toLowerCase() });
+            i = end + 1;
+            continue;
+        }
+        let j = i;
+        while (j < s.length && !/[\s()（）&|!,，、]/.test(s[j])) j++;
+        const word = s.slice(i, j).trim();
+        i = j === i ? i + 1 : j;
+        if (!word) continue;
+        const op = exprClassify(word);
+        if (op) toks.push({ t: op }); else toks.push({ t: 'term', v: word.toLowerCase() });
+    }
+    return toks;
+}
+
+export function parseKeywordExpr(src) {
+    const s = String(src || '').trim();
+    if (!s) return { ok: false, empty: true, error: '', node: null };
+    if (s.length > EXPR_MAX_LEN) return { ok: false, empty: false, error: `太长了（最多 ${EXPR_MAX_LEN} 字）`, node: null };
+    let toks;
+    try { toks = tokenizeExpr(s); } catch (e) { return { ok: false, empty: false, error: String((e && e.message) || e), node: null }; }
+    if (!toks.length) return { ok: false, empty: false, error: '没写出任何条件', node: null };
+    let p = 0;
+    let nodes = 0;
+    const peek = () => toks[p];
+    const label = (t) => (t === 'and' ? '且' : t === 'or' ? '或' : '非');
+    const primary = () => {
+        if (++nodes > EXPR_MAX_NODES) throw new Error('条件太多');
+        const t = peek();
+        if (!t) throw new Error('末尾还缺一个词');
+        if (t.t === 'term') { p++; return { k: 'term', v: t.v }; }
+        if (t.t === '(') {
+            p++;
+            const a = orExpr();
+            if (!peek() || peek().t !== ')') throw new Error('括号没配对');
+            p++;
+            return a;
+        }
+        if (t.t === ')') throw new Error('括号没配对');
+        throw new Error(`「${label(t.t)}」后面得有词`);
+    };
+    const notExpr = () => {
+        if (peek() && peek().t === 'not') { p++; return { k: 'not', a: notExpr() }; }
+        return primary();
+    };
+    const andExpr = () => {
+        let a = notExpr();
+        for (;;) {
+            const t = peek();
+            if (!t) break;
+            if (t.t === 'or' || t.t === ')') break;
+            if (t.t === 'and') p++;
+            a = { k: 'and', a, b: notExpr() };
+        }
+        return a;
+    };
+    const orExpr = () => {
+        let a = andExpr();
+        while (peek() && peek().t === 'or') { p++; a = { k: 'or', a, b: andExpr() }; }
+        return a;
+    };
+    try {
+        const node = orExpr();
+        if (p < toks.length) return { ok: false, empty: false, error: '后面有多出来的东西', node: null };
+        return { ok: true, empty: false, error: '', node };
+    } catch (e) {
+        return { ok: false, empty: false, error: String((e && e.message) || e || '看不懂'), node: null };
+    }
+}
+
+/** 这条正文该不该留；节点为空一律当「不筛」= true，绝不因为读不懂而隐藏 */
+export function evalKeywordExpr(node, text) {
+    if (!node) return true;
+    const low = String(text || '').toLowerCase();
+    const walk = (n) => {
+        if (!n) return true;
+        if (n.k === 'term') return !n.v || low.indexOf(n.v) >= 0;
+        if (n.k === 'not') return !walk(n.a);
+        if (n.k === 'and') return walk(n.a) && walk(n.b);
+        if (n.k === 'or') return walk(n.a) || walk(n.b);
+        return true;
+    };
+    try { return walk(node); } catch (e) { return true; }
+}
+
+const EXPR_CACHE = new Map();
+/** 同一句话要被整条信息流反复求值，解析结果缓存住（只留最近 40 条） */
+export function keywordExprOf(src) {
+    const key = String(src || '').trim();
+    const hit = EXPR_CACHE.get(key);
+    if (hit) return hit;
+    const r = parseKeywordExpr(key);
+    if (EXPR_CACHE.size > 40) EXPR_CACHE.delete(EXPR_CACHE.keys().next().value);
+    EXPR_CACHE.set(key, r);
+    return r;
+}
+
+/** filter → 表达式原文（expr 档下 keywords 只装这一整句，不许按逗号拆） */
+export function exprSource(f) {
+    const src = f && f.keywords;
+    return (Array.isArray(src) ? src.join(' ') : String(src || '')).trim();
+}
+
 function normDay(v) {
     const m = DAY_RE.exec(String(v || '').trim());
     if (!m) return '';
@@ -47,13 +197,15 @@ export function normalizeWeiboFilter(f) {
     const t = src.types && typeof src.types === 'object' ? src.types : {};
     const types = {};
     for (const k of WEIBO_TYPES) types[k] = t[k] !== false;
+    const keywordMode = src.keywordMode === 'none' ? 'none' : src.keywordMode === 'expr' ? 'expr' : 'has';
+    const rawKw = Array.isArray(src.keywords) ? src.keywords.join(keywordMode === 'expr' ? ' ' : '\n') : src.keywords;
     return {
         enabled: !!src.enabled,
         site: String(src.site || '').toLowerCase(),
         allSites: !!src.allSites,
         types,
-        keywordMode: src.keywordMode === 'none' ? 'none' : 'has',
-        keywords: Array.isArray(src.keywords) ? splitKeywords(src.keywords.join('\n')) : splitKeywords(src.keywords),
+        keywordMode,
+        keywords: keywordMode === 'expr' ? [String(rawKw || '').trim()].filter(Boolean) : splitKeywords(rawKw),
         dateFrom: normDay(src.dateFrom),
         dateTo: normDay(src.dateTo),
         experimental: !!src.experimental,
@@ -87,7 +239,14 @@ export function matchWeiboFilter(info, filter) {
         || (f.types.video && hasVideo)
         || (f.types.music && hasMusic);
     if (!passMedia) return false;
-    if (f.keywords.length) {
+    if (f.keywordMode === 'expr') {
+        const src = exprSource(f);
+        if (src) {
+            const parsed = keywordExprOf(src);
+            // 看不懂的表达式不筛：宁可多留几条，也不许因为语法写错把整页微博藏掉
+            if (parsed.ok && !evalKeywordExpr(parsed.node, v.text)) return false;
+        }
+    } else if (f.keywords.length) {
         const text = String(v.text || '').toLowerCase();
         const hit = f.keywords.some((k) => text.includes(k.toLowerCase()));
         if (f.keywordMode === 'has' && !hit) return false;
@@ -113,7 +272,13 @@ export function describeWeiboFilter(filter) {
     const media = [['image', '含图片'], ['video', '含视频'], ['music', '含音乐'], ['text', '纯文字']]
         .filter(([k]) => f.types[k]).map(([, label]) => label);
     if (media.length < 4) parts.push(media.length ? '只看' + media.join('/') : '不看任何类型');
-    if (f.keywords.length) parts.push(`${f.keywordMode === 'has' ? '包含' : '不含'}「${f.keywords.slice(0, 3).join('、')}」${f.keywords.length > 3 ? '等 ' + f.keywords.length + ' 个' : ''}`);
+    if (f.keywordMode === 'expr') {
+        const src = exprSource(f);
+        const parsed = src ? keywordExprOf(src) : { ok: false };
+        if (src) parts.push(parsed.ok ? `只留符合逻辑式「${src}」的` : `逻辑式看不懂（${parsed.error}），这条没生效`);
+    } else if (f.keywords.length) {
+        parts.push(`${f.keywordMode === 'has' ? '包含' : '不含'}「${f.keywords.slice(0, 3).join('、')}」${f.keywords.length > 3 ? '等 ' + f.keywords.length + ' 个' : ''}`);
+    }
     if (f.dateFrom || f.dateTo) parts.push(`${f.dateFrom || '不限'} ~ ${f.dateTo || '至今'}`);
     return parts.length ? parts.join(' · ') : '启用但没有条件（等同不筛）';
 }

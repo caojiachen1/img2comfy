@@ -165,6 +165,8 @@ export const DEFAULT_SETTINGS = {
         sendTier: 'card',   // 发给 ComfyUI 用哪个档：card=mw690（默认，~41KB）· full=mw2000 · orig=large（4MB+）
         feedAll: true,      // 微博：连被虚拟列表摘掉、页面上没有 DOM 的帖子也从微博自己的信息流数据里收图
         loadPages: 3,       // 「帮我翻页」一次翻几页（产品侧卡到 1~10）
+        jumpMode: 'scroll', // 点分组头「↗ 微博」：scroll=滚到页面上那条微博（找不到就退回开标签）· tab=直接开新标签 · scrollOnly=只滚页面，任何情况都不新开标签
+        jumpMissing: 'scroll', // 页面上还没有这条时：scroll=一步一屏往下滚，直到它被虚拟列表挂出来（到底没找到就滚回原位）· tab=直接开新标签
     },
     ai: {
         enabled: true,

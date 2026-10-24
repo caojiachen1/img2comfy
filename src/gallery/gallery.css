@@ -79,6 +79,12 @@ body.gallery-page {
     flex: none; padding: 3px 10px; border-radius: 99px; border: var(--bw) solid var(--line);
     background: var(--toggle-bg); color: var(--muted); cursor: pointer; font-size: 11.5px;
 }
+/* 「↗ 微博」：跳到这一条的固定地址，跟「反选」同款，只是文字用强调色区分开 */
+.g-group-open {
+    flex: none; padding: 3px 10px; border-radius: 99px; border: var(--bw) solid var(--line);
+    background: var(--toggle-bg); color: var(--accent); cursor: pointer; font-size: 11.5px; white-space: nowrap;
+}
+.g-group-open:hover { border-color: var(--line-hover); color: var(--accent); }
 .g-group-inv:hover:not(:disabled) { color: var(--text); border-color: var(--line-hover-pill); }
 .g-group-inv:disabled { opacity: .45; cursor: default; }
 /* 网格：列数由 fitLayout() 按分组内宽度算好写进 --cols（一行 2~3 个大卡片），1fr 铺满整行不溢出 */
@@ -225,6 +231,8 @@ body.tab-filter .g-foot { display: none; }
     background: var(--input-bg); color: var(--text); font-size: 12.5px; outline: none;
 }
 .wf-search input:focus, .g-filter select:focus, .g-filter input[type="date"]:focus { border-color: var(--accent-hover-line); }
+/* 表达式看不懂：只描一圈危险色，不改边框宽度（宽度一变输入框里的字会跳一下） */
+.wf-search input.bad { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 .g-filter select, .g-filter input[type="date"] {
     padding: 6px 8px; border-radius: var(--radius-sm); border: var(--bw) solid var(--line); background: var(--input-bg);
     color: var(--text); font-size: 12.5px; outline: none;

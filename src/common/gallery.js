@@ -59,11 +59,26 @@ export function accountInitial(name) {
     return Array.from(t)[0].toUpperCase();
 }
 
+/* 一条微博的固定地址，面板「跳转」按钮用。桌面版是 weibo.com/<uid>/<bid>；
+   没有 uid（或本来就是移动版页面）就退到 m.weibo.cn/status/<id> —— 那个形状只靠 id 就能打开。 */
+export function weiboStatusUrl(item, host) {
+    const it = item && typeof item === 'object' ? item : {};
+    let uid = '';
+    let id = '';
+    try {
+        uid = String((it.user && (it.user.id || it.user.uid)) || '');
+        id = String(it.mblogid || it.bid || it.mid || it.idstr || it.id || '');
+    } catch (e) { return ''; }
+    if (!id || id.length < 5) return '';
+    if (/^m\./i.test(String(host || ''))) return 'https://m.weibo.cn/status/' + id;
+    return /^\d{5,}$/.test(uid) ? 'https://weibo.com/' + uid + '/' + id : 'https://m.weibo.cn/status/' + id;
+}
+
 /* 微博信息流里的一个条目（列表里的 item，或翻页接口返回的 status）→ 面板补图用的帖子形状。
    这是「一条微博有哪些图」的唯一映射处：读列表和读翻页接口两条路都走它，别在页面里再写一份。
    转发的图挂在 retweeted_status 上，而九宫格显示在这一条下面，所以两边并成一组、按 pathname 去重；
    档位优先 large，只有 mw2000 的导出就退一档（两个键名各版本都见过）。 */
-export function weiboStatusToPost(item, index) {
+export function weiboStatusToPost(item, index, host) {
     const it = item && typeof item === 'object' ? item : {};
     const rt = it.retweeted_status && typeof it.retweeted_status === 'object' ? it.retweeted_status : null;
     const pics = [];
@@ -97,6 +112,7 @@ export function weiboStatusToPost(item, index) {
         uid: String(user.id || user.uid || ''),
         name: strip(user.screen_name || ''),
         text: strip(it.text || it.longText || (rt && rt.text) || '').slice(0, 200),
+        url: weiboStatusUrl(it, host),
         pics,
     };
 }
@@ -165,11 +181,13 @@ export function mergeFeedPosts(acc, posts, meta = {}) {
         }
 
         let g = key ? acc.byKey.get(key) : null;
+        // DOM 那边没认出永久链接时（有些版式就是没有），用数据里的地址补上
+        if (g && !g.url && p.url) g.url = String(p.url);
         if (g && key.indexOf('feed:') !== 0) stats.matched++;
         if (!g) {
             key = 'feed:' + (ids[0] || pics[0].dk);
             if (acc.byKey.has(key)) { g = acc.byKey.get(key); } else {
-                g = { key, label: String(p.name || ''), sub: String(p.text || '').slice(0, 72), items: [], junk: false, y: 0, feed: true };
+                g = { key, label: String(p.name || ''), sub: String(p.text || '').slice(0, 72), url: String(p.url || ''), items: [], junk: false, y: 0, feed: true };
                 acc.byKey.set(key, g);
                 acc.groups.push(g);
                 stats.groups++;
