@@ -1355,17 +1355,33 @@ async function runWeiboFilterChecks() {
       for(let i=0;i<60;i++){const f=document.querySelector('#panelFilter');if(f&&!f.classList.contains('loading'))break;await new Promise(r=>setTimeout(r,150));}
       ${js};await new Promise(r=>setTimeout(r,650));
       return {status:document.querySelector('#wfStatus').textContent,
+        enabledBox:document.querySelector('#wfEnabled').checked,
+        offClass:document.querySelector('#panelFilter').classList.contains('off'),
+        hint:document.querySelector('#wfEnabledHint').textContent,
         stored:(await chrome.storage.local.get(['mtbSettings'])).mtbSettings.weiboFilter};})()`);
+    // 「启用筛选」是总闸：后面每一步都得先确认它是勾着的（清除筛选会把它关掉）
+    const ensureOn = () => setForm(`(()=>{const b=document.querySelector('#wfEnabled');if(!b.checked)b.click();})()`);
 
     const f0 = await readFeed();
-    const first = await setForm(`document.querySelector('[data-wf-type="text"]').click()`);
-    const f1 = await readFeed();
-    step('取消「纯文字」立刻生效：那条整条 display:none、自身零高',
+    // 这一步同时是下一条的反向对照：同一套条件（取消「纯文字」），差别只有那个勾
+    const gateOff = await setForm(`document.querySelector('[data-wf-type="text"]').click()`);
+    const fGate = await readFeed();
+    step('「启用筛选」没勾：条件写到「取消纯文字」也一条都不挡（enabled=false、六条全在、提示条不出现、整块表单压暗）',
         !!(f0 && f0.total === 6 && f0.hidden.length === 0
-            && first.stored.site === PAGE_HOST && first.stored.enabled === true
-            && /已隐藏 1 条/.test(first.status)
+            && gateOff.stored.enabled === false && gateOff.enabledBox === false && gateOff.offClass === true
+            && /不挡/.test(gateOff.hint) && /未启用筛选/.test(gateOff.status)
+            && fGate && fGate.total === 6 && fGate.hidden.length === 0
+            && fGate.chip && fGate.chip.hidden === true),
+        { gateOff: { enabled: gateOff.stored.enabled, offClass: gateOff.offClass, status: gateOff.status }, fGate });
+
+    const first = await setForm(`document.querySelector('#wfEnabled').click()`);
+    const f1 = await readFeed();
+    step('勾上「启用筛选」立刻生效：刚才那条整条 display:none、自身零高，右下角提示条出现',
+        !!(first.stored.site === PAGE_HOST && first.stored.enabled === true && first.enabledBox === true
+            && first.offClass === false && /已隐藏 1 条/.test(first.status)
             && f1.hidden.length === 1 && /纯文字/.test(f1.hidden[0]) && f1.zeroed
-            && f1.chip && f1.chip.hidden === false && /已隐藏 1 条/.test(f1.chip.text)), { f0, first: { status: first.status, site: first.stored.site }, f1 });
+            && f1.chip && f1.chip.hidden === false && /已隐藏 1 条/.test(f1.chip.text)),
+        { first: { status: first.status, site: first.stored.site, offClass: first.offClass }, f1 });
 
     await clickChip();
     await wait(300);
@@ -1398,10 +1414,35 @@ async function runWeiboFilterChecks() {
 
     const cleared = await setForm(`document.querySelector('#wfClear').click()`);
     const f5 = await readFeed();
-    step('清除筛选：六条全部回来、槽位恢复原样、提示条消失',
+    step('清除筛选：六条全部回来、槽位恢复原样、提示条消失，「启用筛选」那个勾也跟着变回没勾（表单和存下来的必须是同一份）',
         !!(f5 && f5.hidden.length === 0 && f5.shown.length === 6
-            && f5.chip && f5.chip.hidden === true && cleared.stored.enabled === false), { cleared: { enabled: cleared.stored.enabled, status: cleared.status }, f5 });
+            && f5.chip && f5.chip.hidden === true && cleared.stored.enabled === false
+            && cleared.enabledBox === false && cleared.offClass === true),
+        { cleared: { enabled: cleared.stored.enabled, enabledBox: cleared.enabledBox, status: cleared.status }, f5 });
 
+    // —— 「禁用本站」：面板右上角那个勾写的是 sites.disabled ——
+    // 内容脚本只在启动那一刻读它，所以这里改完不会立刻动页面（不测「动没动」，测「写没写对 + 有没有讲清要刷新」）；
+    // 面板自己的采集走 chrome.scripting.executeScript，不靠内容脚本，所以这一步之后后面的步骤照跑。
+    const siteOffRes = await cdp.ev(fp, `(async()=>{
+      const w=document.querySelector('#siteOffWrap'),b=document.querySelector('#siteOff');
+      const before={hidden:w.hidden,checked:b.checked,host:document.querySelector('#siteInfo').textContent};
+      b.click();await new Promise(r=>setTimeout(r,600));
+      const s1=(await chrome.storage.local.get(['mtbSettings'])).mtbSettings;
+      const mid={checked:b.checked,on:w.classList.contains('on'),disabled:((s1.sites||{}).disabled||[]),
+        toast:(document.querySelector('#toast')||{}).textContent||'',status:document.querySelector('#wfStatus').textContent};
+      b.click();await new Promise(r=>setTimeout(r,600));
+      const s2=(await chrome.storage.local.get(['mtbSettings'])).mtbSettings;
+      return {before,mid,after:{checked:b.checked,on:w.classList.contains('on'),disabled:((s2.sites||{}).disabled||[])}};})()`);
+    step('右上角「禁用本站」把当前站点写进 sites.disabled：勾上就描危险色+说清要刷新本页，取消就把那条从清单里摘掉',
+        !!(siteOffRes && siteOffRes.before.hidden === false && siteOffRes.before.checked === false
+            && siteOffRes.before.host === PAGE_HOST
+            && siteOffRes.mid.checked === true && siteOffRes.mid.on === true
+            && siteOffRes.mid.disabled.includes(PAGE_HOST) && /刷新/.test(siteOffRes.mid.toast)
+            && /停用|禁用/.test(siteOffRes.mid.status)
+            && siteOffRes.after.checked === false && siteOffRes.after.on === false
+            && !siteOffRes.after.disabled.includes(PAGE_HOST)), siteOffRes);
+
+    await ensureOn();
     // —— 关键字逻辑表达式（且 / 或 / 非 / 括号）——
     const setExpr = (src) => cdp.ev(fp, `(async()=>{
       const k=document.querySelector('#wfKeywords');k.value=${JSON.stringify(src)};k.dispatchEvent(new Event('input',{bubbles:true}));
@@ -1430,7 +1471,8 @@ async function runWeiboFilterChecks() {
             && fe3 && fe3.hidden.length === 0 && fe3.shown.length === 6), { e3, fe3 });
     await setForm(`(()=>{document.querySelector('#wfClear').click();})()`);
     await wait(500);
-
+    // 清除筛选把「启用筛选」一起关了，实验模式这几步得先把总闸重新勾上
+    await ensureOn();
     // 实验模式：后台把一段代码注入页面主世界，直接改微博自己的信息流数组（夹具里是 #app._vnode.component.data.list）。
     // 这条路不碰 DOM，列表自己重排 → 被筛掉的帖子真的不存在，不留空位。失败会自动退回上面的页面隐藏。
     const readList = () => cdp.ev(filterPage, `(()=>{
@@ -1927,7 +1969,7 @@ if (WEIBO_HOST) {
             && after.hl.top <= after.top + 1 && after.hl.bottom >= after.bottom - 1
             && after.outline !== 'solid' && after.outline !== 'dotted'
             && faded && faded.hlGone === true && faded.outline !== 'solid' && faded.y > 800
-            && toastA && /已经滚到那条微博/.test(toastA.text)), { clicked, before, after, faded, toastA });
+            && toastA && /已经滚到那条微博/.test(toastA.text)), { clicked, ready: A.ready, before, after, faded, toastA });
     await A.close();
 
     await setJump('tab');

@@ -597,7 +597,7 @@ function escapeHtml(s) {
     $('#toolGroup').addEventListener('change', renderToolList);
     $('#btnSave').onclick = () => save();
     $('#apiDoc pre').textContent = CONTEXT_API_DOC + '\n\n内置脚本模板：\n' + BUILTIN_SCRIPTS[0].code;
-    $('#btnCurrentSite') && ($('#btnCurrentSite').onclick = () => toast('请在地址栏右侧的扩展弹窗里切换当前站点'));
+    $('#btnCurrentSite') && ($('#btnCurrentSite').onclick = () => toast('点扩展图标打开「本页图片」面板，右上角站名旁边的「禁用本站」就是切当前站点的'));
     await setupPreviewMedia();
     syncForm();
     renderToolList();

@@ -15,6 +15,7 @@
   </div>
   <div class="hdr-actions">
     <span class="g-site" id="siteInfo"></span>
+    <label class="g-view g-siteoff" id="siteOffWrap" hidden title="勾选后扩展在这个站点整体停用"><input type="checkbox" id="siteOff">禁用本站</label>
     <label class="g-view" title="只列屏幕上下各一屏内的图；关掉则列出这个页面已经加载的全部图"><input type="checkbox" id="onlyView">只看屏幕附近</label>
     <label class="g-view" id="feedAllWrap" title="连滚过去、被虚拟列表从页面上摘掉的微博一起收：图地址直接问微博自己那份信息流数据要，不用先把帖子滚出来"><input type="checkbox" id="feedAll">全部微博</label>
     <button id="btnWide" title="下拉面板最宽只能 800px，点这里用接近全屏的大窗打开">⤢ 大窗</button>
@@ -41,6 +42,11 @@
 </main>
 
 <section class="g-main g-filter" id="panelFilter" hidden>
+  <div class="wf-row wf-master">
+    <span class="wf-label">开关</span>
+    <label class="wf-chk"><input type="checkbox" id="wfEnabled"> 启用筛选</label>
+    <span class="wf-hint" id="wfEnabledHint"></span>
+  </div>
   <div class="wf-row">
     <span class="wf-label">类型</span>
     <div class="wf-chips">

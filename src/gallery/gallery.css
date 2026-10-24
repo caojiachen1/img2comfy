@@ -211,8 +211,13 @@ body.gallery-page {
 }
 .g-tabs button:hover { color: var(--text); }
 .g-tabs button.active { color: var(--text); background: var(--wash-bg); border-color: var(--line); }
-body.tab-filter .g-view, body.tab-filter #btnWide, body.tab-filter #btnRefresh, body.tab-filter #btnMore { display: none; }
+body.tab-filter .g-view:not(.g-siteoff), body.tab-filter #btnWide, body.tab-filter #btnRefresh, body.tab-filter #btnMore { display: none; }
 body.tab-filter .g-foot { display: none; }
+
+/* 「禁用本站」管的是整站的注入开关，两个 tab 都得能改，所以不跟着别的头部控件一起藏 */
+.g-siteoff.on { border-color: var(--danger); }
+/* 没勾「启用筛选」时条件照样能预先讲好，但整块压暗，免得看起来已经在挡了 */
+.g-filter.off .wf-row:not(.wf-master), .g-filter.off .wf-warn { opacity: .5; }
 
 /* ---------------- 微博筛选表单（照微博原生的样子：类型 / 关键字 / 时间） ---------------- */
 .g-filter { display: flex; flex-direction: column; gap: 13px; padding: 14px 14px 20px; }

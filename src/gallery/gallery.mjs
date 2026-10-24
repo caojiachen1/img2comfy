@@ -32,6 +32,7 @@ const S = {
     batchState: new Map(),
     selSaved: '',
     filterSite: '',
+    siteHost: '',
     running: false,
     lbIndex: -1,
     lbList: [],
@@ -86,6 +87,7 @@ function bindEvents() {
         S.onlyView = $('#onlyView').checked;
         if (S.full) applyData(S.full, true);
     };
+    $('#siteOff').onchange = () => { void setSiteOff($('#siteOff').checked); };
     // 「全部微博」要重扫（得多问一次页面自己那份信息流数据），不像「只看屏幕附近」只是换个筛法
     $('#feedAll').onchange = () => {
         if (S.running) return;
@@ -171,6 +173,8 @@ function bindEvents() {
     chrome.storage.onChanged.addListener((changes, area) => {
         if (area !== 'local' || !changes.mtbSettings) return;
         applyUiTheme(changes.mtbSettings.newValue);
+        const nextSites = (changes.mtbSettings.newValue || {}).sites;
+        if (nextSites) { S.settings.sites = nextSites; syncSiteOff(); }
         const g = (changes.mtbSettings.newValue || {}).gallery || {};
         S.jumpMode = normJumpMode(g.jumpMode);
         S.jumpMissing = g.jumpMissing === 'tab' ? 'tab' : 'scroll';
@@ -273,6 +277,8 @@ async function collect(keepSelection) {
         $('#pageTitle').textContent = tab.title || tab.url || '';
         const host = (() => { try { return new URL(tab.url).hostname; } catch (e) { return ''; } })();
         $('#siteInfo').textContent = host;
+        S.siteHost = host;
+        syncSiteOff();
         S.weiboFlag = isWeiboHost(host);
         $('#feedAllWrap').hidden = !S.weiboFlag;
         $('#btnMore').hidden = !S.weiboFlag;
@@ -1405,6 +1411,42 @@ function filterHost() {
     try { return new URL((S.tab && S.tab.url) || '').hostname.toLowerCase(); } catch (e) { return ''; }
 }
 
+function disabledHosts() {
+    return ((S.settings || {}).sites || {}).disabled || [];
+}
+
+function isSiteDisabled() {
+    return !!S.siteHost && disabledHosts().includes(S.siteHost);
+}
+
+// 内容脚本只在启动那一刻读 sites.disabled，所以这里改完必须刷新页面才看得见效果
+function syncSiteOff() {
+    const wrap = $('#siteOffWrap');
+    if (!wrap) return;
+    wrap.hidden = !S.siteHost;
+    if (!S.siteHost) return;
+    const off = isSiteDisabled();
+    $('#siteOff').checked = off;
+    wrap.classList.toggle('on', off);
+    wrap.title = off
+        ? `扩展已在 ${S.siteHost} 停用：悬浮工具栏和微博筛选都不注入（图片面板照常，它不靠内容脚本）。刷新本页才会生效`
+        : `勾选后在 ${S.siteHost} 停用扩展：悬浮工具栏和微博筛选都不注入，刷新本页生效`;
+}
+
+async function setSiteOff(off) {
+    const host = S.siteHost;
+    if (!host) return;
+    const list = disabledHosts().filter((h) => h !== host);
+    if (off) list.push(host);
+    S.settings.sites = { ...(S.settings.sites || {}), disabled: list };
+    syncSiteOff();
+    try {
+        await chrome.runtime.sendMessage({ action: 'patchSettings', patch: { sites: { disabled: list } } });
+    } catch (e) { /* 扩展刚重载时忽略 */ }
+    toast(off ? `已停用 ${host}：刷新本页后工具栏和筛选都会消失` : `已恢复 ${host}：刷新本页后重新注入工具栏`);
+    if (document.body.classList.contains('tab-filter')) void refreshFilterStatus();
+}
+
 function modeText(r) {
     const base = `已隐藏 ${r.hidden} 条 / 共 ${r.total} 条`;
     return r.mode === 'list' ? `${base} · 实验模式（改微博内部列表，无空位）` : `${base} · 页面隐藏（会留空位）`;
@@ -1455,8 +1497,15 @@ function describeExpr(node) {
     return w(node, true);
 }
 
+function renderMasterRow(f) {
+    $('#panelFilter').classList.toggle('off', !f.enabled);
+    $('#wfEnabledHint').textContent = f.enabled ? describeWeiboFilter(f) : '没勾选时下面这些条件一条都不挡';
+}
+
 function syncFilterForm() {
     const f = normalizeWeiboFilter((S.settings || {}).weiboFilter);
+    $('#wfEnabled').checked = f.enabled;
+    renderMasterRow(f);
     for (const el of document.querySelectorAll('[data-wf-type]')) el.checked = f.types[el.dataset.wfType] !== false;
     $('#wfKeywords').value = f.keywords.join(f.keywordMode === 'expr' ? ' ' : '\n');
     $('#wfKeywordMode').value = f.keywordMode;
@@ -1473,7 +1522,7 @@ function readFilterForm() {
     for (const el of document.querySelectorAll('[data-wf-type]')) types[el.dataset.wfType] = el.checked;
     const keywordMode = $('#wfKeywordMode').value;
     return normalizeWeiboFilter({
-        enabled: true,
+        enabled: !!$('#wfEnabled').checked,
         site: S.filterSite || filterHost(),
         allSites: $('#wfAllSites').checked,
         types,
@@ -1490,7 +1539,8 @@ async function pushFilter(filter) {
     if (!S.tabId) { setWfStatus('没有可作用的网页'); return; }
     try {
         const r = await chrome.tabs.sendMessage(S.tabId, { action: 'mtbWeiboFilter', filter });
-        if (r && typeof r.hidden === 'number') setWfStatus(modeText(r), true);
+        if (!filter.enabled) setWfStatus('未启用筛选：条件先留着，页面上一条都不挡');
+        else if (r && typeof r.hidden === 'number') setWfStatus(modeText(r), true);
         else setWfStatus('已应用', true);
         if (r && r.pageError) setWfStatus(`实验模式不可用，已退回页面隐藏（会留空位）：${r.pageError}`, false);
     } catch (e) {
@@ -1502,6 +1552,7 @@ let wfTimer = 0;
 function onFilterFormChanged() {
     const filter = readFilterForm();
     S.settings.weiboFilter = filter;
+    renderMasterRow(filter);
     updateExprUi(filter);
     clearTimeout(wfTimer);
     wfTimer = setTimeout(() => {
@@ -1513,11 +1564,12 @@ function onFilterFormChanged() {
 async function refreshFilterStatus() {
     const f = normalizeWeiboFilter((S.settings || {}).weiboFilter);
     if (!S.tabId) { setWfStatus('没有可作用的网页'); return; }
+    if (isSiteDisabled()) { setWfStatus('本站已用「禁用本站」停用扩展，筛选不会注入（取消勾选并刷新本页后恢复）'); return; }
     try {
         const r = await chrome.tabs.sendMessage(S.tabId, { action: 'mtbWeiboStatus' });
         if (r && r.applied) setWfStatus(modeText(r), true);
         else if (f.enabled) setWfStatus(`已开启，但这条规则只作用于 ${f.site || '—'}，本页不生效`);
-        else setWfStatus('筛选会立刻生效，不用刷新');
+        else setWfStatus('没勾「启用筛选」，本页显示全部微博；勾上立刻生效，不用刷新');
     } catch (e) { setWfStatus('网页里的脚本连不上：刷新网页后再试'); }
 }
 
@@ -1546,6 +1598,7 @@ function initFilterTab() {
         el.addEventListener('change', onFilterFormChanged);
     }
     $('#wfAllSites').addEventListener('change', syncFilterForm);
+    $('#wfEnabled').addEventListener('change', syncFilterForm);
     $('#wfClear').onclick = () => {
         const f = normalizeWeiboFilter({ enabled: false, site: S.filterSite || host });
         S.settings.weiboFilter = f;
