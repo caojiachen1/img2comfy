@@ -6,8 +6,8 @@ import { keywordExprOf } from './src/common/weibo-filter.js';
 import { llmErrorText, parseChatReply, redactKey } from './src/common/ai/llm-api.js';
 import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
-import { collectPageImages } from './src/gallery/collect.mjs';
-import { upgradeWeiboImageUrl, imageDedupeKey } from './src/common/gallery.js';
+import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './src/gallery/collect.mjs';
+import { upgradeWeiboImageUrl, imageDedupeKey, weiboImageTierUrl, weiboStatusToPost, mergeFeedPosts, isWeiboHost, clampLoadPages } from './src/common/gallery.js';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
@@ -55,9 +55,26 @@ const EXT_SCHEMA = {
     note: 'send {action, ...params}; long jobs are task-based (start + poll state)',
     actions: {
         collectImages: {
-            desc: '一次性采集指定标签页全部图片（含 iframe）：垃圾过滤、去重、微博档位升级、按博主分组',
-            params: { tabId: 'number 必填（chrome.tabs 的 tabId）', max: '最多采集数，默认 400', weibo: 'bool，强制按微博规则', debug: 'bool，带回丢弃样本' },
-            returns: '{ total, junk, groups[{key,label,url,items[{url,thumb,card,full,width,height,kind,alt,y}]}], dropHist, pageUrl, pageTitle }',
+            desc: '采集指定标签页全部图片（含 iframe）：垃圾过滤、去重、按博主分组；每个条目并存三档位（url=large 原图 / full=mw2000 / card=mw690）',
+            params: {
+                tabId: 'number 必填（chrome.tabs 的 tabId）',
+                max: '最多采集数，默认 400',
+                weibo: 'bool，强制按微博规则',
+                feed: 'bool，微博页再读信息流数据，补回被虚拟列表回收的帖子（配 weiboLoadMore 使用）',
+                accumulate: 'bool，跨调用累加（与面板共用缓存，滚过的内容不清零）',
+                debug: 'bool，带回丢弃样本',
+            },
+            returns: '{ total, junk, groups[{key,label,url,y,items[{url,thumb,card,full,width,height,kind,alt,y}]}], dropHist, feed, pageUrl, pageTitle, weibo, accumulated }',
+        },
+        weiboLoadMore: {
+            desc: '「帮我翻页」：不滚动页面，调微博组件自己的 loadMoreData，拿不到就带 max_id 游标直接向后端要后 1~10 页；翻完用 collectImages {feed:true} 合并',
+            params: { tabId: 'number 必填', pages: '1~10，默认 1' },
+            returns: '{ ok, route(component|fetch), pages, added, addedPosts, detail }',
+        },
+        scrollToPost: {
+            desc: '跳到某条微博：被虚拟列表回收的会自动往下翻屏挂出来并高亮，不新开标签',
+            params: { tabId: 'number 必填', ids: '[mid]', key: '组 key（#ps<id> 后缀自动提取）', url: '微博地址（mid 段自动提取）', loadMissing: 'bool 默认 true' },
+            returns: '{ ok, found, how, centerDelta, searched, … }',
         },
         downloadUrl: {
             desc: '高清下载：伪装 Referer（DNR 动态规则）抓字节后走 chrome.downloads 落盘',
@@ -346,41 +363,87 @@ function weiboFilterPage(arg) {
     }
 }
 
-// 无状态合并：把 allFrames 各帧的采集结果并成一份。gallery 面板的 mergeResults
-// 带面板累加状态（S.raw），RPC 场景没有面板，这里一次性合并完就返回。
-function mergeCollectResults(results) {
-    const byKey = new Map();
-    const seen = new Set();
+// ── 采集合并核心（与面板 mergeResults 同构，供 RPC 复用）──────────────────
+// acc 与面板的 S.raw 结构一致：{ groups, byKey, seen, byPid }，
+// 这样 mergeFeedPosts（信息流补全）和 galleryCache（跨调用累加）都能直接吃。
+function newCollectAcc() {
+    return { groups: [], byKey: new Map(), seen: new Set(), byPid: new Map() };
+}
+
+// 把一帧（或缓存里旧的一批）采集结果并进 acc；返回首帧 meta 与本次丢弃统计。
+// 注意档位策略与面板一致：url 是 large（原图/发送用），card=mw690（卡片），
+// full=mw2000（查看器）——三档并存，不做统一升级。
+function mergeCollectInto(acc, results) {
+    let meta = null;
     const dropHist = {};
     let view = null;
     for (const r of results || []) {
         const res = r && r.result;
         if (!res || !Array.isArray(res.groups)) continue;
+        if (!meta) meta = res;
         if (!view && res.view) view = res.view;
         if (res.dropHist) for (const k in res.dropHist) dropHist[k] = (dropHist[k] || 0) + res.dropHist[k];
         for (const g of res.groups) {
-            let t = byKey.get(g.key);
+            let t = acc.byKey.get(g.key);
             if (!t) {
                 t = { key: g.key, label: g.label || '本页图片', sub: g.sub || '', url: g.url || '', items: [], junk: !!g.junk };
-                byKey.set(g.key, t);
+                acc.byKey.set(g.key, t);
+                acc.groups.push(t);
             } else if (!t.url && g.url) t.url = g.url;
             for (const raw of g.items || []) {
                 const url = upgradeWeiboImageUrl(raw.url || '');
                 if (!/^https?:/i.test(url) && !/^data:image\//i.test(url)) continue;
                 // 同一张图出现在两条微博（转发）里按组各算一项，与面板逻辑一致
-                const key = t.key + '|' + imageDedupeKey(url);
-                if (seen.has(key)) continue;
-                seen.add(key);
+                const dkey = imageDedupeKey(url);
+                const key = t.key + '|' + dkey;
+                if (acc.seen.has(key)) continue;
+                acc.seen.add(key);
+                // 记「这张图属于哪个组」：信息流数据里的帖子要靠 pid 认亲
+                if (!acc.byPid.has(dkey)) acc.byPid.set(dkey, t.key);
+                const y = Math.round(raw.y) || 0;
+                if (typeof t.y !== 'number' || y < t.y) t.y = y;
                 t.items.push({
-                    ...raw,
-                    url,
-                    full: raw.full ? upgradeWeiboImageUrl(raw.full) : raw.full,
-                    card: raw.card ? upgradeWeiboImageUrl(raw.card) : raw.card,
+                    key, url,
+                    thumb: raw.thumb && !/^blob:/i.test(raw.thumb) ? raw.thumb : url,
+                    card: raw.card || weiboImageTierUrl(url, 'card'),
+                    full: raw.full || weiboImageTierUrl(url, 'full'),
+                    y,
+                    width: raw.width | 0, height: raw.height | 0,
+                    kind: raw.kind || 'image', alt: raw.alt || '',
+                    pageUrl: raw.pageUrl || (meta && meta.pageUrl) || '',
+                    groupKey: t.key,
                 });
             }
         }
     }
-    const groups = [...byKey.values()].filter((g) => g.items.length);
+    return { meta, dropHist, view };
+}
+
+// 从 galleryCache 的旧条目恢复 acc（面板 seedFromCache 的 RPC 版：
+// 缓存里的 groups 是纯 JSON，重建 byKey/seen/byPid 三个索引）。
+function seedAccFromCache(entry) {
+    const acc = newCollectAcc();
+    if (!entry) return { acc, meta: null };
+    for (const g of (Array.isArray(entry.groups) ? entry.groups : [])) {
+        if (!g || !Array.isArray(g.items) || !g.items.length) continue;
+        const t = { ...g };
+        acc.byKey.set(t.key, t);
+        acc.groups.push(t);
+        for (const it of t.items) {
+            if (it && it.key) acc.seen.add(it.key);
+            const dkey = it && it.url ? imageDedupeKey(it.url) : '';
+            if (dkey && !acc.byPid.has(dkey)) acc.byPid.set(dkey, t.key);
+        }
+    }
+    return { acc, meta: entry.meta || null };
+}
+
+// acc → 响应视图：组按页面位置排序（面板顺序=信息流顺序），「无用图片」垫底。
+function accView(acc, dropHist, view) {
+    const groups = acc.groups
+        .filter((g) => g.items.length)
+        .sort((a, b) => (a.junk ? 1 : 0) - (b.junk ? 1 : 0) || (a.y ?? 0) - (b.y ?? 0))
+        .map((g) => { for (const it of g.items) it.groupLabel = g.label; return g; });
     const total = groups.reduce((n, g) => n + g.items.length, 0);
     const junk = groups.filter((g) => g.junk).reduce((n, g) => n + g.items.length, 0);
     return { total, junk, groups, dropHist, view };
@@ -417,17 +480,40 @@ const HANDLERS = {
         return { ok: true, id: t.id };
     },
 
-    // 外部桥入口：对指定标签页做一次性全量图片采集。
-    // gallery 面板版带累加状态（面板反复开关）；这里是无状态单发，结果直接回给调用方。
+    // 外部桥入口：对指定标签页做图片采集。与 gallery 面板同一套合并核心：
+    //   feed:true       微博页再读信息流数据（虚拟列表回收的帖子在这里补回）
+    //   accumulate:true 跨调用累加（与面板共用 galleryCache，滚过的内容不清零）
     collectImages: async (req) => {
         const tabId = Number(req.tabId) || 0;
         if (!tabId) throw new Error('tabId required (chrome.tabs id)');
         let tab;
         try { tab = await chrome.tabs.get(tabId); }
         catch (e) { throw new Error('tab not found: ' + tabId); }
+        let host = '';
+        try { host = new URL(tab.url || '').hostname; } catch (e) { /* 非 http(s) 页 */ }
+        const weiboFlag = req.weibo === true || isWeiboHost(host);
+        const accumulate = req.accumulate === true;
+        const wantFeed = req.feed === true && weiboFlag;
+
+        // 1) 种子：累加模式下先并入这个标签页的缓存（面板与 RPC 共用一份）
+        let acc, seedMeta = null, extraPosts = [];
+        if (accumulate) {
+            const e = galleryCache.get(tabId);
+            const fresh = e && Date.now() - e.at <= GALLERY_CACHE_TTL ? e : null;
+            const seeded = seedAccFromCache(fresh);
+            acc = seeded.acc;
+            seedMeta = seeded.meta;
+            if (fresh && Array.isArray(fresh.extra)) {
+                extraPosts = fresh.extra.filter((p) => p && Array.isArray(p.pics) && p.pics.length);
+            }
+        } else {
+            acc = newCollectAcc();
+        }
+
+        // 2) DOM 扫描（allFrames，受限页面降级单帧）
         const args = [{
             max: Math.max(1, Math.min(1000, Number(req.max) || 400)),
-            weibo: req.weibo === true,
+            weibo: weiboFlag,
             debug: req.debug === true,
         }];
         let results;
@@ -436,7 +522,131 @@ const HANDLERS = {
         } catch (e) {
             results = await chrome.scripting.executeScript({ target: { tabId }, func: collectPageImages, args });
         }
-        return { ok: true, tabId, pageUrl: tab.url, pageTitle: tab.title, ...mergeCollectResults(results) };
+        const { meta, dropHist, view } = mergeCollectInto(acc, results);
+
+        // 3) 信息流数据补全：MAIN world 读微博自己的 feed 数组 + 「帮我翻页」攒下的 extra
+        let feedStats = null;
+        if (wantFeed) {
+            const r = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: weiboFeedPage, args: [{ max: 300 }] }).catch(() => null);
+            const res = r && r[0] && r[0].result;
+            const posts = [];
+            if (res && res.ok && Array.isArray(res.posts)) {
+                const seenMid = new Set();
+                for (const [i, it] of res.posts.entries()) {
+                    const p = weiboStatusToPost(it, Number(it.index) || i, host);
+                    if (!p.pics.length) continue;
+                    if (p.mid) { if (seenMid.has(p.mid)) continue; seenMid.add(p.mid); }
+                    posts.push(p);
+                }
+            }
+            const allPosts = posts.concat(extraPosts);
+            if (allPosts.length) feedStats = mergeFeedPosts(acc, allPosts, { pageUrl: tab.url });
+        }
+
+        const out = accView(acc, dropHist, view || (seedMeta && seedMeta.view) || null);
+
+        // 4) 写回缓存（与面板同格式；信息流补来的条目每次都能重取，不进缓存）
+        if (accumulate && acc.groups.length) {
+            const groupsOut = acc.groups
+                .map((g) => {
+                    const items = (g.items || []).filter((it) => it.src !== 'feed');
+                    return items.length ? { ...g, items, y: items.reduce((m, it) => Math.min(m, it.y || 0), Infinity) } : null;
+                })
+                .filter(Boolean);
+            if (groupsOut.length || extraPosts.length) {
+                await HANDLERS.galleryCachePut({
+                    tabId,
+                    entry: {
+                        meta: { pageUrl: tab.url, pageTitle: tab.title, host, weibo: weiboFlag, view: out.view },
+                        groups: groupsOut,
+                        extra: extraPosts,
+                    },
+                });
+            }
+        }
+        return { ok: true, tabId, pageUrl: tab.url, pageTitle: tab.title, weibo: weiboFlag, accumulated: accumulate, feed: feedStats, ...out };
+    },
+
+    // 外部桥入口：「帮我翻页」。不滚动页面，直接调微博组件自己的 loadMoreData，
+    // 拿不到就克隆读流请求带 max_id 游标向后端要后几页（1~10 页，太多容易被限流）。
+    // fetch 路由要来的帖子不在页面列表里，转成帖子存进该标签页缓存 的 extra，
+    // 之后的 collectImages {feed:true} 会把它们并进来。
+    weiboLoadMore: async (req) => {
+        const tabId = Number(req.tabId) || 0;
+        if (!tabId) throw new Error('tabId required');
+        let tab;
+        try { tab = await chrome.tabs.get(tabId); }
+        catch (e) { throw new Error('tab not found: ' + tabId); }
+        const pages = clampLoadPages(Number(req.pages) || 1);
+        let res;
+        try {
+            const r = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: weiboLoadMorePages, args: [{ pages }] });
+            res = r && r[0] && r[0].result;
+        } catch (e) {
+            res = { ok: false, error: String((e && e.message) || e) };
+        }
+        if (!res) return { ok: false, error: '页面无响应（可能刚更新，刷新页面后重试）' };
+        let addedPosts = 0;
+        if (res.route === 'fetch' && Array.isArray(res.statuses)) {
+            let fhost = '';
+            try { fhost = new URL(tab.url || '').hostname; } catch (e) { /* ignore */ }
+            const e = galleryCache.get(tabId) || {};
+            const extra = Array.isArray(e.extra) ? e.extra : [];
+            const seen = new Set(extra.map((p) => p && p.mid).filter(Boolean));
+            for (const s of res.statuses) {
+                const p = weiboStatusToPost(s, 0, fhost);
+                if (!p.pics.length || (p.mid && seen.has(p.mid))) continue;
+                if (p.mid) seen.add(p.mid);
+                extra.push(p);
+                addedPosts++;
+            }
+            galleryCache.set(tabId, {
+                at: Date.now(),
+                meta: e.meta || null,
+                groups: Array.isArray(e.groups) ? e.groups : [],
+                extra: extra.slice(-900),
+            });
+        }
+        return {
+            ok: !!res.ok,
+            route: res.route || '',
+            pages: res.pages | 0,
+            added: res.added | 0,
+            addedPosts,
+            detail: res.detail || res.stopped || res.error || '',
+            note: '翻完后用 collectImages {feed:true, accumulate:true} 合并结果',
+        };
+    },
+
+    // 外部桥入口：跳到某条微博（含被虚拟列表回收的：自动往下翻屏挂出来高亮）。
+    // ids 或 url/key 至少给一个；key/url 里的 mid 段会自动提取（与面板 groupIdsOf 一致）。
+    scrollToPost: async (req) => {
+        const tabId = Number(req.tabId) || 0;
+        if (!tabId) throw new Error('tabId required');
+        const ids = [];
+        for (const v of (Array.isArray(req.ids) ? req.ids : [])) {
+            const s = String(v || '');
+            if (s.length >= 5 && ids.indexOf(s) < 0) ids.push(s);
+        }
+        for (const s of [String(req.key || ''), String(req.url || '')]) {
+            let m = /#ps(.+)$/.exec(s);
+            if (m && ids.indexOf(m[1]) < 0) ids.push(m[1]);
+            m = /weibo\.(?:com|cn)\/(?:\d{5,}\/)?([\w]{5,})(?:[?#]|$)/.exec(s);
+            if (m && ids.indexOf(m[1]) < 0) ids.push(m[1]);
+        }
+        if (!ids.length && !req.url) return { ok: false, error: '需要 ids / key / url 至少一个' };
+        let res;
+        try {
+            const r = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: scrollToPost,
+                args: [{ ids, url: String(req.url || ''), loadMissing: req.loadMissing !== false, color: String(req.color || '#6ea8fe') }],
+            });
+            res = r && r[0] && r[0].result;
+        } catch (e) {
+            res = { ok: false, error: String((e && e.message) || e) };
+        }
+        return res || { ok: false, error: '页面无响应' };
     },
 
     captureVisibleTab: async (req, sender) => {
