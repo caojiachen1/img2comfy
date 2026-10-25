@@ -17,6 +17,11 @@
   "host_permissions": [
     "<all_urls>"
   ],
+  "externally_connectable": {
+    "ids": [
+      "elhkfoiapjdaglefijfgapbffflphgim"
+    ]
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"

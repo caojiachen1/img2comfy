@@ -6,6 +6,8 @@ import { keywordExprOf } from './src/common/weibo-filter.js';
 import { llmErrorText, parseChatReply, redactKey } from './src/common/ai/llm-api.js';
 import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
+import { collectPageImages } from './src/gallery/collect.mjs';
+import { upgradeWeiboImageUrl, imageDedupeKey } from './src/common/gallery.js';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
@@ -32,6 +34,59 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     if (!req || !req.action) return false;
     const h = HANDLERS[req.action];
     if (!h) return false;
+    Promise.resolve(h(req, sender)).then((r) => sendResponse(r === undefined ? { ok: true } : r))
+        .catch((e) => sendResponse({ ok: false, error: String(e && e.message || e) }));
+    return true; // 异步通道
+});
+
+
+// ── 外部扩展 RPC 桥（UBB 等）──────────────────────────────────────────────
+// manifest 的 externally_connectable.ids 决定谁能发消息进来；这里再校验一次
+// sender.id，然后按 {action, ...params} 转发给内部 HANDLERS。
+// 受控方能力自发现：发 {action:'__schema__'} 返回可调用清单。
+const EXTERNAL_SENDER_IDS = new Set([
+    'elhkfoiapjdaglefijfgapbffflphgim', // UBB — Universal Browser Bridge (D:\Codebase\ubb)
+]);
+
+const EXT_SCHEMA = {
+    ok: true,
+    extension: 'Media Hover Toolbar (img2comfy)',
+    protocol: 1,
+    note: 'send {action, ...params}; long jobs are task-based (start + poll state)',
+    actions: {
+        collectImages: {
+            desc: '一次性采集指定标签页全部图片（含 iframe）：垃圾过滤、去重、微博档位升级、按博主分组',
+            params: { tabId: 'number 必填（chrome.tabs 的 tabId）', max: '最多采集数，默认 400', weibo: 'bool，强制按微博规则', debug: 'bool，带回丢弃样本' },
+            returns: '{ total, junk, groups[{key,label,url,items[{url,thumb,card,full,width,height,kind,alt,y}]}], dropHist, pageUrl, pageTitle }',
+        },
+        downloadUrl: {
+            desc: '高清下载：伪装 Referer（DNR 动态规则）抓字节后走 chrome.downloads 落盘',
+            params: { url: '图片地址（建议用采集结果的 full/large 档）', pageUrl: '来源页地址，用于 Referer 伪装', filename: '可选文件名' },
+            returns: '{ ok, downloadId, filename }',
+        },
+        downloadDataUrl: { desc: '下载 base64 dataURL 字节', params: { dataUrl: '', filename: '' } },
+        fetchMedia: { desc: '带 Referer 伪装抓取图片字节，返回 base64（注意消息体积）', params: { url: '', pageUrl: '', filename: '' } },
+        startGalleryBatch: { desc: '批量任务：下载/发送 ComfyUI 一组图片；用 galleryBatchState 轮询', params: '见 gallery 面板' },
+        galleryBatchState: { desc: '轮询批量任务进度' },
+        cancelGalleryBatch: { desc: '取消批量任务' },
+        getState: { desc: '读取当前设置' },
+        __schema__: { desc: '本清单' },
+    },
+    passthrough: '其余内部 HANDLERS 动作（llmChat / proxyFetch / sendImageToComfyUI …）同样可调',
+};
+
+chrome.runtime.onMessageExternal.addListener((req, sender, sendResponse) => {
+    if (!EXTERNAL_SENDER_IDS.has(sender.id)) {
+        sendResponse({ ok: false, error: 'sender not allowed: ' + (sender.id || '(none)') });
+        return false;
+    }
+    if (!req || typeof req.action !== 'string') {
+        sendResponse({ ok: false, error: 'missing action' });
+        return false;
+    }
+    if (req.action === '__schema__') { sendResponse(EXT_SCHEMA); return false; }
+    const h = HANDLERS[req.action];
+    if (!h) { sendResponse({ ok: false, error: 'unknown action: ' + req.action }); return false; }
     Promise.resolve(h(req, sender)).then((r) => sendResponse(r === undefined ? { ok: true } : r))
         .catch((e) => sendResponse({ ok: false, error: String(e && e.message || e) }));
     return true; // 异步通道
@@ -291,6 +346,46 @@ function weiboFilterPage(arg) {
     }
 }
 
+// 无状态合并：把 allFrames 各帧的采集结果并成一份。gallery 面板的 mergeResults
+// 带面板累加状态（S.raw），RPC 场景没有面板，这里一次性合并完就返回。
+function mergeCollectResults(results) {
+    const byKey = new Map();
+    const seen = new Set();
+    const dropHist = {};
+    let view = null;
+    for (const r of results || []) {
+        const res = r && r.result;
+        if (!res || !Array.isArray(res.groups)) continue;
+        if (!view && res.view) view = res.view;
+        if (res.dropHist) for (const k in res.dropHist) dropHist[k] = (dropHist[k] || 0) + res.dropHist[k];
+        for (const g of res.groups) {
+            let t = byKey.get(g.key);
+            if (!t) {
+                t = { key: g.key, label: g.label || '本页图片', sub: g.sub || '', url: g.url || '', items: [], junk: !!g.junk };
+                byKey.set(g.key, t);
+            } else if (!t.url && g.url) t.url = g.url;
+            for (const raw of g.items || []) {
+                const url = upgradeWeiboImageUrl(raw.url || '');
+                if (!/^https?:/i.test(url) && !/^data:image\//i.test(url)) continue;
+                // 同一张图出现在两条微博（转发）里按组各算一项，与面板逻辑一致
+                const key = t.key + '|' + imageDedupeKey(url);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                t.items.push({
+                    ...raw,
+                    url,
+                    full: raw.full ? upgradeWeiboImageUrl(raw.full) : raw.full,
+                    card: raw.card ? upgradeWeiboImageUrl(raw.card) : raw.card,
+                });
+            }
+        }
+    }
+    const groups = [...byKey.values()].filter((g) => g.items.length);
+    const total = groups.reduce((n, g) => n + g.items.length, 0);
+    const junk = groups.filter((g) => g.junk).reduce((n, g) => n + g.items.length, 0);
+    return { total, junk, groups, dropHist, view };
+}
+
 const HANDLERS = {
     getState: async () => {
         const data = await chrome.storage.local.get(['mtbSettings', 'comfyConfig']);
@@ -320,6 +415,28 @@ const HANDLERS = {
     openTab: async (req) => {
         const t = await chrome.tabs.create({ url: req.url, active: req.active !== false });
         return { ok: true, id: t.id };
+    },
+
+    // 外部桥入口：对指定标签页做一次性全量图片采集。
+    // gallery 面板版带累加状态（面板反复开关）；这里是无状态单发，结果直接回给调用方。
+    collectImages: async (req) => {
+        const tabId = Number(req.tabId) || 0;
+        if (!tabId) throw new Error('tabId required (chrome.tabs id)');
+        let tab;
+        try { tab = await chrome.tabs.get(tabId); }
+        catch (e) { throw new Error('tab not found: ' + tabId); }
+        const args = [{
+            max: Math.max(1, Math.min(1000, Number(req.max) || 400)),
+            weibo: req.weibo === true,
+            debug: req.debug === true,
+        }];
+        let results;
+        try {
+            results = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: collectPageImages, args });
+        } catch (e) {
+            results = await chrome.scripting.executeScript({ target: { tabId }, func: collectPageImages, args });
+        }
+        return { ok: true, tabId, pageUrl: tab.url, pageTitle: tab.title, ...mergeCollectResults(results) };
     },
 
     captureVisibleTab: async (req, sender) => {
