@@ -12,6 +12,7 @@ import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.j
 import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64, bytesFingerprint, uniqueUploadName, extFromMime } from '../src/common/util.js';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, weiboStatusUrl, clampLoadPages } from '../src/common/gallery.js';
 import { UI_THEMES, DEFAULT_UI_THEME, normalizeUiTheme, uiThemeLabel } from '../src/common/theme.js';
+import { parseWeiboDate, eventDateOf, normStatus, parseArchivePage, addPosts, newArchiveState, crawlArchive, serializeArchive, restoreArchive, publicArchive, uniqPics, mediaPlan, ARCHIVE_STORE_KEY, DEFAULT_FEATURES, TIERS } from '../src/gallery/weibo-archive.mjs';
 
 let pass = 0, fail = 0;
 const notes = [];
@@ -358,10 +359,21 @@ console.log('== registry / settings ==');
     ok('图片工具栏非空', items.length >= 3, JSON.stringify(items.map((i) => i.id)));
     ok('视频工具栏含取帧', buildToolbar(s, 'video', false).some((i) => i.id === 'v-frame'));
     {
-        const bg = buildToolbar(s, 'image', true).map((i) => i.id);
-        ok('bg 保留地址类工具', ['copy-link', 'open-src', 'info'].every((id) => bg.includes(id)), bg.join(','));
-        ok('bg 排除取帧/像素类', !bg.includes('v-frame') && !bg.includes('upscale-lanczos'), bg.join(','));
-        ok('bg 允许脚本工具（可自行取链）', bg.includes('send-comfy'));
+        // 这一整块原来写的是 `buildToolbar(s, 'image', true)` 并断言「像素类要被排除」——
+        // 但 buildToolbar 从来只有 (settings, mediaType) 两个参数，第三个参数是空气，
+        // 而 upscale-lanczos 是默认启用的图片工具，被排除才是 bug。断言按真实契约重写。
+        const img = buildToolbar(s, 'image').map((i) => i.id);
+        const onlyVideo = ['v-frame', 'v-frames-sheet', 'v-play', 'v-speed', 'v-mute', 'v-piP', 'v-seek-in', 'v-copy-time'];
+        ok('图片工具栏保留地址类工具', ['copy-link', 'open-src', 'info'].every((id) => img.includes(id)), img.join(','));
+        ok('图片工具栏绝不漏进视频专属工具（mediaType 过滤是唯一入口，靠 media 数组判，不靠第二参数）',
+            !onlyVideo.some((id) => img.includes(id)), img.join(','));
+        ok('视频工具栏反过来也不许漏进图片专属工具（抠色/暗角/圆角/OTSU/调色板/标签/sam/深度都是图片专属）',
+            !['chromakey', 'vignette', 'round', 'palette', 'ai-sam', 'ai-depth'].some((id) => buildToolbar(s, 'video').map((i) => i.id).includes(id)));
+        ok('图片工具栏允许脚本工具（可自行取链）', img.includes('send-comfy'), img.join(','));
+        ok('默认启用的图片工具是「高清/调色/下载」这一族，upscale-lanczos 出现是对的（旧断言把它当排除项，是断言错不是实现错）',
+            img.includes('upscale-lanczos') && img.includes('download'));
+        ok('buildToolbar 只接两个参数：测试不许再靠一个不存在的第三参数写断言（这条红过一次就是这么来的）',
+            buildToolbar.length === 2, 'arity=' + buildToolbar.length);
     }
     s.tools['invert'].enabled = true;
     s.tools['invert'].order = 0;
@@ -1265,6 +1277,173 @@ console.log('== 往下翻找：没有「翻几屏就算了」的上限 ==');
         read('src/gallery/gallery.mjs').includes('屏也没加载出这条')
         && /r\.restored \? '，已滚回原位'/.test(read('src/gallery/gallery.mjs'))
         && /r\.endNote \? `（\$\{r\.endNote\}）`/.test(read('src/gallery/gallery.mjs')));
+}
+
+console.log('== 微博整档抓取（weibo-archive）==');
+{
+    // 花体数字写成字面量太脆（成对代理对，编辑器/管道都可能吞一半），按码点造
+    const fancy = (d) => Array.from(d, (c) => String.fromCodePoint(0x1d7ce + Number(c))).join('');
+    ok('接口日期 "Sat Oct 10 20:14:13 +0800 2026" 必须自己拆成 ISO 形状（new Date 对它不可靠）',
+        parseWeiboDate('Sat Oct 10 20:14:13 +0800 2026') === '2026-10-10 20:14:13');
+    ok('认不出的日期一律给空串，不许拿当前时间或 NaN 冒充（宁缺毋滥）',
+        parseWeiboDate('') === '' && parseWeiboDate('2026-10-10') === '' && parseWeiboDate('Sat Xyz 10 20:14:13 +0800 2026') === '');
+    ok('花体数字 𝟐𝟎𝟒𝟎𝟔𝟎𝟖 经 NFKD 归一化解成场次日期码 —— 图博正文不写穿搭只写日期码，这是聚合主键',
+        eventDateOf('伟大的月诞 ' + fancy('20240608')) === '2024-06-08');
+    ok('普通 ASCII 日期同样认；没有日期码给空串（不拿 created_at 冒充场次）',
+        eventDateOf('20230701 下班') === '2023-07-01' && eventDateOf('没有任何数字') === '');
+
+    const st0 = normStatus({
+        id: 5000000000000001, idstr: '5000000000000001', mblogid: 'AbCdEf123', mid: 'm1',
+        created_at: 'Sat Oct 10 20:14:13 +0800 2026', text: '<a href=x>@某人</a>正文', text_raw: '正文 ' + fancy('20240608'),
+        pic_ids: ['p1', 'p2'], pic_num: 2, source: 'iPhone 14 Pro Max', region_name: '发布于 广东',
+        reposts_count: 1, comments_count: 2, attitudes_count: 3, isLongText: true,
+        retweeted_status: { pic_ids: ['r1'] }, page_info: { type: 'video' },
+    }, '7599983809');
+    ok('正文取 text_raw 不取带标签的 text（HTML 混进档案会让后面所有关键词统计失真）',
+        st0.text === '正文 ' + fancy('20240608') && st0.event === '2024-06-08');
+    ok('永久链接按 uid+bid 拼桌面版；没 uid 才退 m.weibo.cn',
+        st0.url === 'https://weibo.com/7599983809/AbCdEf123'
+        && normStatus({ id: 1, mblogid: 'x1' }, '').url === 'https://m.weibo.cn/status/x1');
+    ok('转发原帖的图单列 rt_pics，绝不和本条的 pics 混成一桶（混了就不知道图是谁的）',
+        st0.pics.length === 2 && st0.rt_pics.length === 1 && st0.repost === true);
+    ok('没有 id 的脏条目给 null（不往档案里塞无名条目）', normStatus({}, '1') === null && normStatus(null, '1') === null);
+
+    ok('游标字段三个版本都认（since_id / max_id_id / maxId），列表在 data 里或在顶层都认',
+        parseArchivePage({ data: { list: [1, 2], since_id: 'S1', total: 1176 } }).cursor === 'S1'
+        && parseArchivePage({ data: { list: [1], max_id_id: 'S2' } }).cursor === 'S2'
+        && parseArchivePage({ list: [1, 2, 3] }).list.length === 3);
+    ok('total=-1（feature 1/2/14 就是这样）必须归 0，不许当成「还有一页负一条」的总数',
+        parseArchivePage({ data: { list: [], total: -1 } }).declaredTotal === 0
+        && parseArchivePage({ data: { list: [], total: 1176 } }).declaredTotal === 1176);
+
+    const mk = (i) => ({ id: String(5000000000000000 + i), mblogid: 'B' + i, created_at: 'Sat Oct 10 20:14:13 +0800 2026', pic_ids: ['p' + i] });
+    const A = newArchiveState('1', { features: [0], maxPages: 5, delayMs: 0 });
+    ok('addPosts 只认 id 去重：跨 feature 桶重复出现的同一条不会计两次',
+        addPosts(A, [mk(1), mk(2)], '1') === 2 && addPosts(A, [mk(2), mk(3)], '1') === 1 && A.posts.length === 3);
+
+    // 假接口：能验证「有没有把上一页游标带回来」——不带就会原地反复要第一页，这是整档最容易犯的错
+    const asked = [];
+    const pages = [{ list: [mk(1), mk(2)], since_id: 'c1', total: 6 }, { list: [mk(3), mk(4)], since_id: 'c2' }, { list: [mk(5), mk(6)], since_id: 'c3' }];
+    const st = newArchiveState('42', { features: [0], maxPages: 9, delayMs: 0 });
+    let ck = 0;
+    let res = await crawlArchive({
+        fetchPage: async (q) => { asked.push(q); return { data: pages[asked.length - 1] || { list: [], since_id: 'z' } }; },
+        sleep: null, checkpoint: async () => { ck++; }, checkpointEvery: 2,
+    }, st);
+    ok('第二页必须把第一页返回的 since_id 传回去（page 参数单独用微博会一直给第一屏）',
+        asked[0].sinceId === '' && asked[1].sinceId === 'c1' && asked[2].sinceId === 'c2');
+    ok('接口自报 total=6，收满 6 条就停，并把「收满」这件事写进 stopped（不靠猜到底没有）',
+        res.posts === 6 && res.declaredTotal === 6 && res.stopped === 'reached-total' && res.complete === true);
+    ok('页码按 1 起（接口是 1-based），整档进度每页回调一次',
+        asked[0].page === 1 && asked[1].page === 2);
+    ok('checkpoint 按间隔落（每 2 页一次 + 收尾一次），SW 被回收才可能续得上',
+        ck === 2);
+
+    const st2 = newArchiveState('42', { features: [0], maxPages: 9, delayMs: 0 });
+    let n2 = 0;
+    const r2 = await crawlArchive({ fetchPage: async () => { n2++; return { data: { list: [mk(100 + n2)], since_id: 'same' } }; }, sleep: null }, st2);
+    ok('游标连续两次不动就判「接口没往后翻」立刻收手，绝不空转烧限流',
+        n2 === 3 && r2.stopped === 'cursor-stuck');
+
+    const st3 = newArchiveState('42', { features: [0], maxPages: 3, delayMs: 0 });
+    const r3 = await crawlArchive({ fetchPage: async () => ({ data: { list: [mk(1), mk(2)], since_id: 'x' + Math.random() } }), sleep: null }, st3);
+    ok('maxPages 是硬闸：到数就停并说明原因（防止把微博的限流敲穿）',
+        r3.stopped === 'max-pages' && r3.pages === 3);
+
+    const st4 = newArchiveState('42', { features: [0], maxPages: 9, delayMs: 0 });
+    const r4 = await crawlArchive({ fetchPage: async () => ({ data: { list: [] } }), sleep: null }, st4);
+    ok('空页 = 到底，stopped=empty-page，且 complete 在没拿到 total 时给 null 而不是 false（未知不等于失败）',
+        r4.stopped === 'empty-page' && r4.complete === null);
+
+    const st5 = newArchiveState('42', { features: [0], maxPages: 9, delayMs: 0 });
+    let hits = 0;
+    const r5 = await crawlArchive({ fetchPage: async () => { hits++; return { data: { list: [mk(hits)], since_id: 'k' + hits } }; }, sleep: null, shouldStop: () => hits >= 2 }, st5);
+    ok('取消要在页与页之间生效，并把 canceled 说清楚（用户按停止必须真停）',
+        hits === 2 && r5.canceled === true && r5.done === false);
+
+    const st6 = newArchiveState('42', { features: [0], maxPages: 2, delayMs: 0 });
+    await crawlArchive({ fetchPage: async () => ({ data: { list: [mk(1), mk(2)], since_id: 'a' } }), sleep: null }, st6);
+    const back = restoreArchive(JSON.parse(JSON.stringify(serializeArchive(st6))));
+    ok('落盘/恢复往返不丢帖，且 byId 会重建（Set 不可序列化，直接 JSON 化会把去重能力洗掉）',
+        back.posts.length === 2 && back.byId.has(String(5000000000000001)) && addPosts(back, [mk(1)], '42') === 0);
+    ok('默认抓 0/1/2/14 四个 feature 桶：实测只有 0 报 total，其余各回 20 条，并集才接近全部',
+        DEFAULT_FEATURES.join(',') === '0,1,2,14');
+
+    const stP = newArchiveState('42', { features: [0] });
+    addPosts(stP, [{ id: '1', mblogid: 'b1', created_at: 'Sat Oct 10 20:14:13 +0800 2026', pic_ids: ['p1', 'p2'] }], '42');
+    addPosts(stP, [{ id: '2', mblogid: 'b2', created_at: 'Sat Oct 10 20:14:13 +0800 2026', pic_ids: ['p2', 'p3'] }], '42');
+    const plan = mediaPlan(stP, {});
+    ok('下载计划按 pid 去重（两条帖共用一张图只下一次），默认档位 large 原图',
+        plan.length === 3 && uniqPics(stP.posts).length === 3 && /\/large\/p1\.jpg$/.test(plan[0].url));
+    ok('落盘路径带 uid 与拍摄日，文件名就是 pid —— 续传靠它认「这张已经下过」',
+        plan[0].key === 'mtb-weibo/42/2026-10-10/p1.jpg');
+    ok('skip 命中已完成的 pid 就跳过（断点续传不许重下），limit 只截数量不截顺序',
+        mediaPlan(stP, { skip: ['p1'] }).length === 2 && mediaPlan(stP, { limit: 1 }).length === 1);
+    ok('档位只认四个名字，写错回落 orig（拼错档位会 403，不如回到最稳的那档）',
+        TIERS.card === 'mw690' && mediaPlan(stP, { tier: 'nope' })[0].url.includes('/large/'));
+
+    const stT = newArchiveState('42', { features: [0] });
+    stT.posts = [
+        { id: 'top', created_at: '2024-06-09 08:19:15', ts: Date.parse('2024-06-09T08:19:15+08:00'), pics: [] },
+        { id: 'new', created_at: '2026-10-10 20:14:13', ts: Date.parse('2026-10-10T20:14:13+08:00'), pics: [] },
+        { id: 'old', created_at: '2021-04-27 23:08:30', ts: Date.parse('2021-04-27T23:08:30+08:00'), pics: [] },
+    ];
+    const pubT = publicArchive(stT);
+    ok('first/last 必须按时间取、不许取数组两端：微博把置顶帖放在最前面，按插入序会把「最新一条」报成那条置顶（真机 E2E 实测暴露：last 显示 2024-06-09，真最新是 2026-10-10）',
+        pubT.first === '2021-04-27 23:08:30' && pubT.last === '2026-10-10 20:14:13');
+
+    ok('features 从 RPC 过来可能是数字/字符串/空数组，不许因此抛异常，退回默认四桶',
+        newArchiveState('1', { features: 0 }).features.join(',') === DEFAULT_FEATURES.join(',')
+        && newArchiveState('1', { features: 'abc' }).features.length === 4
+        && newArchiveState('1', { features: [] }).features.length === 4
+        && newArchiveState('1', { features: [0, null, 2] }).features.join(',') === '0,2');
+
+    // 抓完再 Start（resume）时，已经判到底的桶不许再敲接口
+    const stR = newArchiveState('42', { features: [0, 1], maxPages: 9, delayMs: 0 });
+    stR.perFeature = { 0: { cursor: 'c', page: 3, added: 60, end: true, error: '' }, 1: { cursor: '', page: 0, added: 0, end: false, error: '' } };
+    for (let i = 0; i < 60; i++) addPosts(stR, [mk(i)], '42');
+    let askedR = 0;
+    await crawlArchive({ fetchPage: async () => { askedR++; return { data: { list: [], since_id: '' } }; }, sleep: null }, stR);
+    ok('续跑要跳过上一轮已到底的桶（抓完再点一次 Start 不该白烧几十次请求），只敲没跑完的那个桶',
+        askedR === 1 && stR.perFeature[0].page === 3);
+}
+
+console.log('== 整档抓取的后台接线（源码钉子）==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const bg = read('background.js');
+    const at = (s) => bg.indexOf(s);
+    const a = at('weiboArchiveStart: async');
+    const b = at('weiboArchiveMediaState: async');
+    const r = at('async function waCheckpoint');
+    const rend = at('function publicWaMedia');
+    const seg = bg.slice(a, b);        // 处理器本体
+    const run = bg.slice(r, rend);     // 真正干活的分离任务
+    ok('锚点都必须真在源码里（找不到就会切出空串，上面那些「不许出现 X」的钉子会静默空过）',
+        a > 0 && b > a && r > 0 && rend > r);
+    ok('Start 只许起任务立刻返回，绝不 await 整档（30~60s 的活儿塞进一次 RPC 必然被调用方那层超时掐死）',
+        !/await\s+crawlArchive/.test(seg) && /runWaJob\(\);/.test(seg) && /await\s+crawlArchive/.test(run));
+    ok('整档与图片两条链都要吃 MV3 的 30 秒回收：各自都要有心跳续命（和批量发送同一个招）',
+        (run.match(/getPlatformInfo/g) || []).length >= 2);
+    ok('断点落盘走 ARCHIVE_STORE_KEY 这一个键，游标与帖子一起写（只把游标写快一步，续跑会静默跳过没落盘的页）',
+        /ARCHIVE_STORE_KEY/.test(run) && /serializeArchive/.test(run));
+    ok('dump 大结果必须能改走 chrome.downloads，不把 1~2MB 档案塞进 RPC 消息',
+        /to === 'download'/.test(seg) && /chrome\.downloads\.download/.test(seg));
+    ok('Dump 与 Media 都必须先 waEnsureArchive（SW 被回收后只剩断点，"按 pid 续传"要还能继续，而不是逼人重抓整档）',
+        (seg.match(/waEnsureArchive\(\)/g) || []).length >= 2);
+    ok('批量取图不许逐张 addRefererRule（几千张就是近万次规则引擎往返），要用任务级共用规则 + 直取',
+        !/addRefererRule\(/.test(run) && /waSetReferer\(WA_IMG_RULE/.test(run));
+    ok('sinaimg 没有 Referer 直接 403：任务级规则必须在，且字节太少要当成被防盗链挡了说',
+        /waSetReferer\(WA_API_RULE/.test(run) && /防盗链/.test(run));
+    ok('图片落盘不许走 downloadBinary：它内部 sanitizeFilename 会把 / 换成 _，子目录会被压扁',
+        !/downloadBinary\(/.test(run) && /key\.split\(/.test(run));
+    ok('Referer 规则整段任务共用一条，不许每页加删（白烧 DNR 配额，还会抖出没带 Referer 的页）',
+        (run.match(/waSetReferer\(/g) || []).length === 2 && !/addRefererRule\(/.test(run));
+    ok('新动作全部进了 EXT_SCHEMA 清单，否则外部控制方（UBB）自发现不到',
+        ['weiboArchiveStart', 'weiboArchiveState', 'weiboArchiveDump', 'weiboArchiveCancel', 'weiboArchiveMedia', 'weiboArchiveMediaState']
+            .every((n) => bg.indexOf(n + ': {') > 0 && bg.indexOf(n + ': {') < a));
+    ok('限流/风控要停下并说清原因，不许闷头把微博敲穿',
+        /限流或风控/.test(run) || /限流或风控/.test(bg));
 }
 
 __summary();process.exit(fail ? 1 : 0);

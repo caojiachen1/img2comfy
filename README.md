@@ -315,7 +315,7 @@ MV3 扩展页的 `script-src 'self'` 挡掉了跨源脚本与 `blob:` 模块，�
 
 ```bash
 node scripts/check-imports.mjs        # 语法 + 相对路径 + 具名导入是否存在（50+ 文件）
-node test/unit_pure.mjs              # 362 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言）
+node test/unit_pure.mjs              # 405 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言/微博整档抓取与后台接线）
 node test/run_browser.mjs            # 页面级：内容脚本包 + 工具栏 + 拖拽 + 算子链 + 视频取帧
 node test/run_browser.mjs --ai       # 再加：vendor + slimSAM/swin2SR/YuNet 真实推理 + 设置页
 node test/run_browser.mjs --ai --only=sr|sam|face|llm|script|options   # 单跑某一阶段
@@ -428,6 +428,29 @@ SSIM/PSNR/MSE、帧间差、内容区测量。
 所以这些操作记着「用户意图」并在这些事件上重新按一次，同时把**最终值读回来**提示（不生效就说不生效，不谎报）。
 默认配置里播放控制（播放/暂停、倍速、循环）常驻，逐帧、时间码、抽帧、静音、小窗折叠进 ▾ 菜单。
 
+**微博整档（接口路线，`weiboArchive*`）**：把一个人主页的历史微博**全部**抓下来，不碰 DOM。
+1. `weiboArchiveStart {uid}` → 走 `/ajax/statuses/mymblog`，`features` 默认并集 `0/1/2/14`（实测只有 0 会自报
+   `data.total`，其余各回 20 条），每页带回上一页的 `since_id` 游标。**整档要 30~60 秒，比调用方那层 RPC 超时
+   （CLI 60s、`ext.call` 内层默认 45s）更长，所以 Start 立刻返回，进度用 `weiboArchiveState` 轮询**——
+   同步等必然被掐死，而且扩展这边其实跑完了、只是响应丢了。
+2. 断点：游标与帖子**同进同退**一起写 `chrome.storage.local`（只把游标写快一步，SW 被回收后续跑会静默跳过
+   没落盘的那几页），默认每 10 页一次；`resume` 默认开，接着上次跑。MV3 的 SW 空闲 30s 回收，任务期间靠
+   `getPlatformInfo` 心跳续命。
+3. `weiboArchiveDump` 默认按 `offset/limit` 分页返回（单次 ≤500 条）；`to:"download"` 直接把整份 JSON 落盘、
+   只回文件大小——1~2MB 的档案不该塞进一次 RPC 消息。
+4. `weiboArchiveMedia {tier,limit}` 把档案里的图按 pid 落盘到 `下载目录/mtb-weibo/<uid>/<拍摄日>/<pid>.jpg`，
+   按 pid 记断点、重复调用只补没下的；档位 `orig(large)/full(mw2000)/card(mw690)/thumb(orj360)`。
+   Referer 靠**整段任务共用一条 DNR 规则**（`Referer` 是 forbidden header，fetch 里写不动；逐页加删是白烧配额，
+   而且会抖出没带 Referer 的 403 页）。
+5. 记录里带两个分析用的派生字段：`event`（正文里 U+1D7CE 段「数学粗体数字」经 NFKD 归一化解出的**拍摄场次**
+   （如 `𝟚𝟘𝟚𝟜𝟘𝟞𝟘𝟠` → `2024-06-08`）——图博
+   正文不写穿搭只写日期码，这是聚合主键）与 `created_at`（微博那个 `new Date()` 不可靠的英文日期，自己拆）。
+
+   **真机 E2E 已跑通**（登录态真人 Edge）：1176 条 / 59 页 / 48 秒，`complete=true`、`stopped=reached-total`；
+   与一份**独立的 Python 抓取**逐条对表 —— id 集合相同、1176 条的 `pics` 数组全部相等、唯一图 4558 张零差异、
+   日期零不一致、场次码解出 1042 条一致；`Dump to:download` 落盘 670KB JSON，`Media tier=card limit=3` 落 3 张图
+   且**子目录 `mtb-weibo/<uid>/<日期>/` 完整保留**。
+
 **自定义功能**：
 1. **脚本型**（`ctx` API 的 JS）——内置示例①发送到 ComfyUI、示例②发送并立即执行、示例③AI 读字并复制、
    示例④算子链组合。API 见设置页「自定义功能 → ctx API 参考」，或 `src/common/builtin-scripts.js`。
@@ -465,9 +488,10 @@ src/options/*                 设置页（外观/按钮/输出/AI/自定义/站�
 gallery.html                  本页图片面板：账户分组、多选、批量发送到 ComfyUI（?wide=1 = 大窗模式）
 src/gallery/*                 采集注入函数 collect.mjs + 批量窗口逻辑/样式
 src/common/gallery.js         微博图 URL 升级/去重键/域名判定等纯函数
+src/gallery/weibo-archive.mjs 微博整档：接口游标翻页、按 id 去重、断点序列化、图片落盘计划（零 chrome 依赖，可在 Node 里跑断言）
 vendor/                       transformers.js + onnxruntime-web + QuickJS wasm（setup-vendor.mjs 生成，已 gitignore）
 scripts/                      build-content / setup-vendor / check-imports
-test/                         unit_pure（362 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
+test/                         unit_pure（405 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
                               gallery_probe（有头，本页图片/批量发送）、cdp.mjs、旧的 run_headless + harness + cors_server
 ```
 
@@ -482,7 +506,16 @@ test/                         unit_pure（362 条）、run_browser + harness_pag
 
 ## 五、已知边界（如实记录）
 
-- 端到端验证覆盖到：362 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+- **`test/run_browser.mjs` 有一条已知的红**：「background-image 容器命中（bg 态只留可取链按钮）」。
+  实测 CSS 背景图命中时弹的是**完整工具栏**（含 `Lanczos 放大`/`反色`/`Canny`/`人脸识别` 等 16 个按钮），
+  而断言要求这些不该出现。根因不是断言写错：`registry.js` 里确实有 `showImage: false` 这个字段
+  （measure/palette/stats/hash 与全部脚本、链接工具都标了），但 `buildToolbar` 产出它之后
+  **`src/content/` 里没有任何一处消费** —— 也就是说「按命中形态裁剪按钮」这条规则只做了一半就断了。
+  bg 命中拿到的是真实图片 URL，重工具其实可用，所以「该藏还是该放行」是**产品决定**，
+  留给作者定：要么补上消费 `showImage` 的过滤，要么把断言改成「只要求可取链类按钮都在」。
+  这里只如实记红，不擅自改测试让它变绿。
+
+- 端到端验证覆盖到：405 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
   slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）。
   **看图说话/提问/OCR 不再在这条链上**：它们改调外部 LLM API，验证换成「请求形状 + 应答取字 + 报错文案」
   （`node test/run_browser.mjs --only=llm` 拿桩后台跑 `AiEngine`，验的是没装运行时也能出文）。
@@ -508,7 +541,20 @@ test/                         unit_pure（362 条）、run_browser + harness_pag
   面板**绝不替用户滚动页面**（这条是产品硬约束），要更全就自己往下滚一段再点「刷新」。
   它也依赖桌面版那份 Vue 3 数据（`#app._vnode.component.data.list`，实验性筛选同源）：改版或换成移动版就
   读不到，这时退回「只列页面上真有的图」，摘要写「信息流数据没读到」，悬停给原因，不报错也不崩。
+- **「帮我翻页」最多翻到 ~300 条就到底**（实测：组件路由翻到第 3 轮退成 fetch、`added=0`，日期只到最近约三年，
+  更早的 75% 内容翻不出来）——这不是实现缺陷，是微博自己对个人主页信息流的截断。要全量请用 **`weiboArchiveStart`**
+  （接口路线实测 60 页 / 1176 条，且 `data.total` 自报总数可当场校验）。两条路还互为验证：整档实测与页面采集
+  对同一批 300 条帖的**图片集合逐条完全一致**。
 - **「帮我翻页」是替你多问微博几次**：请求数由你选的页数决定（1~10，产品侧卡死），只 GET 读流、不发任何写操作；
   但翻得太急理论上会碰它的限流/风控，所以默认 3 页、不自动翻、点一次翻一次。真页面实测过两条路都成立
   （组件 `loadMoreData` 一次 13→40 条且视口不动；克隆读流请求一条回 25 条 / 60 张图、与页面已有零重复），
   微博改版后两条都可能失效 —— 失效时按钮会明确说「没加载到更多：原因」，不会闷声什么都不发生。
+- **整档路线的边界（如实说）**：① 依赖浏览器里这份登录态，掉登录时接口会把 JSON 换成 passport 页，
+  代码认这个形状并直说「应答不是 JSON —— 多半是登录态掉了」，不假装抓完；② 403/418/429 一律**立即停止**并提示
+  把 `delayMs` 调大再续跑，绝不重敲（风控是打在用户真实账号上的，不是打在沙箱里）；③ **`features` 默认并 4 个桶是有代价的**：
+  真机实测一个 1176 条的号，`feature=0` 59 页拿满 1176 条，`feature=2` 又翻 41 页、`14` 翻 10 页、`1` 第一页就空，
+  **三个桶新增 0 条**（全是 0 的子集），却多花约 80 次请求。所以只想要全量可以把 `features` 传 `[0]`；
+  留四个桶是因为「0 是否永远是超集」只在少数号验证过（这个号 0 转发 0 视频，视频/文章桶本来就是空的）；
+  ④ 抓下来的正文与图仍在用户磁盘上，`test/unit_pure.mjs` 用的是
+  合成夹具，仓库里不落任何真实抓取内容；⑤ **断点只有一个槽位**（`chrome.storage.local` 的 `mtbWeiboArchive`），
+  换 uid 重新 Start 会覆盖上一位的档案与图片进度 —— 同时只整档一个账号，要并行请先 `weiboArchiveDump` 落盘。

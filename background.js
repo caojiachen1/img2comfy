@@ -8,11 +8,16 @@ import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './src/gallery/collect.mjs';
 import { upgradeWeiboImageUrl, imageDedupeKey, weiboImageTierUrl, weiboStatusToPost, mergeFeedPosts, isWeiboHost, clampLoadPages } from './src/common/gallery.js';
+import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan } from './src/gallery/weibo-archive.mjs';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
 let hostMode = null; // 'offscreen' | 'tab'
 let galleryBatch = null;
+// 微博整档（接口路线）的两个长任务：抓档案、抓图片。都按「起任务 → 轮询」形状做，
+// 理由见下面 runWaJob 上方的注释。
+let waJob = null;
+let waMedia = null;
 // 按标签页存「已经采到过哪些图」：面板是 action popup，用户一点网页它就关了，
 // 下次打开是新文档、内存里的累加全丢 —— 于是「每开一次都少一大堆」。
 const galleryCache = new Map();
@@ -71,6 +76,31 @@ const EXT_SCHEMA = {
             params: { tabId: 'number 必填', pages: '1~10，默认 1' },
             returns: '{ ok, route(component|fetch), pages, added, addedPosts, detail }',
         },
+        weiboArchiveStart: {
+            desc: '「整档」：走 /ajax/statuses/mymblog 接口把一个人主页的历史微博全部抓下来（不碰 DOM）。'
+                + '实测页面翻页最多 ~300 条就到底，接口路线能翻到全量且响应 data.total 自报总数可当场校验。'
+                + '整档要 30~60s，比调用方那层 RPC 超时更长，所以本动作立刻返回、用 weiboArchiveState 轮询',
+            params: {
+                uid: '数字必填（weibo.com/u/<uid>）', features: '[0,1,2,14] 默认，接口分桶取并集（只有 0 报 total）',
+                maxPages: '每个桶最多翻多少页，默认 400（防敲穿限流）', delayMs: '页间隔，默认 600',
+                checkpointEvery: '每多少页落一次断点，默认 10', resume: 'bool 默认 true：从 storage 断点续跑',
+            },
+            returns: '{ ok, started, resumed, state{pages,posts,declaredTotal,complete,withPics,picTotal,stopped,…}, note }',
+        },
+        weiboArchiveState: { desc: '轮询整档进度；内存里没任务时回上次落盘的断点（SW 被回收也看得到）' },
+        weiboArchiveDump: {
+            desc: '取档案。默认按 offset/limit 分页返回（单次上限 500 条）；to:"download" 直接把整份 JSON 落盘只回文件大小',
+            params: { offset: 'int', limit: 'int ≤500', to: '"download" 走 chrome.downloads' },
+            returns: '{ ok, total, offset, taken, items[] } 或 { ok, bytes, posts, filename }',
+        },
+        weiboArchiveMedia: {
+            desc: '把档案里的图按 pid 批量落盘到 下载目录/mtb-weibo/<uid>/<拍摄日>/<pid>.jpg。'
+                + '按 pid 记断点，重复调用只补没下的；orig 档单张可达 4MB，先带 limit 试一批',
+            params: { tier: 'orig(large 原图)|full(mw2000)|card(mw690)|thumb(orj360)，默认 orig', limit: 'int，0=全部', subdir: '下载目录下的子目录名', concurrency: '1~4，默认 3' },
+            returns: '{ ok, started, total, alreadyDone, tier, note }',
+        },
+        weiboArchiveMediaState: { desc: '轮询图片落盘进度（ok/fail/bytes/currentKey/errors）' },
+        weiboArchiveCancel: { desc: '停整档与图片两个任务（在页与页、图与图之间生效）' },
         scrollToPost: {
             desc: '跳到某条微博：被虚拟列表回收的会自动往下翻屏挂出来并高亮，不新开标签',
             params: { tabId: 'number 必填', ids: '[mid]', key: '组 key（#ps<id> 后缀自动提取）', url: '微博地址（mid 段自动提取）', loadMissing: 'bool 默认 true' },
@@ -620,6 +650,99 @@ const HANDLERS = {
 
     // 外部桥入口：跳到某条微博（含被虚拟列表回收的：自动往下翻屏挂出来高亮）。
     // ids 或 url/key 至少给一个；key/url 里的 mid 段会自动提取（与面板 groupIdsOf 一致）。
+    // ── 微博整档：抓档案 / 抓图片，都是长任务，只起不对等 ──────────────────
+    weiboArchiveStart: async (req) => {
+        const uid = String(req.uid || '').trim();
+        if (!/^\d{5,}$/.test(uid)) throw new Error('uid 必须是数字（个人主页 weibo.com/u/<uid> 里那个）');
+        if (waJob && waJob.running) {
+            return { ok: true, started: false, note: '整档已经在跑，这是当前进度', state: publicArchive(waJob.st) };
+        }
+        let st;
+        let resumed = false;
+        if (req.resume !== false) {
+            const rec = (await chrome.storage.local.get(ARCHIVE_STORE_KEY))[ARCHIVE_STORE_KEY];
+            if (rec && String(rec.uid) === uid && Array.isArray(rec.posts) && rec.posts.length) {
+                st = restoreArchive(rec);
+                st.features = (req.features ? req.features.map(Number) : st.features);
+                st.maxPages = Number(req.maxPages) || st.maxPages;
+                st.delayMs = Number(req.delayMs) || st.delayMs;
+                st.done = false; st.error = ''; st.stopped = '';
+                resumed = true;
+            }
+        }
+        if (!st) st = newArchiveState(uid, req);
+        waJob = {
+            st, running: true, cancel: false, pub: publicArchive(st),
+            checkpointEvery: Math.max(1, Number(req.checkpointEvery) || 10),
+            mediaDone: new Set(Array.isArray(st.mediaDone) ? st.mediaDone : []),
+        };
+        runWaJob();
+        return {
+            ok: true, started: true, resumed, state: publicArchive(st),
+            note: resumed ? `从断点续跑（已存 ${st.posts.length} 条）` : '任务已起，用 weiboArchiveState 轮询进度',
+        };
+    },
+
+    weiboArchiveState: async () => {
+        if (waJob) {
+            const pub = publicArchive(waJob.st);
+            pub.running = !!waJob.running;
+            return { ok: true, state: pub, media: publicWaMedia() };
+        }
+        const stored = await waStoredState();
+        return stored ? { ok: true, state: stored, media: publicWaMedia(), note: '内存里没有任务，这是上次落盘的断点' }
+            : { ok: true, state: null, media: null, note: '还没有整档记录' };
+    },
+
+    // 档案动辄 1~2MB，塞进一次 RPC 消息会把调用方撑爆（扩展消息通道也不是为大数据设计的），
+    // 所以 to:'download' 直接落盘，只回文件大小；要内容就按 offset/limit 分页取。
+    weiboArchiveDump: async (req) => {
+        const job = await waEnsureArchive();
+        const posts = job.st.posts;
+        if (req.to === 'download') {
+            const json = JSON.stringify({
+                uid: job.st.uid, generated: new Date().toISOString(),
+                total: posts.length, declaredTotal: job.st.declaredTotal || 0,
+                perFeature: job.st.perFeature, posts,
+            });
+            const b64 = bytesToBase64(new TextEncoder().encode(json));
+            const id = await chrome.downloads.download({
+                url: `data:application/json;base64,${b64}`, filename: `mtb-weibo/${job.st.uid}_archive.json`,
+                saveAs: false, conflictAction: 'overwrite',
+            });
+            const st = await downloadSettled(id);
+            return { ok: true, bytes: json.length, posts: posts.length, filename: (st && st.filename) || `${job.st.uid}_archive.json` };
+        }
+        const off = Math.max(0, Number(req.offset) || 0);
+        const lim = Math.max(1, Math.min(Number(req.limit) || 200, 500));
+        return { ok: true, total: posts.length, offset: off, taken: Math.min(lim, posts.length - off), items: posts.slice(off, off + lim), state: publicArchive(job.st) };
+    },
+
+    weiboArchiveCancel: async () => {
+        if (waJob && waJob.running) waJob.cancel = true;
+        if (waMedia && waMedia.running) waMedia.cancel = true;
+        return { ok: true, state: waJob ? publicArchive(waJob.st) : null, media: publicWaMedia() };
+    },
+
+    weiboArchiveMedia: async (req) => {
+        await waEnsureArchive();          // 断点里取回的档案同样能继续下（SW 重启不必重抓整档）
+        if (waMedia && waMedia.running) return { ok: true, started: false, note: '图片任务已在跑', media: publicWaMedia() };
+        const done = waJob.mediaDone || new Set();
+        const plan = mediaPlan(waJob.st, { tier: req.tier, subdir: req.subdir, limit: Number(req.limit) || 0, skip: done });
+        waMedia = {
+            running: true, cancel: false, canceled: false, plan, done, index: 0, ok: 0, fail: 0,
+            bytes: 0, skipped: done.size, tier: plan.length ? plan[0].tier : String(req.tier || 'orig'),
+            errors: [], sample: [], currentKey: '', concurrency: Number(req.concurrency) || 3, startedAt: Date.now(), finishedAt: 0,
+        };
+        runWaMedia();
+        return {
+            ok: true, started: true, total: plan.length, alreadyDone: done.size, tier: waMedia.tier,
+            note: 'orig 档单张可达 4MB，整档几千张建议先带 limit 试一批；断点按 pid 记，重复调用只补没下的',
+        };
+    },
+
+    weiboArchiveMediaState: async () => ({ ok: true, media: publicWaMedia() }),
+
     scrollToPost: async (req) => {
         const tabId = Number(req.tabId) || 0;
         if (!tabId) throw new Error('tabId required');
@@ -935,6 +1058,198 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
 });
 
 // 「本页图片」批量发送：跑在后台，弹窗/页面关掉也不会中断队列。
+// ── 微博整档（接口路线，不碰 DOM）───────────────────────────────────
+// 为什么要单独一条链：页面侧「帮我翻页」实测最多翻到 ~300 条就被微博截断（2023 年以前的内容
+// 根本翻不出来），而 /ajax/statuses/mymblog 实测 60 页 / 1176 条全量，响应里的 data.total 还会
+// 自报总数，能当场校验有没有漏。
+// 为什么是「起任务 + 轮询」而不是一个同步动作：整档要 30~60 秒，比调用方那层的 RPC 硬顶
+// （ubb CLI 60s、ext.call 内层默认 45s）更长 —— 同步返回必然被掐死，而且扩展这边其实跑完了，
+// 只是响应丢了。所以 Start 立刻返回，进度靠 State 轮询。
+const WA_API_RULE = 4242;
+const WA_IMG_RULE = 4243;
+const WA_PAGE_URL = 'https://weibo.com/';
+
+/* Referer 是浏览器的 forbidden header，fetch 里写不动，只能靠 DNR 改写。
+   整档要发几十次请求，逐条加删规则是白烧 DNR 配额（而且每次 updateDynamicRules 都是异步的，
+   加删顺序一乱就会出现某几页没带上 Referer 而 403），所以整段任务共用一条规则。 */
+async function waSetReferer(id, urlFilter) {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [id],
+        addRules: [{
+            id, priority: 1,
+            action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Referer', operation: 'set', value: WA_PAGE_URL }] },
+            condition: { urlFilter, resourceTypes: ['xmlhttprequest', 'image', 'other'] },
+        }],
+    });
+}
+
+async function waClearReferer(id) {
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [id] }).catch(() => {});
+}
+
+async function waFetchPage(q) {
+    const url = `${MYMBLOG_API}?uid=${encodeURIComponent(q.uid)}&page=${q.page}&feature=${q.feature}`
+        + (q.sinceId ? `&since_id=${encodeURIComponent(q.sinceId)}` : '');
+    const res = await fetch(url, {
+        credentials: 'include', redirect: 'follow',
+        headers: { 'x-requested-with': 'XMLHttpRequest', accept: 'application/json' },
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        throw new Error(`HTTP ${res.status}` + (res.status === 403 || res.status === 418 || res.status === 429
+            ? '（微博限流或风控，整档已停止；把 delayMs 调大再续跑）' : ''));
+    }
+    try { return JSON.parse(text); }
+    catch (e) { throw new Error('应答不是 JSON —— 多半是登录态掉了被重定向到 passport 页'); }
+}
+
+// 游标和帖子必须同进同退：只把游标写快一步，SW 被回收后续跑就会跳过没落盘的那几页（静默少一批）。
+// 所以 checkpoint 只在整档状态一起落盘时发生，代价是最多重跑 checkpointEvery 页。
+async function waCheckpoint() {
+    if (!waJob) return;
+    const rec = serializeArchive(waJob.st);
+    rec.mediaDone = Array.from(waJob.mediaDone || []);
+    rec.savedAt = Date.now();
+    await chrome.storage.local.set({ [ARCHIVE_STORE_KEY]: rec });
+}
+
+function broadcastWa(payload) {
+    try { chrome.runtime.sendMessage({ action: 'weiboArchiveEvent', ...payload }).catch(() => {}); }
+    catch (e) { /* 面板没开，没有接收方 */ }
+}
+
+async function runWaJob() {
+    const j = waJob;
+    if (!j) return;
+    // MV3 的 SW 空闲 30s 回收；整档动辄一分钟，必须持续有一次扩展 API 调用给它续命
+    const keep = setInterval(() => { try { chrome.runtime.getPlatformInfo().catch(() => {}); } catch (e) { /* ignore */ } }, 20000);
+    try {
+        await waSetReferer(WA_API_RULE, 'weibo.com/ajax/statuses/mymblog');
+        await crawlArchive({
+            fetchPage: waFetchPage,
+            checkpoint: waCheckpoint,
+            checkpointEvery: j.checkpointEvery,
+            shouldStop: () => j.cancel,
+            onProgress: (pub) => { j.pub = pub; broadcastWa(pub); },
+        }, j.st);
+    } catch (e) {
+        j.st.error = String((e && e.message) || e);
+        j.st.running = false;
+    } finally {
+        clearInterval(keep);
+        await waClearReferer(WA_API_RULE);
+        j.running = false;
+        await waCheckpoint().catch(() => {});
+        broadcastWa(publicArchive(j.st));
+    }
+}
+
+/* 图片落盘不走 downloadBinary：它内部 sanitizeFilename 会把 '/' 换成 '_'，
+   子目录 mtb-weibo/<uid>/<日期>/ 会被压成一个扁平文件名。这里按段清洗、自己拼相对路径。
+   也不走 fetchWithReferer：它每张图都 addRefererRule + removeRuleIds 一次，几千张就是近万次
+   规则引擎往返（downloadUrl 单张用没问题，批量不行），换成上面那条任务级共用规则 + 直取。
+   Referer 是 forbidden header，fetch 里写不动，只能由 WA_IMG_RULE 改写。 */
+async function waDownload(item) {
+    const res = await fetch(item.url, { credentials: 'include', redirect: 'follow' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length < 1000) throw new Error('字节太少（' + bytes.length + '），多半是被防盗链挡了');
+    const mime = (res.headers.get('content-type') || '').split(';')[0] || sniffMime(bytes);
+    const name = item.key.split('/').map((seg) => sanitizeFilename(seg, 80)).join('/');
+    const b64 = bytesToBase64(bytes);
+    const id = await chrome.downloads.download({
+        url: `data:${mime || 'image/jpeg'};base64,${b64}`, filename: name,
+        saveAs: false, conflictAction: 'overwrite',
+    });
+    const st = await downloadSettled(id);
+    if (st && st.state === 'interrupted') throw new Error('下载被中断: ' + (st.error || 'unknown'));
+    return { filename: (st && st.filename) || name, bytes: bytes.length };
+}
+
+async function runWaMedia() {
+    const j = waMedia;
+    if (!j) return;
+    const keep = setInterval(() => { try { chrome.runtime.getPlatformInfo().catch(() => {}); } catch (e) { /* ignore */ } }, 20000);
+    const pool = Math.max(1, Math.min(4, Number(j.concurrency) || 3));
+    try {
+        await waSetReferer(WA_IMG_RULE, 'sinaimg.cn');
+        let i = 0;
+        const worker = async () => {
+            while (i < j.plan.length) {
+                if (j.cancel) { j.canceled = true; return; }
+                const item = j.plan[i++];
+                j.index = i;
+                j.currentKey = item.key;
+                try {
+                    const r = await waDownload(item);
+                    j.ok++;
+                    j.bytes += r.bytes;
+                    j.done.add(item.pid);
+                    if (!j.sample.length) j.sample.push(r.filename);
+                } catch (e) {
+                    j.fail++;
+                    if (j.errors.length < 20) j.errors.push(`${item.pid}: ${String((e && e.message) || e)}`);
+                }
+                if (j.ok % 25 === 0) { await waMediaCheckpoint(); broadcastWa({ type: 'media', ...publicWaMedia() }); }
+            }
+        };
+        await Promise.all(Array.from({ length: pool }, worker));
+    } finally {
+        clearInterval(keep);
+        await waClearReferer(WA_IMG_RULE);
+        j.running = false;
+        j.currentKey = '';
+        j.finishedAt = Date.now();
+        await waMediaCheckpoint().catch(() => {});
+        broadcastWa({ type: 'media', ...publicWaMedia() });
+    }
+}
+
+async function waMediaCheckpoint() {
+    if (!waJob) return;
+    waJob.st.mediaDone = Array.from(waJob.mediaDone || []);
+    await waCheckpoint();
+}
+
+// Dump 与 Media 都要能在「SW 已被回收、只剩断点」时继续工作：先把断点装回 waJob（不重新抓）
+async function waEnsureArchive() {
+    if (waJob && waJob.st && waJob.st.posts.length) return waJob;
+    const r = await waRestored();
+    if (!r) throw new Error('还没有整档结果：先 weiboArchiveStart 抓完档案');
+    waJob = {
+        st: r.st, running: false, cancel: false, pub: publicArchive(r.st),
+        checkpointEvery: 10, mediaDone: new Set(r.st.mediaDone || []),
+    };
+    return waJob;
+}
+
+function publicWaMedia() {
+    if (!waMedia) return null;
+    const j = waMedia;
+    return {
+        running: !!j.running, canceled: !!j.canceled, tier: j.tier, total: j.plan.length,
+        index: j.index, ok: j.ok, fail: j.fail, bytes: j.bytes, skipped: j.skipped,
+        currentKey: j.currentKey, errors: j.errors.slice(0, 20), sample: j.sample,
+        startedAt: j.startedAt, finishedAt: j.finishedAt,
+    };
+}
+
+/* 从断点里取回可用的档案状态。SW 被回收后 waJob 就没了，但档案与图片进度还在 storage 里 ——
+   Dump 与 Media 必须还能继续用，否则「按 pid 断点续传」等于白做（重启一次就得重抓整档）。 */
+async function waRestored() {
+    const rec = (await chrome.storage.local.get(ARCHIVE_STORE_KEY))[ARCHIVE_STORE_KEY];
+    if (!rec || !Array.isArray(rec.posts) || !rec.posts.length) return null;
+    const st = restoreArchive(rec);
+    st.mediaDone = Array.isArray(rec.mediaDone) ? rec.mediaDone : [];
+    return { st, savedAt: rec.savedAt || 0 };
+}
+
+async function waStoredState() {
+    const r = await waRestored();
+    if (!r) return null;
+    return { ...publicArchive(r.st), storedAt: r.savedAt, mediaDone: r.st.mediaDone.length, resumed: true };
+}
+
 function publicGalleryBatch() {
     if (!galleryBatch) return null;
     const b = galleryBatch;
