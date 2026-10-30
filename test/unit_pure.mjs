@@ -1531,8 +1531,8 @@ console.log('== 面板「API 模式 · 无限下拉」接线（源码钉子）==
     }
     ok('面板把 failed 也当成「到底」，并把原因写进摘要（error 分支必须存在）',
         /done: !!res\.done \|\| !!res\.failed/.test(gm) && /error: res\.failed/.test(gm));
-    ok('API 模式不依赖「全部微博」也要把帖子并进来（这两个开关是两条不同数据来源，卡成一个就会勾了看不见）',
-        /if \(!S\.weiboFlag \|\| \(!S\.feedAll && !S\.apiMode\)\) return null;/.test(gm));
+    ok('API 模式不依赖「全部微博」也要把帖子并进来（微博分支里闸门必须是 (!feedAll && !apiMode)，卡成一个就会勾了看不见）',
+        /if \(!S\.feedAll && !S\.apiMode\) return null;/.test(gm));
     ok('回来的帖子按 mid 去重后塞进 S.extraPosts，并留上限（和「帮我翻页」同一条路，重扫才认得）',
         /S\.extraPosts\.push\(p\)/.test(gm) && /S\.extraPosts = S\.extraPosts\.slice\(-3000\)/.test(gm));
     ok('摘要必须写明 API 模式拉到几条/共几条、到底没有、或为什么停了',
@@ -1618,6 +1618,14 @@ console.log('== 小红书展开的后台与面板接线（源码钉子）==');
         && /小红书展开完成/.test(gm));
     ok('勾选走同一套持久化（settings.gallery.xhsFull + patchSettings），且取消勾选要停掉轮询定时器',
         /patch: \{ gallery: \{ xhsFull: S\.xhsFull \} \}/.test(gm) && /clearInterval\(S\.xhsTimer\)/.test(gm));
+    // ↓ 端到端实测抓出来的两个「合并被卡」：后台按 weiboFlag 卡 extra，面板按 weiboFlag 直接 return null
+    ok('后台 collectImages：读微博主世界 feed 数组可以按站点卡，但**合并 extra 必须站点无关**（否则小红书展开完一条都不显示）',
+        /const feedPosts = \[\];/.test(bg) && /feedPosts\.concat\(extraPosts\)/.test(bg)
+        && !/if \(wantFeed\)/.test(bg));
+    ok('面板 readFeedPosts：非微博站点也要把 S.extraPosts 并进来（不许被 weiboFlag 一句 return null 卡死）',
+        /if \(!S\.weiboFlag\) \{[\s\S]{0,220}if \(!S\.extraPosts\.length\) return null;/.test(gm));
+    ok('面板轮询展开进度时要先把后台落的 extra 拉回 S.extraPosts 再重扫（不拉就一直是旧数据，看不到一条条长出来）',
+        /action: 'galleryCacheGet', tabId: S\.tabId/.test(gm.slice(gm.indexOf('async function pollXhs'))));
 }
 
 __summary();process.exit(fail ? 1 : 0);

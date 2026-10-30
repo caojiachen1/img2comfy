@@ -467,9 +467,17 @@ async function jumpToGroup(g) {
 // 光扫 DOM 拿不到，而列表里每条都带 pic_ids/pic_infos。读不到就算了，不影响正常扫描。
 async function readFeedPosts() {
     S.feedError = '';
+    // 非微博站点（小红书）没有「页面自己那份 feed 数组」可读，但「展开每条笔记」会把解析好的
+    // 帖子放进 S.extraPosts —— 这条必须照样并进来。以前整条链被 weiboFlag 卡住，
+    // 表现就是后台解析出 8 条 9 张、面板却一条都不多（端到端实测抓出来的）。
+    if (!S.weiboFlag) {
+        if (!S.extraPosts.length) return null;
+        S.feedTotal = 0;
+        return { posts: S.extraPosts.map((p, i) => ({ ...p, index: i })), total: 0 };
+    }
     // API 模式自己就会往 S.extraPosts 里塞帖子，所以「全部微博」没勾也要让它并进来，
     // 否则勾了 API 模式却一条都看不见 —— 这两个开关是两条不同的数据来源，不是一个的开关
-    if (!S.weiboFlag || (!S.feedAll && !S.apiMode)) return null;
+    if (!S.feedAll && !S.apiMode) return null;
     try {
         const res = await chrome.scripting.executeScript({
             target: { tabId: S.tabId, allFrames: false }, world: 'MAIN', func: weiboFeedPage, args: [{ max: 300 }],
@@ -620,7 +628,17 @@ async function pollXhs() {
         total: st.total, parsed: st.parsed, images: st.images, failed: st.failed,
         running: !!st.running, error: st.failed ? `${st.failed} 条没取到` : '',
     };
-    if (st.parsed !== before || !st.running) { await collect(true); await syncBatchState(); }
+    if (st.parsed !== before || !st.running) {
+        // 后台是「每解析出一条就落一次缓存」，所以这里要把 extra 拉回面板再重扫；
+        // 不拉的话 collect(true) 保留的是面板旧数据，用户看不到一条条长出来
+        try {
+            const c = await chrome.runtime.sendMessage({ action: 'galleryCacheGet', tabId: S.tabId });
+            const e = c && c.entry;
+            if (e && Array.isArray(e.extra)) S.extraPosts = e.extra.filter((p) => p && Array.isArray(p.pics) && p.pics.length);
+        } catch (err) { /* 缓存没答上就用手上这份 */ }
+        await collect(true);
+        await syncBatchState();
+    }
     if (!st.running) {
         clearInterval(S.xhsTimer);
         S.xhsTimer = 0;

@@ -572,22 +572,26 @@ const HANDLERS = {
         }
         const { meta, dropHist, view } = mergeCollectInto(acc, results);
 
-        // 3) 信息流数据补全：MAIN world 读微博自己的 feed 数组 + 「帮我翻页」攒下的 extra
+        // 3) 信息流数据补全。两件事分开：读「微博自己那份 feed 数组」是微博专属（要 MAIN world 摸 Vue），
+        //    而把 extra 并进分组是**站点无关**的 —— 微博「帮我翻页」与小红书「展开每条笔记」都往 extra 里放帖子，
+        //    以前这条被 weiboFlag 一起卡住，小红书展开完 8 条 9 张图后 collectImages 一条都不显示（实测）。
         let feedStats = null;
-        if (wantFeed) {
+        const feedPosts = [];
+        if (req.feed === true && weiboFlag) {
             const r = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: weiboFeedPage, args: [{ max: 300 }] }).catch(() => null);
             const res = r && r[0] && r[0].result;
-            const posts = [];
             if (res && res.ok && Array.isArray(res.posts)) {
                 const seenMid = new Set();
                 for (const [i, it] of res.posts.entries()) {
                     const p = weiboStatusToPost(it, Number(it.index) || i, host);
                     if (!p.pics.length) continue;
                     if (p.mid) { if (seenMid.has(p.mid)) continue; seenMid.add(p.mid); }
-                    posts.push(p);
+                    feedPosts.push(p);
                 }
             }
-            const allPosts = posts.concat(extraPosts);
+        }
+        {
+            const allPosts = feedPosts.concat(extraPosts);
             if (allPosts.length) feedStats = mergeFeedPosts(acc, allPosts, { pageUrl: tab.url });
         }
 
