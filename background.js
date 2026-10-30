@@ -9,6 +9,7 @@ import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFrom
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './src/gallery/collect.mjs';
 import { upgradeWeiboImageUrl, imageDedupeKey, weiboImageTierUrl, weiboStatusToPost, mergeFeedPosts, isWeiboHost, clampLoadPages } from './src/common/gallery.js';
 import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan, uniqPics, normFeatures, reconcileDone, takePages, WA_BUILD } from './src/gallery/weibo-archive.mjs';
+import { parseSsrState, listedNotes, undertakeCard, xhsNoteToPost, noteDetailUrl, profileUrl, profileUid } from './src/gallery/xhs-archive.mjs';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
@@ -18,6 +19,8 @@ let galleryBatch = null;
 // 理由见下面 runWaJob 上方的注释。
 let waJob = null;
 let waMedia = null;
+// 小红书「把每条笔记的全部图取回来」任务
+let xhsJob = null;
 // 按标签页存「已经采到过哪些图」：面板是 action popup，用户一点网页它就关了，
 // 下次打开是新文档、内存里的累加全丢 —— 于是「每开一次都少一大堆」。
 const galleryCache = new Map();
@@ -108,6 +111,14 @@ const EXT_SCHEMA = {
             returns: '{ ok, uid, fetched, added, posts[面板帖子形状], done, stopped, total, declaredTotal, cursor }',
         },
         weiboArchiveCancel: { desc: '停整档与图片两个任务（在页与页、图与图之间生效）' },
+        xhsExpand: {
+            desc: '小红书「把每条笔记的全部图片解析出来」：主页列表每条只有 1 张 cover，全部图在每条笔记内页的 SSR 里'
+                + '（详情接口带 x-s 签名、replay 不了，实测 406）。逐条取内页 → 攒成帖子 → 落进该标签页采集缓存的 extra，'
+                + '之后 collectImages {feed:true} 就会把它们并成一条笔记一组九宫格。30 条要 15~30 秒，所以起任务立刻返回',
+            params: { tabId: 'number 必填（必须停在个人主页 xiaohongshu.com/user/profile/<uid>）', limit: '最多展开几条笔记，默认全部（上限 200）', delayMs: '条间隔，默认 250' },
+            returns: '{ ok, started, uid, total, note } 或 { ok:false, error }',
+        },
+        xhsExpandState: { desc: '轮询小红书展开进度 { running, total, done, parsed, images, failed, errors, current }' },
         scrollToPost: {
             desc: '跳到某条微博：被虚拟列表回收的会自动往下翻屏挂出来并高亮，不新开标签',
             params: { tabId: 'number 必填', ids: '[mid]', key: '组 key（#ps<id> 后缀自动提取）', url: '微博地址（mid 段自动提取）', loadMissing: 'bool 默认 true' },
@@ -807,6 +818,33 @@ const HANDLERS = {
         };
     },
 
+    // ── 小红书：列表每条笔记只有封面，这里把每条笔记的全部图片解析出来 ──────────
+    xhsExpand: async (req) => {
+        const tabId = Number(req.tabId) || 0;
+        if (!tabId) throw new Error('tabId required');
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab) throw new Error('tab not found: ' + tabId);
+        const uid = profileUid(tab.url || '');
+        if (!uid) return { ok: false, error: '小红书要在个人主页上用（地址形如 xiaohongshu.com/user/profile/<uid>），这个页面认不出 uid' };
+        if (xhsJob && xhsJob.running) return { ok: true, started: false, note: '展开任务已在跑，这是当前进度', state: publicXhs() };
+        const prof = profileUrl(uid);
+        const notes = listedNotes(parseSsrState(await xhsFetchHtml(prof, prof)));
+        if (!notes.length) return { ok: false, error: '主页 SSR 里没解析出笔记列表（没登录、被风控、或小红书改了页面结构）' };
+        const lim = Math.max(1, Math.min(Number(req.limit) || notes.length, 200));
+        xhsJob = {
+            uid, tabId, notes: notes.slice(0, lim), index: 0, parsed: 0, images: 0,
+            failed: [], errors: [], current: '', running: true, cancel: false, canceled: false,
+            delayMs: Math.max(0, Number(req.delayMs) || 250), startedAt: Date.now(), finishedAt: 0,
+        };
+        runXhsJob();
+        return {
+            ok: true, started: true, uid, total: xhsJob.notes.length,
+            note: '逐条取内页 SSR（列表只有封面）；用 xhsExpandState 轮询，每解析出一条就落进该标签页采集缓存，面板刷新即可见',
+        };
+    },
+
+    xhsExpandState: async () => ({ ok: true, state: publicXhs() }),
+
     scrollToPost: async (req) => {
         const tabId = Number(req.tabId) || 0;
         if (!tabId) throw new Error('tabId required');
@@ -1342,6 +1380,84 @@ async function waStoredState() {
     const r = await waRestored();
     if (!r) return null;
     return { ...publicArchive(r.st), storedAt: r.savedAt, mediaDone: r.st.mediaDone.length, resumed: true };
+}
+
+/* 小红书：列表页每条笔记只带 1 张 cover，**全部图片在每条笔记内页的 SSR 里**；
+   而它的详情/翻页接口 edith.xiaohongshu.com 不带 x-s 签名直接 406（实测），签名是前端 JS 算的、replay 不了。
+   所以这条链只能是「取主页 SSR → 逐条取内页 SSR → 攒成帖子」。30 条要 15~30 秒，
+   和微博整档同理：必须「起任务 + 轮询」，同步返回一定被调用方那层超时掐死。 */
+const XHS_PAGE_RULE = 4244;
+
+async function xhsFetchHtml(url, pageUrl) {
+    const res = await fetch(url, { credentials: 'include', redirect: 'follow', headers: { accept: 'text/html,*/*' } });
+    const text = await res.text();
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    // 风控时会回一个很小的校验页，不是 403 —— 只按状态码判会把它当成功，然后一条都解析不出来
+    if (text.length < 3000) throw new Error('页面只有 ' + text.length + ' 字节，多半被风控拦成校验页（歇一会儿再试）');
+    return text;
+}
+
+function publicXhs() {
+    if (!xhsJob) return null;
+    const j = xhsJob;
+    return {
+        running: !!j.running, canceled: !!j.canceled, uid: j.uid, total: j.notes.length,
+        done: j.index, parsed: j.parsed, images: j.images, failed: j.failed.length,
+        errors: j.errors.slice(0, 10), current: j.current, startedAt: j.startedAt, finishedAt: j.finishedAt,
+    };
+}
+
+async function xhsPushToCache(tabId, posts) {
+    const e = galleryCache.get(tabId) || {};
+    const extra = Array.isArray(e.extra) ? e.extra : [];
+    const seen = new Set(extra.map((p) => p && p.mid).filter(Boolean));
+    let added = 0;
+    for (const p of posts) {
+        if (!p.pics.length || (p.mid && seen.has(p.mid))) continue;
+        if (p.mid) seen.add(p.mid);
+        extra.push(p);
+        added++;
+    }
+    galleryCache.set(tabId, { at: Date.now(), meta: e.meta || null, groups: Array.isArray(e.groups) ? e.groups : [], extra: extra.slice(-900) });
+    return added;
+}
+
+async function runXhsJob() {
+    const j = xhsJob;
+    if (!j) return;
+    const keep = setInterval(() => { try { chrome.runtime.getPlatformInfo().catch(() => {}); } catch (e) { /* ignore */ } }, 20000);
+    try {
+        await waSetReferer(XHS_PAGE_RULE, 'xiaohongshu.com');
+        for (const n of j.notes) {
+            if (j.cancel) { j.canceled = true; break; }
+            j.index++;
+            j.current = n.id;
+            try {
+                const html = await xhsFetchHtml(noteDetailUrl(n.id, n.token), profileUrl(j.uid));
+                const nc = undertakeCard(parseSsrState(html), n.id);
+                const imgs = (nc && nc.imageList) || [];
+                if (!imgs.length) { j.failed.push(n.id + ':没解析出图片'); continue; }
+                const post = xhsNoteToPost({ ...nc, noteId: n.id }, 'www.xiaohongshu.com');
+                j.parsed++;
+                j.images += imgs.length;
+                // 一条一落缓存：面板可以在任务跑完之前就刷新看到已解析的部分，
+                // 中途 SW 被回收也不至于白跑
+                await xhsPushToCache(j.tabId, [post]);
+            } catch (e) {
+                j.failed.push(n.id + ':' + String((e && e.message) || e).slice(0, 60));
+                if (e && /校验页|HTTP 4/.test(String(e.message || e))) { j.canceled = true; break; }
+            }
+            broadcastWa({ type: 'xhs', ...publicXhs() });
+            await new Promise((r) => setTimeout(r, j.delayMs));
+        }
+    } finally {
+        clearInterval(keep);
+        await waClearReferer(XHS_PAGE_RULE);
+        j.running = false;
+        j.current = '';
+        j.finishedAt = Date.now();
+        broadcastWa({ type: 'xhs', ...publicXhs() });
+    }
 }
 
 function publicGalleryBatch() {

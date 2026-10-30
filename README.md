@@ -315,7 +315,7 @@ MV3 扩展页的 `script-src 'self'` 挡掉了跨源脚本与 `blob:` 模块，�
 
 ```bash
 node scripts/check-imports.mjs        # 语法 + 相对路径 + 具名导入是否存在（50+ 文件）
-node test/unit_pure.mjs              # 432 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言/微博整档抓取与后台接线）
+node test/unit_pure.mjs              # 456 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言/微博整档抓取与后台接线）
 node test/run_browser.mjs            # 页面级：内容脚本包 + 工具栏 + 拖拽 + 算子链 + 视频取帧
 node test/run_browser.mjs --ai       # 再加：vendor + slimSAM/swin2SR/YuNet 真实推理 + 设置页
 node test/run_browser.mjs --ai --only=sr|sam|face|llm|script|options   # 单跑某一阶段
@@ -466,6 +466,22 @@ SSIM/PSNR/MSE、帧间差、内容区测量。
    日期零不一致、场次码解出 1042 条一致；`Dump to:download` 落盘 670KB JSON，`Media tier=card limit=3` 落 3 张图
    且**子目录 `mtb-weibo/<uid>/<日期>/` 完整保留**。
 
+**小红书笔记全图解析（`xhsExpand` + 面板「展开每条笔记的全部图」）**：小红书个人主页的列表**每条笔记只给一张封面**，
+勾上这颗之后扩展逐条去取笔记内页，把每条笔记的**全部图片**解析出来，显示成和微博一样的一条笔记一组九宫格。
+
+- 为什么不能像微博那样直接翻接口：详情/翻页接口 `edith.xiaohongshu.com/api/sns/web/v1/user_posted|feed`
+  **不带 `x-s` 签名直接 406 `{"code":-1}`**，而签名是它前端 JS 算的、replay 不了（实测）。
+  可行的是**笔记内页的 SSR**：带 cookie 取 `xiaohongshu.com/explore/<id>?xsec_token=…` 就是 200，
+  全部图挂在 `feed.undertakeNote.items[].noteCard.imageList`（含 `width/height` 与 `WB_PRV`/`WB_DFT` 两档，
+  **取 `WB_DFT` 无水印档**）。`note.noteDetailMap` 那份是 `new Map([])`，空的，别去那儿找。
+- `xsec_token` 是**每条笔记各自带**的反爬令牌，取内页必须原样带上并 URL 编码，不带就是校验页。
+- SSR 里那份状态**不是合法 JSON**（混着 `new Map(...)`、`new Set(...)`、值位置的 `undefined`，
+  还有字符串里带花括号的 URL），所以解析器是**括号配平静态扫 + 定向消毒**，不是 `JSON.parse` 一把梭；
+  贪婪正则会在第一个 `}` 截断（实测在 21566 字符处炸）。
+- 30 条要 15~30 秒，所以还是「起任务 + 轮询」；**每解析出一条就落进该标签页采集缓存的 `extra`**
+  （和「帮我翻页」fetch 路由同一个落点），面板轮询到数量变了就重扫，用户看得见九宫格一条条长出来。
+- 风控时会回 HTTP 200 但极小的校验页，所以按**字节数**认失败，不许当成功然后报"一条都没解析出来"。
+
 **自定义功能**：
 1. **脚本型**（`ctx` API 的 JS）——内置示例①发送到 ComfyUI、示例②发送并立即执行、示例③AI 读字并复制、
    示例④算子链组合。API 见设置页「自定义功能 → ctx API 参考」，或 `src/common/builtin-scripts.js`。
@@ -504,9 +520,10 @@ gallery.html                  本页图片面板：账户分组、多选、批�
 src/gallery/*                 采集注入函数 collect.mjs + 批量窗口逻辑/样式
 src/common/gallery.js         微博图 URL 升级/去重键/域名判定等纯函数
 src/gallery/weibo-archive.mjs 微博整档：接口游标翻页、按 id 去重、断点序列化、图片落盘计划（零 chrome 依赖，可在 Node 里跑断言）
+src/gallery/xhs-archive.mjs   小红书：SSR 状态括号配平解析 + JS 字面量消毒、内页全部图片→面板帖子（同样零 chrome 依赖）
 vendor/                       transformers.js + onnxruntime-web + QuickJS wasm（setup-vendor.mjs 生成，已 gitignore）
 scripts/                      build-content / setup-vendor / check-imports
-test/                         unit_pure（432 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
+test/                         unit_pure（456 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
                               gallery_probe（有头，本页图片/批量发送）、cdp.mjs、旧的 run_headless + harness + cors_server
 ```
 
@@ -539,7 +556,7 @@ test/                         unit_pure（432 条）、run_browser + harness_pag
   留给作者定：要么补上消费 `showImage` 的过滤，要么把断言改成「只要求可取链类按钮都在」。
   这里只如实记红，不擅自改测试让它变绿。
 
-- 端到端验证覆盖到：432 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+- 端到端验证覆盖到：456 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
   slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）。
   **看图说话/提问/OCR 不再在这条链上**：它们改调外部 LLM API，验证换成「请求形状 + 应答取字 + 报错文案」
   （`node test/run_browser.mjs --only=llm` 拿桩后台跑 `AiEngine`，验的是没装运行时也能出文）。
@@ -550,7 +567,15 @@ test/                         unit_pure（432 条）、run_browser + harness_pag
   **有头 CfT 可以打开扩展页**，所以设置页与宿主页已经进了 `extension_smoke.mjs --headed` 的断言；
   另外 `test/harness_options.html` 用「搬 DOM + 桩后台 + 逐个点按钮」在普通网页里覆盖了设置页逻辑。
   真人 Edge 里剩下的只是装载本身的体检（品牌浏览器忽略 `--load-extension`，没法自动化）。
+- **小红书这条链的边界（如实说）**：① 只能展开**列表里已经列出的那批笔记**（主页 SSR 一次给 30 条），
+  要更多得先让页面往下翻 —— 面板**不替用户滚动页面**这条硬约束在这里同样成立，所以按钮名是「展开每条笔记」而不是「取全部笔记」；
+  ② 解析出来的图片 URL 是 `sns-webpic-qc.xhscdn.com/<日期时段>/<hash>/...`，**带时效**，隔天可能 404，
+  要长期留档必须当场下载（`downloadUrl` / `fetchMedia`），别把地址存下来当档案；
+  ③ 逐条取内页 = 一次页面请求，30 条就是 30 次，比微博翻页重，所以默认 250ms 一条并且上限 200 条；
+  ④ 小红书改版把 `feed.undertakeNote` 挪走时，`parseSsrState` 会返回能解析但 `imageList` 为空，
+  面板会明说「N 条没取到」而不是静默出空列表。
 - 视频位于跨域 iframe 且画布受保护时，只能退回标签页截图（会带播放器 UI）。
+
 - **CSP**：MV3 的 `extension_pages` **不允许 `'unsafe-eval'`**（只允许 `'wasm-unsafe-eval'`，写 unsafe-eval 会被 Edge 直接拒绝加载扩展）。
   核对结论：`@huggingface/jinja`（聊天模板）与 transformers.js 浏览器构建里 `new Function(`、`eval(`
   命中数均为 **0**——jinja 是 AST 解释器，不生成 JS 代码，所以**没有 unsafe-eval 时浏览器内模型照常可用**。

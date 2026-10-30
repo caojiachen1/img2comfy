@@ -13,6 +13,7 @@ import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, weiboStatusUrl, clampLoadPages } from '../src/common/gallery.js';
 import { UI_THEMES, DEFAULT_UI_THEME, normalizeUiTheme, uiThemeLabel } from '../src/common/theme.js';
 import { parseWeiboDate, eventDateOf, normStatus, parseArchivePage, addPosts, newArchiveState, crawlArchive, serializeArchive, restoreArchive, publicArchive, uniqPics, mediaPlan, normFeatures, reconcileDone, takePages, ARCHIVE_STORE_KEY, DEFAULT_FEATURES, TIERS, WA_BUILD } from '../src/gallery/weibo-archive.mjs';
+import { parseSsrState, undertakeCard, xhsNoteToPost, listedNotes, noteDetailUrl, profileUrl, profileUid, isXhsHost, pickImageUrl } from '../src/gallery/xhs-archive.mjs';
 
 let pass = 0, fail = 0;
 const notes = [];
@@ -1542,6 +1543,81 @@ console.log('== 面板「API 模式 · 无限下拉」接线（源码钉子）==
         /weibo\.com\/u\/<uid>/.test(bg) && /function waProfileUid/.test(bg));
     ok('补来的帖子存进该标签页缓存的 extra，上限与「帮我翻页」一致（-900），两处不一致会让面板重开时数量跳变',
         (bg.match(/extra: extra\.slice\(-900\)/g) || []).length >= 2);
+}
+
+console.log('== 小红书笔记全部图片解析（xhs-archive）==');
+{
+    // 真页面里 __INITIAL_STATE__ 混着 JS 字面量：noteDetailMap 是 new Map([])（空的！），
+    // 值位置有 undefined，字符串里还有带花括号的 URL —— 贪婪正则会截断，全局换 undefined 会改坏字符串
+    const html = [
+        '<html><script>window.__INITIAL_STATE__=',
+        '{"feed":{"undertakeNote":{"items":[{"id":"n1","noteCard":{"noteId":"n1","displayTitle":"笔记一",'
+        + '"user":{"userId":"u1","nickname":"小红"},"xsecToken":"AB=",'
+        + '"cover":{"width":10,"infoList":[{"imageScene":"WB_PRV","url":"http://c/p"}]},'
+        + '"imageList":[{"width":1500,"height":2000,"infoList":[{"imageScene":"WB_PRV","url":"http://a/prv"},{"imageScene":"WB_DFT","url":"http://a/dft"}]},'
+        + '{"width":800,"height":600,"infoList":[{"imageScene":"WB_PRV","url":"http://b/prv"}]}]}}]}},'
+        + '"user":{"notes":[[{"id":"n1","xsecToken":"AB%3D","noteCard":{"displayTitle":"笔记一","cover":{"infoList":[{"imageScene":"WB_DFT","url":"http://c/d"}]},"interactInfo":{"likedCount":"111"}}},'
+        + '{"id":"n2","xsecToken":"CD","noteCard":{"displayTitle":"带 } 花括{号 的标题","cover":{}}}]]},'
+        + '"note":{"noteDetailMap":new Map([]),"foo":undefined,"bar":[undefined,1],"set":new Set(["x"])}',
+        '}</script></html>',
+    ].join('');
+    const st = parseSsrState(html);
+    ok('SSR 状态能解析：new Map([])/new Set([])/值位置 undefined 都消毒，且字符串里的花括号不骗过括号配平',
+        st && typeof st === 'object' && !st._err && st.note.noteDetailMap !== undefined);
+    ok('noteDetailMap 是 new Map([]) → 空的，数据必须从 feed.undertakeNote 拿（去 noteDetailMap 找会一条都不出）',
+        Object.keys(st.note.noteDetailMap).length === 0 && (st.feed.undertakeNote.items[0].noteCard.imageList || []).length === 2);
+    const nc = undertakeCard(st, 'n1');
+    ok('undertakeCard 按 id 认这条笔记；id 对不上但只有一条时退回它（返回空就等于用户看到「一条都没解析出来」）',
+        (nc.imageList || []).length === 2 && undertakeCard(st, 'zzz').imageList.length === 2 && !undertakeCard({}, 'x').imageList);
+    const post = xhsNoteToPost({ ...nc, noteId: 'n1' }, 'www.xiaohongshu.com');
+    ok('一条笔记 → 面板帖子：全部图片都进 pics（列表只给 1 张封面），带真实宽高',
+        post.pics.length === 2 && post.pics[0].width === 1500 && post.pics[1].height === 600);
+    ok('档位：WB_DFT（无水印）优先，即使它排在 WB_PRV 后面；只有 WB_PRV 时退回它',
+        post.pics[0].url === 'https://a/dft' && post.pics[1].url === 'https://b/prv');
+    ok('URL 一律升到 https（页面里给的是 http://，扩展页是 https 上下文，混载会被拦）',
+        post.pics.every((p) => p.url.startsWith('https://')));
+    ok('帖子形状与 weiboStatusToPost 对齐（id/mid/bid/uid/name/text/url/pics），才能共用 mergeFeedPosts 那条合并链',
+        ['index', 'id', 'mid', 'bid', 'uid', 'name', 'text', 'url', 'pics'].every((k) => k in post)
+        && post.url === 'https://www.xiaohongshu.com/explore/n1' && post.uid === 'u1' && post.name === '小红');
+    const notes = listedNotes(st);
+    ok('主页列表解析出笔记（含 xsecToken），且标题里带花括号也不影响条目数',
+        notes.length === 2 && notes[0].token === 'AB%3D' && notes[0].likes === '111' && notes[1].id === 'n2');
+    ok('内页地址必须带 xsec_token 且做 URL 编码（token 里有 = % 等字符，不编码就 404/校验页）',
+        noteDetailUrl('n1', 'AB=/x') === 'https://www.xiaohongshu.com/explore/n1?xsec_token=AB%3D%2Fx&xsec_source=pc_feed');
+    ok('uid 只认个人主页形状；其它小红书页面返回空，面板就不该亮出这颗勾选',
+        profileUid('https://www.xiaohongshu.com/user/profile/5d22b95c0000000012022f93') === '5d22b95c0000000012022f93'
+        && profileUid('https://www.xiaohongshu.com/explore') === '' && profileUid('') === '');
+    ok('域名判定认 xiaohongshu.com 与其子域，不许把 xhscdn.com（图片 CDN）当站点',
+        isXhsHost('www.xiaohongshu.com') && !isXhsHost('sns-webpic-qc.xhscdn.com') && !isXhsHost('weibo.com'));
+    ok('页面里没有 __INITIAL_STATE__ 时给 null（调用方据此报「读不到数据」，不返回空对象骗人）',
+        parseSsrState('<html><body>登录页</body></html>') === null && parseSsrState('') === null);
+}
+
+console.log('== 小红书展开的后台与面板接线（源码钉子）==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const bg = read('background.js');
+    const gm = read('src/gallery/gallery.mjs');
+    const html = read('gallery.html');
+    ok('xhsExpand / xhsExpandState 已注册且进了 EXT_SCHEMA',
+        /xhsExpand: async/.test(bg) && /xhsExpandState: async/.test(bg) && /xhsExpand: \{/.test(bg) && /xhsExpandState: \{/.test(bg));
+    ok('展开是「起任务立刻返回」：xhsExpand 里不许 await runXhsJob（30 条要 15~30 秒，同步等必被调用方超时掐死）',
+        !/await\s+runXhsJob/.test(bg.slice(bg.indexOf('xhsExpand: async'), bg.indexOf('xhsExpandState: async')))
+        && /runXhsJob\(\);/.test(bg));
+    ok('逐条取内页要限速（默认 250ms 一条），并且两条链都要 SW 心跳',
+        /Number\(req\.delayMs\) \|\| 250/.test(bg) && (bg.match(/getPlatformInfo/g) || []).length >= 3);
+    ok('风控校验页要认出来：HTTP 200 但页面极小时按失败处理，不许当成功然后一条都解析不出',
+        /校验页/.test(bg) && /text\.length < 3000/.test(bg));
+    ok('解析出的帖子落进该标签页采集缓存的 extra，上限与微博一致（-900），面板重开才不会数量跳变',
+        /xhsPushToCache/.test(bg) && (bg.match(/extra: extra\.slice\(-900\)/g) || []).length >= 2);
+    ok('面板那颗勾选只在小红书个人主页亮（isXhsHost && profileUid），别的站点不该出现',
+        /S\.xhsFlag = isXhsHost\(host\) && !!profileUid\(tab\.url \|\| \'\'\)/.test(gm)
+        && /\$\('#xhsFullWrap'\)\.hidden = !S\.xhsFlag/.test(gm) && /id="xhsFull"/.test(html));
+    ok('面板轮询到 parsed 变了就重扫（用户要能看着九宫格一条条长出来），停了做最后一次并播报结果',
+        /action: 'xhsExpandState'/.test(gm) && /st\.parsed !== before \|\| !st\.running/.test(gm)
+        && /小红书展开完成/.test(gm));
+    ok('勾选走同一套持久化（settings.gallery.xhsFull + patchSettings），且取消勾选要停掉轮询定时器',
+        /patch: \{ gallery: \{ xhsFull: S\.xhsFull \} \}/.test(gm) && /clearInterval\(S\.xhsTimer\)/.test(gm));
 }
 
 __summary();process.exit(fail ? 1 : 0);

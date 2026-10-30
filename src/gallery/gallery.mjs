@@ -3,6 +3,7 @@
 // 批量发送由后台执行，面板关掉也不会中断。
 
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './collect.mjs';
+import { isXhsHost, profileUid } from './xhs-archive.mjs';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, clampLoadPages } from '../common/gallery.js';
 import { baseNameFromUrl, sanitizeFilename } from '../common/util.js';
 import { normalizeWeiboFilter, describeWeiboFilter, keywordExprOf, exprSource } from '../common/weibo-filter.js';
@@ -51,6 +52,12 @@ const S = {
     apiMode: false,
     apiBusy: false,
     apiInfo: null,
+    // 小红书：列表只有封面，勾上后逐条取内页把全部图解析出来
+    xhsFull: false,
+    xhsBusy: false,
+    xhsInfo: null,
+    xhsTimer: 0,
+    xhsFlag: false,
     feedStats: null,
     feedError: '',
     feedTotal: 0,
@@ -130,6 +137,14 @@ function bindEvents() {
             void apiMore(2);
         }, { passive: true });
     }
+    $('#xhsFull').onchange = () => {
+        if (S.running) return;
+        S.xhsFull = $('#xhsFull').checked;
+        S.settings.gallery = { ...(S.settings.gallery || {}), xhsFull: S.xhsFull };
+        chrome.runtime.sendMessage({ action: 'patchSettings', patch: { gallery: { xhsFull: S.xhsFull } } }).catch(() => {});
+        if (S.xhsFull) void startXhs();
+        else { clearInterval(S.xhsTimer); S.xhsTimer = 0; S.xhsBusy = false; }
+    };
     $('#selAll').onchange = () => {
         if (S.running) return;
         const on = $('#selAll').checked;
@@ -225,6 +240,8 @@ async function loadSettings() {
     $('#feedAll').checked = S.feedAll;
     S.apiMode = (S.settings.gallery || {}).apiMode === true;
     $('#apiMode').checked = S.apiMode;
+    S.xhsFull = (S.settings.gallery || {}).xhsFull === true;
+    if ($('#xhsFull')) $('#xhsFull').checked = S.xhsFull;
     S.jumpMode = normJumpMode((S.settings.gallery || {}).jumpMode);
     S.jumpMissing = (S.settings.gallery || {}).jumpMissing === 'tab' ? 'tab' : 'scroll';
     $('#morePages').value = String(clampLoadPages((S.settings.gallery || {}).loadPages));
@@ -311,6 +328,9 @@ async function collect(keepSelection) {
         S.weiboFlag = isWeiboHost(host);
         $('#feedAllWrap').hidden = !S.weiboFlag;
         $('#apiModeWrap').hidden = !S.weiboFlag;
+        // 「展开每条笔记的全部图」只在小红书个人主页上有意义（uid 从地址取，别的页面没这个结构）
+        S.xhsFlag = isXhsHost(host) && !!profileUid(tab.url || '');
+        $('#xhsFullWrap').hidden = !S.xhsFlag;
         // 勾了 API 模式，「帮我翻页」和它的页数选择就是多余的：滚到底会自动要下一页
         $('#btnMore').hidden = !S.weiboFlag || S.apiMode;
         $('#morePagesWrap').hidden = !S.weiboFlag || S.apiMode;
@@ -568,6 +588,48 @@ async function apiMore(pages) {
     if (res.done) toast(res.stopped === 'reached-total' ? 'API 模式：已经拉到这个账号的最后一条' : 'API 模式：微博说没有更多了（' + (res.stopped || 'end') + '）');
 }
 
+/* 小红书「展开每条笔记的全部图」：起任务 + 轮询。每解析出一条后台就落一次缓存，
+   所以轮询到数量变了就重扫一次 —— 用户能看着九宫格一条条长出来，而不是等半分钟黑屏。 */
+async function startXhs() {
+    if (S.xhsBusy) return;
+    S.xhsBusy = true;
+    let res = null;
+    try { res = await chrome.runtime.sendMessage({ action: 'xhsExpand', tabId: S.tabId }); }
+    catch (e) { res = { ok: false, error: truncate(String((e && e.message) || e || ''), 90) }; }
+    if (!res || res.ok !== true) {
+        S.xhsBusy = false;
+        S.xhsInfo = { error: (res && res.error) || '后台没有应答' };
+        toast('小红书展开失败' + (S.xhsInfo.error ? '：' + S.xhsInfo.error : ''), true);
+        await collect(true);
+        return;
+    }
+    S.xhsInfo = { total: res.total || 0, parsed: 0, images: 0, running: true, error: '' };
+    toast(`开始逐条取 ${res.total} 条笔记的内页（列表每条只给一张封面）`);
+    clearInterval(S.xhsTimer);
+    S.xhsTimer = setInterval(() => { void pollXhs(); }, 2000);
+    await collect(true);
+}
+
+async function pollXhs() {
+    let st = null;
+    try { st = ((await chrome.runtime.sendMessage({ action: 'xhsExpandState' })) || {}).state; }
+    catch (e) { st = null; }
+    if (!st) { clearInterval(S.xhsTimer); S.xhsTimer = 0; S.xhsBusy = false; return; }
+    const before = S.xhsInfo ? S.xhsInfo.parsed : -1;
+    S.xhsInfo = {
+        total: st.total, parsed: st.parsed, images: st.images, failed: st.failed,
+        running: !!st.running, error: st.failed ? `${st.failed} 条没取到` : '',
+    };
+    if (st.parsed !== before || !st.running) { await collect(true); await syncBatchState(); }
+    if (!st.running) {
+        clearInterval(S.xhsTimer);
+        S.xhsTimer = 0;
+        S.xhsBusy = false;
+        toast(`小红书展开完成：${st.parsed}/${st.total} 条笔记、共 ${st.images} 张内页图`
+            + (st.failed ? `（${st.failed} 条没取到）` : ''), !!st.failed);
+    }
+}
+
 async function scanOnce() {
     const args = [{ max: 400, weibo: !!S.weiboFlag }];
     const feed = await readFeedPosts();
@@ -785,9 +847,13 @@ function buildSummary(data) {
     const feedErr = (S.feedAll && S.weiboFlag && S.feedError && !st) ? ` · 信息流数据没读到` : '';
     // 无用图片不再算「被忽略」：它们收在最后一个折叠组里，想看的可以展开
     const junk = data.junk ? ` · 无用图片 ${data.junk} 张（默认收起）` : '';
+    // 小红书展开进度必须写在摘要上：面板不滚、不弹遮罩，用户只看这里知道有没有在长
+    const xi = S.xhsInfo;
+    const xhs = !S.xhsFlag ? '' : (xi && xi.error && !xi.parsed ? ` · 小红书展开：${xi.error}`
+        : xi ? ` · 小红书已展开 ${xi.parsed}/${xi.total} 条笔记 · ${xi.images} 张内页图${xi.running ? '（进行中）' : ''}` : '');
     const ignored = Math.max(0, (data.dropped || 0) - (data.junk || 0));
     const drop = ignored ? ` · 已忽略 ${ignored} 张` : '';
-    return `${data.host || ''} · ${kind} · ${data.total} 张图片${fixed}${fromFeed}${api}${feedErr}${truncated}${off}${junk}${drop}${kept}`;
+    return `${data.host || ''} · ${kind} · ${data.total} 张图片${fixed}${fromFeed}${api}${xhs}${feedErr}${truncated}${off}${junk}${drop}${kept}`;
 }
 
 function renderGroups() {
