@@ -12,7 +12,7 @@ import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.j
 import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64, bytesFingerprint, uniqueUploadName, extFromMime } from '../src/common/util.js';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, weiboStatusUrl, clampLoadPages } from '../src/common/gallery.js';
 import { UI_THEMES, DEFAULT_UI_THEME, normalizeUiTheme, uiThemeLabel } from '../src/common/theme.js';
-import { parseWeiboDate, eventDateOf, normStatus, parseArchivePage, addPosts, newArchiveState, crawlArchive, serializeArchive, restoreArchive, publicArchive, uniqPics, mediaPlan, ARCHIVE_STORE_KEY, DEFAULT_FEATURES, TIERS } from '../src/gallery/weibo-archive.mjs';
+import { parseWeiboDate, eventDateOf, normStatus, parseArchivePage, addPosts, newArchiveState, crawlArchive, serializeArchive, restoreArchive, publicArchive, uniqPics, mediaPlan, normFeatures, reconcileDone, ARCHIVE_STORE_KEY, DEFAULT_FEATURES, TIERS, WA_BUILD } from '../src/gallery/weibo-archive.mjs';
 
 let pass = 0, fail = 0;
 const notes = [];
@@ -1392,8 +1392,8 @@ console.log('== 微博整档抓取（weibo-archive）==');
     ok('first/last 必须按时间取、不许取数组两端：微博把置顶帖放在最前面，按插入序会把「最新一条」报成那条置顶（真机 E2E 实测暴露：last 显示 2024-06-09，真最新是 2026-10-10）',
         pubT.first === '2021-04-27 23:08:30' && pubT.last === '2026-10-10 20:14:13');
 
-    ok('features 从 RPC 过来可能是数字/字符串/空数组，不许因此抛异常，退回默认四桶',
-        newArchiveState('1', { features: 0 }).features.join(',') === DEFAULT_FEATURES.join(',')
+    ok('features 从 RPC 过来可能是数字/字符串/空数组：不许抛异常；标量按用户意图当单桶，全非法才退回默认四桶',
+        newArchiveState('1', { features: 0 }).features.join(',') === '0'
         && newArchiveState('1', { features: 'abc' }).features.length === 4
         && newArchiveState('1', { features: [] }).features.length === 4
         && newArchiveState('1', { features: [0, null, 2] }).features.join(',') === '0,2');
@@ -1406,6 +1406,23 @@ console.log('== 微博整档抓取（weibo-archive）==');
     await crawlArchive({ fetchPage: async () => { askedR++; return { data: { list: [], since_id: '' } }; }, sleep: null }, stR);
     ok('续跑要跳过上一轮已到底的桶（抓完再点一次 Start 不该白烧几十次请求），只敲没跑完的那个桶',
         askedR === 1 && stR.perFeature[0].page === 3);
+
+    // 真机复验踩过：传 features:0 被当成「没传」，静默沿用存档里上次那组桶，调用方以为参数没生效
+    ok('features 允许标量：传 0 就是「只抓 0 桶」，不许因为 0 是假值就退回别的桶',
+        normFeatures(0).join(',') === '0' && normFeatures('2').join(',') === '2');
+    ok('features 里的 null 不许被 Number() 悄悄变成 0（那会把「只抓视频桶」变成抓时间线）',
+        normFeatures([null, 0, 2]).join(',') === '0,2' && normFeatures([1, 1, 2]).join(',') === '1,2');
+    ok('features 全非法（空数组 / 乱字符串）才退回默认四桶',
+        normFeatures([]).join(',') === DEFAULT_FEATURES.join(',') && normFeatures('abc').join(',') === DEFAULT_FEATURES.join(','));
+    ok('newArchiveState 与状态里的 build 标记同源（真人 Edge 的 ESM SW 会连着几次重载仍跑旧版，得一条调用就能判是哪一版）',
+        newArchiveState('1', {}).features.length === DEFAULT_FEATURES.length && publicArchive(newArchiveState('1')).build === WA_BUILD);
+
+    const pids = ['008ikKY1gy1ihxipnq3dmj32bc1jke81', '008ikKY1gy1ihxiqbgcy7j31e02gw7wk', '008ikKY1gy1ihxiqglxvlj31jk2bcnpf'];
+    ok('rescan 按文件名认回已下的 pid：Windows 反斜杠路径、Chrome 重名加的 " (1)" 后缀都要认',
+        [...reconcileDone(pids, ['E:\\mtb-weibo\\42\\2026-10-10\\' + pids[0] + '.jpg',
+            'E:/mtb-weibo/42/2026-10-10/' + pids[2] + ' (1).jpg'])].join(',') === pids[0] + ',' + pids[2]);
+    ok('账本与磁盘不一致时以磁盘为准（实测账本记 7 张、磁盘只剩 2 张，只信账本就永久漏下那 5 张）',
+        reconcileDone(pids, []).size === 0 && reconcileDone(pids, ['E:\\x\\无关文件.jpg']).size === 0);
 }
 
 console.log('== 整档抓取的后台接线（源码钉子）==');
@@ -1431,6 +1448,12 @@ console.log('== 整档抓取的后台接线（源码钉子）==');
         /to === 'download'/.test(seg) && /chrome\.downloads\.download/.test(seg));
     ok('Dump 与 Media 都必须先 waEnsureArchive（SW 被回收后只剩断点，"按 pid 续传"要还能继续，而不是逼人重抓整档）',
         (seg.match(/waEnsureArchive\(\)/g) || []).length >= 2);
+    ok('rescan 必须真去问 chrome.downloads 并看 exists，不许拿内存账本自欺（用户删过图账本就是错的）',
+        /chrome\.downloads\.search/.test(run) && /\.exists/.test(run));
+    ok('downloads.search 单次上限 1000，取已下清单必须翻页，不然几千张的档只核到前 1000',
+        /limit: 1000/.test(run) && /offset \+= 1000/.test(run));
+    ok('热路径 State 也要报 mediaDone（只有冷路径报的话，跑完一轮下载会看不到进度，像丢了）',
+        /pub\.mediaDone =/.test(bg.slice(a, a + 3000)));
     ok('批量取图不许逐张 addRefererRule（几千张就是近万次规则引擎往返），要用任务级共用规则 + 直取',
         !/addRefererRule\(/.test(run) && /waSetReferer\(WA_IMG_RULE/.test(run));
     ok('sinaimg 没有 Referer 直接 403：任务级规则必须在，且字节太少要当成被防盗链挡了说',

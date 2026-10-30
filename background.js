@@ -8,7 +8,7 @@ import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './src/gallery/collect.mjs';
 import { upgradeWeiboImageUrl, imageDedupeKey, weiboImageTierUrl, weiboStatusToPost, mergeFeedPosts, isWeiboHost, clampLoadPages } from './src/common/gallery.js';
-import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan } from './src/gallery/weibo-archive.mjs';
+import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan, uniqPics, normFeatures, reconcileDone } from './src/gallery/weibo-archive.mjs';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
@@ -96,8 +96,9 @@ const EXT_SCHEMA = {
         weiboArchiveMedia: {
             desc: '把档案里的图按 pid 批量落盘到 下载目录/mtb-weibo/<uid>/<拍摄日>/<pid>.jpg。'
                 + '按 pid 记断点，重复调用只补没下的；orig 档单张可达 4MB，先带 limit 试一批',
-            params: { tier: 'orig(large 原图)|full(mw2000)|card(mw690)|thumb(orj360)，默认 orig', limit: 'int，0=全部', subdir: '下载目录下的子目录名', concurrency: '1~4，默认 3' },
-            returns: '{ ok, started, total, alreadyDone, tier, note }',
+            params: { tier: 'orig(large 原图)|full(mw2000)|card(mw690)|thumb(orj360)，默认 orig', limit: 'int，0=全部', subdir: '下载目录下的子目录名', concurrency: '1~4，默认 3',
+                rescan: 'bool：用 chrome.downloads 的 exists 按磁盘现状重算账本（用户删过图就必须带，否则那几张永久漏下）', force: 'bool：无视账本全部重下' },
+            returns: '{ ok, started, total, alreadyDone, tier, recounted, note }',
         },
         weiboArchiveMediaState: { desc: '轮询图片落盘进度（ok/fail/bytes/currentKey/errors）' },
         weiboArchiveCancel: { desc: '停整档与图片两个任务（在页与页、图与图之间生效）' },
@@ -663,7 +664,8 @@ const HANDLERS = {
             const rec = (await chrome.storage.local.get(ARCHIVE_STORE_KEY))[ARCHIVE_STORE_KEY];
             if (rec && String(rec.uid) === uid && Array.isArray(rec.posts) && rec.posts.length) {
                 st = restoreArchive(rec);
-                st.features = (req.features ? req.features.map(Number) : st.features);
+                // 显式传了 features 就要听，包括传单个数字 0；沿用存档的桶会让调用方以为参数没生效
+                if (req.features !== undefined && req.features !== null && req.features !== '') st.features = normFeatures(req.features);
                 st.maxPages = Number(req.maxPages) || st.maxPages;
                 st.delayMs = Number(req.delayMs) || st.delayMs;
                 st.done = false; st.error = ''; st.stopped = '';
@@ -687,6 +689,8 @@ const HANDLERS = {
         if (waJob) {
             const pub = publicArchive(waJob.st);
             pub.running = !!waJob.running;
+            // 图片进度只在内存任务上，不补这一笔的话跑完一轮 Media 后 State 会「看不到进度」
+            pub.mediaDone = waJob.mediaDone ? waJob.mediaDone.size : ((waJob.st.mediaDone || []).length);
             return { ok: true, state: pub, media: publicWaMedia() };
         }
         const stored = await waStoredState();
@@ -727,7 +731,12 @@ const HANDLERS = {
     weiboArchiveMedia: async (req) => {
         await waEnsureArchive();          // 断点里取回的档案同样能继续下（SW 重启不必重抓整档）
         if (waMedia && waMedia.running) return { ok: true, started: false, note: '图片任务已在跑', media: publicWaMedia() };
-        const done = waJob.mediaDone || new Set();
+        let before = waJob.mediaDone.size;
+        if (req.force) waJob.mediaDone = new Set();                      // 全部重下
+        else if (req.rescan) {                                           // 按磁盘现状重算账本
+            waJob.mediaDone = reconcileDone(uniqPics(waJob.st.posts), await waExistingFiles(waJob.st.uid));
+        }
+        const done = waJob.mediaDone;
         const plan = mediaPlan(waJob.st, { tier: req.tier, subdir: req.subdir, limit: Number(req.limit) || 0, skip: done });
         waMedia = {
             running: true, cancel: false, canceled: false, plan, done, index: 0, ok: 0, fail: 0,
@@ -737,7 +746,10 @@ const HANDLERS = {
         runWaMedia();
         return {
             ok: true, started: true, total: plan.length, alreadyDone: done.size, tier: waMedia.tier,
-            note: 'orig 档单张可达 4MB，整档几千张建议先带 limit 试一批；断点按 pid 记，重复调用只补没下的',
+            // 账本被磁盘现状改了多少（负数=发现文件其实没了，这些会重新下）
+            recounted: req.force ? -before : (req.rescan ? done.size - before : 0),
+            note: 'orig 档单张可达 4MB，整档几千张建议先带 limit 试一批；断点按 pid 记，重复调用只补没下的；'
+                + '删过下载目录的话带 rescan:true 按磁盘重算账本',
         };
     },
 
@@ -1221,6 +1233,19 @@ async function waEnsureArchive() {
         checkpointEvery: 10, mediaDone: new Set(r.st.mediaDone || []),
     };
     return waJob;
+}
+
+/* mediaDone 只是记账：用户从下载目录里删掉图之后，只信账本就会永久漏下那几张
+   （实测账本记 7 张、磁盘只剩 2 张）。rescan 用 chrome.downloads 的 exists 字段按磁盘现状重算。
+   search 单次上限 1000 条，所以要翻页取完。 */
+async function waExistingFiles(uid) {
+    const names = [];
+    for (let offset = 0; ; offset += 1000) {
+        const rows = await chrome.downloads.search({ query: 'mtb-weibo/' + uid, offset, limit: 1000 });
+        for (const it of rows || []) if (it && it.exists && it.filename) names.push(it.filename);
+        if (!rows || rows.length < 1000) break;
+    }
+    return names;
 }
 
 function publicWaMedia() {

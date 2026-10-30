@@ -11,6 +11,10 @@
 // node test/unit_pure.mjs 里用真实接口夹具跑断言，不需要浏览器。
 
 export const ARCHIVE_STORE_KEY = 'mtbWeiboArchive';
+/* 构建标记：改一次归档相关代码就 +1。真人 Edge 的 ESM service worker 实测会连着几次
+   「重新加载」后仍跑上一版（本仓库开发中踩过三次），有这个字段，一条 weiboArchiveState
+   就能判定浏览器到底加载了哪一版，不用靠行为反推。 */
+export const WA_BUILD = 'wa3';
 export const MYMBLOG_API = 'https://weibo.com/ajax/statuses/mymblog';
 // feature 分桶实测：只有 0 报 data.total，1/2/14 各回 20 条但 total=-1，9/24 空。
 // 0 是主页时间线，其余几个是页面顶部那些标签（视频/文章/…），并集才接近「全部」。
@@ -76,15 +80,32 @@ export function parseArchivePage(payload) {
     };
 }
 
-export function newArchiveState(uid, opt = {}) {
-    // features 从 RPC 过来，可能是数字、字符串、带 null 的数组。null 会被 Number() 悄悄变成 0，
-    // 于是「只想抓视频桶」会变成抓时间线，所以先按原值滤掉空与非法，再转数、再去重。
-    const raw = Array.isArray(opt.features) && opt.features.length ? opt.features : DEFAULT_FEATURES;
+/* features 从 RPC 过来可能是 0、'0'、[0,1]、[]、带 null。Number(null)===0 会把
+   「我只想抓视频桶」悄悄变成「抓时间线」，所以先按原值滤掉空，再转数、再去重；
+   标量按单桶处理（传 0 就是 [0]），全非法才退回默认四桶。 */
+export function normFeatures(v) {
+    const raw = Array.isArray(v) ? v : (v === undefined || v === null || v === '' ? [] : [v]);
     const feats = [...new Set(raw
-        .filter((v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v)))
+        .filter((x) => x !== null && x !== undefined && x !== '' && Number.isFinite(Number(x)))
         .map(Number))];
+    return feats.length ? feats : DEFAULT_FEATURES.slice();
+}
+
+/* 断点里「已下过哪些图」只是记账，文件可能被用户从下载目录里删掉 —— 只信账本就会永久漏下那几张
+   （实测踩过：账本记 5 张，磁盘上只剩 2 张）。rescan 用实际存在的文件把账本重算一遍。 */
+export function reconcileDone(pids, existingFiles) {
+    const have = new Set();
+    for (const f of existingFiles || []) {
+        // 文件名就是 pid；Chrome 重名时会加 " (1)" 后缀，也要认回来
+        const m = /\/?([0-9a-zA-Z]{16,})(?: \(\d+\))?\.(?:jpg|jpeg|png|webp)$/i.exec(String(f || ''));
+        if (m) have.add(m[1]);
+    }
+    return new Set((pids || []).filter((p) => have.has(p)));
+}
+
+export function newArchiveState(uid, opt = {}) {
     return {
-        uid: String(uid || ''), features: feats.length ? feats : DEFAULT_FEATURES.slice(),
+        uid: String(uid || ''), features: normFeatures(opt.features),
         maxPages: Number(opt.maxPages) || 400, delayMs: Number(opt.delayMs) || 600,
         posts: [], byId: null, seenPages: 0, cursor: '', declaredTotal: 0,
         perFeature: {}, running: false, done: false, canceled: false, stopped: '', error: '',
@@ -118,6 +139,7 @@ export function publicArchive(st) {
         if (!recent || t > recent.ts) recent = p;
     }
     return {
+        build: WA_BUILD,
         uid: st.uid, features: st.features, running: !!st.running, done: !!st.done,
         canceled: !!st.canceled, stopped: st.stopped || '', error: st.error || '',
         pages: st.seenPages, posts: st.posts.length, declaredTotal: st.declaredTotal || 0,
