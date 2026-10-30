@@ -9,7 +9,7 @@ import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFrom
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './src/gallery/collect.mjs';
 import { upgradeWeiboImageUrl, imageDedupeKey, weiboImageTierUrl, weiboStatusToPost, mergeFeedPosts, isWeiboHost, clampLoadPages } from './src/common/gallery.js';
 import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan, uniqPics, normFeatures, reconcileDone, takePages, WA_BUILD } from './src/gallery/weibo-archive.mjs';
-import { parseSsrState, listedNotes, undertakeCard, xhsNoteToPost, noteDetailUrl, profileUrl, profileUid } from './src/gallery/xhs-archive.mjs';
+import { parseSsrState, listedNotes, undertakeCard, xhsNoteToPost, noteDetailUrl, profileUrl, profileUid, isXhsHost } from './src/gallery/xhs-archive.mjs';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
@@ -829,20 +829,24 @@ const HANDLERS = {
         const tab = await chrome.tabs.get(tabId).catch(() => null);
         if (!tab) throw new Error('tab not found: ' + tabId);
         const uid = profileUid(tab.url || '');
-        if (!uid) return { ok: false, error: '小红书要在个人主页上用（地址形如 xiaohongshu.com/user/profile/<uid>），这个页面认不出 uid' };
+        let host = '';
+        try { host = new URL(tab.url || '').hostname; } catch (e) { /* ignore */ }
+        if (!isXhsHost(host)) return { ok: false, error: '这不是小红书页面（' + (host || '未知地址') + '）' };
         if (xhsJob && xhsJob.running) return { ok: true, started: false, note: '展开任务已在跑，这是当前进度', state: publicXhs() };
-        const prof = profileUrl(uid);
-        const notes = listedNotes(parseSsrState(await xhsFetchHtml(prof, prof)));
-        if (!notes.length) return { ok: false, error: '主页 SSR 里没解析出笔记列表（没登录、被风控、或小红书改了页面结构）' };
+        // 个人主页与首页瀑布流都算：列表来源就是当前这一页的 SSR。
+        // 注意首页那 30 条是默认推荐，**不含用户已经滚出来的部分**，要更全就滚完再点一次
+        const listUrl = uid ? profileUrl(uid) : tab.url;
+        const notes = listedNotes(parseSsrState(await xhsFetchHtml(listUrl, listUrl)));
+        if (!notes.length) return { ok: false, error: '这个页面的 SSR 里没解析出笔记列表（没登录、被风控，或小红书改了页面结构）' };
         const lim = Math.max(1, Math.min(Number(req.limit) || notes.length, 200));
         xhsJob = {
-            uid, tabId, notes: notes.slice(0, lim), index: 0, parsed: 0, images: 0,
+            uid: uid || host, listUrl, tabId, notes: notes.slice(0, lim), index: 0, parsed: 0, images: 0,
             failed: [], errors: [], current: '', running: true, cancel: false, canceled: false,
             delayMs: Math.max(0, Number(req.delayMs) || 250), startedAt: Date.now(), finishedAt: 0,
         };
         runXhsJob();
         return {
-            ok: true, started: true, uid, total: xhsJob.notes.length,
+            ok: true, started: true, uid, source: uid ? 'profile' : 'feed', total: xhsJob.notes.length,
             note: '逐条取内页 SSR（列表只有封面）；用 xhsExpandState 轮询，每解析出一条就落进该标签页采集缓存，面板刷新即可见',
         };
     },
@@ -1437,7 +1441,7 @@ async function runXhsJob() {
             j.index++;
             j.current = n.id;
             try {
-                const html = await xhsFetchHtml(noteDetailUrl(n.id, n.token), profileUrl(j.uid));
+                const html = await xhsFetchHtml(noteDetailUrl(n.id, n.token), j.listUrl);
                 const nc = undertakeCard(parseSsrState(html), n.id);
                 const imgs = (nc && nc.imageList) || [];
                 if (!imgs.length) { j.failed.push(n.id + ':没解析出图片'); continue; }

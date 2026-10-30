@@ -1591,6 +1591,21 @@ console.log('== 小红书笔记全部图片解析（xhs-archive）==');
         isXhsHost('www.xiaohongshu.com') && !isXhsHost('sns-webpic-qc.xhscdn.com') && !isXhsHost('weibo.com'));
     ok('页面里没有 __INITIAL_STATE__ 时给 null（调用方据此报「读不到数据」，不返回空对象骗人）',
         parseSsrState('<html><body>登录页</body></html>') === null && parseSsrState('') === null);
+    // 用户要的是「平铺的首页也能解析」，所以列表来源不能只认个人主页那一种形状
+    const home = {
+        feed: { feeds: [
+            { id: 'h1', xsecToken: 'T1', noteCard: { displayTitle: '首页一', cover: { infoList: [{ imageScene: 'WB_DFT', url: 'http://h/1' }] } } },
+            { id: 'h2', xsecToken: 'T2', noteCard: { displayTitle: '首页二', cover: {} } },
+            { id: 'n1', xsecToken: 'dup', noteCard: { displayTitle: '两条来源都出现' } },
+        ] },
+        user: { notes: [[{ id: 'n1', xsecToken: 'AB%3D', noteCard: { displayTitle: '笔记一', cover: { infoList: [{ imageScene: 'WB_DFT', url: 'http://c/d' }] }, interactInfo: { likedCount: '111' } } },
+            { id: 'n2', xsecToken: 'CD', noteCard: { displayTitle: '带 } 花括{号 的标题', cover: {} } }]] },
+    };
+    const all = listedNotes(home);
+    ok('首页瀑布流 `feed.feeds` 与个人主页 `user.notes` 都要认（用户说的「平铺的主页」是这两种之一），并按 id 去重',
+        all.length === 4 && all[0].id === 'n1' && all.some((x) => x.id === 'h1') && all.every((x) => x.token !== 'dup'));
+    ok('去重时保留先出现那条的完整信息（个人主页那条有作者与点赞数，不能被首页的空壳顶掉）',
+        all[0].likes === '111' && all[0].cover === 'https://c/d');
 }
 
 console.log('== 小红书展开的后台与面板接线（源码钉子）==');
@@ -1610,8 +1625,8 @@ console.log('== 小红书展开的后台与面板接线（源码钉子）==');
         /校验页/.test(bg) && /text\.length < 3000/.test(bg));
     ok('解析出的帖子落进该标签页采集缓存的 extra，上限与微博一致（-900），面板重开才不会数量跳变',
         /xhsPushToCache/.test(bg) && (bg.match(/extra: extra\.slice\(-900\)/g) || []).length >= 2);
-    ok('面板那颗勾选只在小红书个人主页亮（isXhsHost && profileUid），别的站点不该出现',
-        /S\.xhsFlag = isXhsHost\(host\) && !!profileUid\(tab\.url \|\| \'\'\)/.test(gm)
+    ok('面板那颗勾选在任何小红书页都亮（个人主页与首页瀑布流的列表都只有封面），非小红书站不许出现',
+        /S\.xhsFlag = isXhsHost\(host\);/.test(gm)
         && /\$\('#xhsFullWrap'\)\.hidden = !S\.xhsFlag/.test(gm) && /id="xhsFull"/.test(html));
     ok('面板轮询到 parsed 变了就重扫（用户要能看着九宫格一条条长出来），停了做最后一次并播报结果',
         /action: 'xhsExpandState'/.test(gm) && /st\.parsed !== before \|\| !st\.running/.test(gm)
@@ -1626,6 +1641,21 @@ console.log('== 小红书展开的后台与面板接线（源码钉子）==');
         /if \(!S\.weiboFlag\) \{[\s\S]{0,220}if \(!S\.extraPosts\.length\) return null;/.test(gm));
     ok('面板轮询展开进度时要先把后台落的 extra 拉回 S.extraPosts 再重扫（不拉就一直是旧数据，看不到一条条长出来）',
         /action: 'galleryCacheGet', tabId: S\.tabId/.test(gm.slice(gm.indexOf('async function pollXhs'))));
+    // 用户明确要的两件事：平铺首页也要能解析（原来只认个人主页，首页连勾都不亮）；点一条只看这一条
+    ok('「展开每条笔记」的闸门只看站点，不许再要求个人主页 uid（首页瀑布流同样是平铺列表）',
+        /S\.xhsFlag = isXhsHost\(host\);/.test(gm) && !/isXhsHost\(host\) && !!profileUid/.test(gm));
+    ok('后台 xhsExpand 也要接受非个人主页的小红书页（source 区分 profile/feed），列表来源就用当前这页的 SSR',
+        /source: uid \? 'profile' : 'feed'/.test(bg) && /const listUrl = uid \? profileUrl\(uid\) : tab\.url;/.test(bg));
+    ok('每个分组头有「只看这条 / 都显示」按钮，点了走 applyData 重算（不是只藏 DOM，摘要与计数要跟着变）',
+        /g-group-only/.test(gm) && /只看这条/.test(gm) && /都显示/.test(gm)
+        && /S\.onlyKey = on \? '' : g\.key;[\s\S]{0,60}applyData\(S\.full, true\)/.test(gm));
+    ok('「只看这条」在 visibleSlice 里做硬过滤，并且那条内容不在结果里时自动解除（留个空面板比什么都不做更糟）',
+        /if \(S\.onlyKey\)/.test(gm.slice(gm.indexOf('function visibleSlice'), gm.indexOf('function visibleSlice') + 900))
+        && /else S\.onlyKey = '';/.test(gm));
+    ok('过滤状态必须写在摘要上（只剩一组时用户会以为图丢了，要告诉他怎么回全量）',
+        /只看「/.test(gm) && /点「都显示」恢复全部/.test(gm));
+    ok('新按钮与「反选」共用同一套外观选择器（不许长出一个和面板风格无关的裸按钮）',
+        /\.g-group-inv, \.g-group-only/.test(read('src/gallery/gallery.css')));
 }
 
 __summary();process.exit(fail ? 1 : 0);

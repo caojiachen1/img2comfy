@@ -81,26 +81,35 @@ function https(u) {
     return String(u || '').replace(/^http:/i, 'https:');
 }
 
-/* 主页 SSR → 这个账号已列出的笔记（id + xsecToken）。
-   xsecToken 是**每条**都带的反爬令牌，取内页必须原样带上，不带就是 404/校验页。 */
+/* 页面 SSR → 这一屏列出的笔记（id + xsecToken）。
+   两种页面都要认，因为它们就是用户看到的两个「平铺」入口：
+     · 个人主页 user.notes        → 这个号发的笔记
+     · 首页/频道 feed.feeds       → 瀑布流推荐流
+   两边条目形状一样（{id, xsecToken, noteCard:{cover, displayTitle, ...}}），都**只有封面没有 imageList**，
+   所以全部图片一律靠逐条取内页拿（见文件头）。
+   xsecToken 是**每条**各自带的反爬令牌，取内页必须原样带上，不带就是校验页。 */
 export function listedNotes(state) {
-    const groups = (((state || {}).user) || {}).notes || [];
     const out = [];
+    const seen = new Set();
+    const push = (it) => {
+        const nc = (it && it.noteCard) || {};
+        const id = it && (it.id || nc.noteId);
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        out.push({
+            id, token: String(it.xsecToken || nc.xsecToken || ''),
+            title: String(nc.displayTitle || '').slice(0, 80),
+            type: String(nc.type || ''),
+            cover: pickImageUrl(nc.cover || {}),
+            author: String(((nc.user || {}).nickname) || ((nc.user || {}).nickName) || ''),
+            likes: String(((nc.interactInfo || {}).likedCount) || ''),
+        });
+    };
+    const groups = (((state || {}).user) || {}).notes || [];
     const buckets = Array.isArray(groups[0]) ? groups : [groups];
-    for (const arr of buckets) {
-        for (const it of Array.isArray(arr) ? arr : []) {
-            const nc = (it && it.noteCard) || {};
-            const id = it && (it.id || nc.noteId);
-            if (!id) continue;
-            out.push({
-                id, token: String(it.xsecToken || nc.xsecToken || ''),
-                title: String(nc.displayTitle || '').slice(0, 80),
-                type: String(nc.type || ''),
-                cover: pickImageUrl(nc.cover || {}),
-                likes: String(((nc.interactInfo || {}).likedCount) || ''),
-            });
-        }
-    }
+    for (const arr of buckets) for (const it of (Array.isArray(arr) ? arr : [])) push(it);
+    const feeds = ((state || {}).feed || {}).feeds || [];
+    for (const it of (Array.isArray(feeds) ? feeds : [])) push(it);
     return out;
 }
 

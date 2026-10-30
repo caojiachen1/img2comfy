@@ -3,7 +3,7 @@
 // 批量发送由后台执行，面板关掉也不会中断。
 
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './collect.mjs';
-import { isXhsHost, profileUid } from './xhs-archive.mjs';
+import { isXhsHost } from './xhs-archive.mjs';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, clampLoadPages } from '../common/gallery.js';
 import { baseNameFromUrl, sanitizeFilename } from '../common/util.js';
 import { normalizeWeiboFilter, describeWeiboFilter, keywordExprOf, exprSource } from '../common/weibo-filter.js';
@@ -58,6 +58,8 @@ const S = {
     xhsInfo: null,
     xhsTimer: 0,
     xhsFlag: false,
+    // 「只看这条」：非空时面板只显示这一组内容，其它全部隐藏
+    onlyKey: '',
     feedStats: null,
     feedError: '',
     feedTotal: 0,
@@ -328,8 +330,9 @@ async function collect(keepSelection) {
         S.weiboFlag = isWeiboHost(host);
         $('#feedAllWrap').hidden = !S.weiboFlag;
         $('#apiModeWrap').hidden = !S.weiboFlag;
-        // 「展开每条笔记的全部图」只在小红书个人主页上有意义（uid 从地址取，别的页面没这个结构）
-        S.xhsFlag = isXhsHost(host) && !!profileUid(tab.url || '');
+        // 「展开每条笔记的全部图」在任何小红书页面上都有意义：个人主页与首页瀑布流的列表都只有封面，
+        // 全部图都在各条笔记内页的 SSR 里（以前只认个人主页，首页点不出这颗勾，用户说"实现不对"就是这个）
+        S.xhsFlag = isXhsHost(host);
         $('#xhsFullWrap').hidden = !S.xhsFlag;
         // 勾了 API 模式，「帮我翻页」和它的页数选择就是多余的：滚到底会自动要下一页
         $('#btnMore').hidden = !S.weiboFlag || S.apiMode;
@@ -666,15 +669,23 @@ async function scanOnce() {
    微博把看过的帖子整条搬到画布外（实测 top:-10088）复用，那种已经被采集器挡掉；
    这条开关管的是「在文档流里但还没滚到/已经滚过去」的那些。 */
 function visibleSlice(data) {
-    if (!S.onlyView || !data.view || !data.view.h) return data;
-    const lo = data.view.y - data.view.h;
-    const hi = data.view.y + data.view.h * 2;
-    const groups = data.groups.map((g) => {
+    // 「只看这条」是硬过滤：面板一次只摊开一条内容的图，其它全部隐藏。
+    // 那条内容如果已经不在结果里（重扫后没了），自动解除过滤 —— 留个空面板比什么都不做更糟
+    let base = data;
+    if (S.onlyKey) {
+        const picked = data.groups.filter((g) => g.key === S.onlyKey);
+        if (picked.length) base = { ...data, groups: picked, total: picked.reduce((n, g) => n + g.items.length, 0) };
+        else S.onlyKey = '';
+    }
+    if (!S.onlyView || !base.view || !base.view.h) return base;
+    const lo = base.view.y - base.view.h;
+    const hi = base.view.y + base.view.h * 2;
+    const groups = base.groups.map((g) => {
         const items = g.items.filter((it) => (it.y || 0) >= lo && (it.y || 0) <= hi);
         return items.length ? { ...g, items } : null;
     }).filter(Boolean);
     const total = groups.reduce((n, g) => n + g.items.length, 0);
-    return { ...data, groups, total, hidden: data.total - total };
+    return { ...base, groups, total, hidden: base.total - total };
 }
 
 // 打开面板时直接滚到「用户正在看的那条微博」：采集结果里带了扫描那一刻的视口位置，
@@ -855,6 +866,8 @@ function buildSummary(data) {
     const truncated = data.truncated ? ' · 已截取前 400 张' : '';
     const off = data.hidden ? ` · 另有 ${data.hidden} 张在屏幕外` : '';
     const kept = S.cachedCount ? ` · 含之前滚过的位置` : '';
+    // 过滤状态必须写在摘要上：面板只剩一组时，用户会以为"图丢了"，得告诉他是怎么回到全量的
+    const only = S.onlyKey ? ` · 只看「${truncate(groupDisplay(data.groups[0] || {}) || '', 24)}」，点「都显示」恢复全部` : '';
     const fixed = data.enriched ? ` · 补齐折叠 ${data.enriched} 张` : '';
     const st = S.feedStats;
     const fromFeed = st && (st.groups || st.items) ? ` · 按微博数据补出 ${st.groups} 条 / ${st.items} 张` : '';
@@ -871,7 +884,7 @@ function buildSummary(data) {
         : xi ? ` · 小红书已展开 ${xi.parsed}/${xi.total} 条笔记 · ${xi.images} 张内页图${xi.running ? '（进行中）' : ''}` : '');
     const ignored = Math.max(0, (data.dropped || 0) - (data.junk || 0));
     const drop = ignored ? ` · 已忽略 ${ignored} 张` : '';
-    return `${data.host || ''} · ${kind} · ${data.total} 张图片${fixed}${fromFeed}${api}${xhs}${feedErr}${truncated}${off}${junk}${drop}${kept}`;
+    return `${data.host || ''} · ${kind} · ${data.total} 张图片${only}${fixed}${fromFeed}${api}${xhs}${feedErr}${truncated}${off}${junk}${drop}${kept}`;
 }
 
 function renderGroups() {
@@ -960,6 +973,20 @@ function renderGroups() {
             head.append(open);
         }
         if (!g.junk) head.append(inv);
+        // 「只看这条」：面板一次只摊开这一条内容的图。用户要的是点开后别的图全都别挡视线
+        if (!g.junk) {
+            const only = document.createElement('button');
+            only.className = 'g-group-only';
+            only.type = 'button';
+            const on = S.onlyKey === g.key;
+            only.textContent = on ? '都显示' : '只看这条';
+            only.title = on ? '取消过滤，重新显示全部内容' : '面板只显示这条内容的图片，其它全部隐藏';
+            only.onclick = () => {
+                S.onlyKey = on ? '' : g.key;
+                if (S.full) applyData(S.full, true);
+            };
+            head.append(only);
+        }
         head.append(checkLabel);
 
         const grid = document.createElement('div');
