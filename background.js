@@ -8,7 +8,7 @@ import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './src/gallery/collect.mjs';
 import { upgradeWeiboImageUrl, imageDedupeKey, weiboImageTierUrl, weiboStatusToPost, mergeFeedPosts, isWeiboHost, clampLoadPages } from './src/common/gallery.js';
-import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan, uniqPics, normFeatures, reconcileDone, takePages } from './src/gallery/weibo-archive.mjs';
+import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan, uniqPics, normFeatures, reconcileDone, takePages, WA_BUILD } from './src/gallery/weibo-archive.mjs';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
@@ -692,16 +692,18 @@ const HANDLERS = {
     },
 
     weiboArchiveState: async () => {
+        // build 必须在**每一条**返回路径上（包括还没有档案时）：它是「浏览器到底加载了哪一版」的
+        // 唯一探针，真人 Edge 的 ESM SW 会连着几次重载仍跑旧版，读不到版本就没法判断该不该继续测
         if (waJob) {
             const pub = publicArchive(waJob.st);
             pub.running = !!waJob.running;
             // 图片进度只在内存任务上，不补这一笔的话跑完一轮 Media 后 State 会「看不到进度」
             pub.mediaDone = waJob.mediaDone ? waJob.mediaDone.size : ((waJob.st.mediaDone || []).length);
-            return { ok: true, state: pub, media: publicWaMedia() };
+            return { ok: true, build: WA_BUILD, state: pub, media: publicWaMedia() };
         }
         const stored = await waStoredState();
-        return stored ? { ok: true, state: stored, media: publicWaMedia(), note: '内存里没有任务，这是上次落盘的断点' }
-            : { ok: true, state: null, media: null, note: '还没有整档记录' };
+        return stored ? { ok: true, build: WA_BUILD, state: stored, media: publicWaMedia(), note: '内存里没有任务，这是上次落盘的断点' }
+            : { ok: true, build: WA_BUILD, state: null, media: null, note: '还没有整档记录' };
     },
 
     // 档案动辄 1~2MB，塞进一次 RPC 消息会把调用方撑爆（扩展消息通道也不是为大数据设计的），
@@ -772,7 +774,15 @@ const HANDLERS = {
         const uid = waProfileUid(tab.url || '');
         if (!uid) return { ok: false, needUid: true, error: 'API 模式要在个人主页上用（地址形如 weibo.com/u/<uid>），这个页面认不出 uid' };
         const job = await waJobFor(uid);
-        const r = await takePages(job.st, waFetchPage, req.pages || 1, 0);
+        // 必须在这里也装 Referer 规则：weibo 的 mymblog 没有 Referer 直接 403（实测：装规则 200、
+        // 不装 403）。整档与图片各自装过，唯独这条漏了 —— 面板勾了 API 模式就是一条都不显示。
+        let r;
+        try {
+            await waSetReferer(WA_API_RULE, 'weibo.com/ajax/statuses/mymblog');
+            r = await takePages(job.st, waFetchPage, req.pages || 1, 0);
+        } finally {
+            await waClearReferer(WA_API_RULE);
+        }
         let host = '';
         try { host = new URL(tab.url || '').hostname; } catch (e) { /* ignore */ }
         const e = galleryCache.get(tabId) || {};
@@ -791,7 +801,7 @@ const HANDLERS = {
         }
         await waCheckpoint().catch(() => {});
         return {
-            ok: true, uid, fetched: r.fetched, added: r.added, posts, done: !!r.done,
+            ok: true, uid, fetched: r.fetched, added: r.added, posts, done: !!r.done, failed: !!r.failed,
             stopped: r.stopped || '', total: job.st.posts.length, declaredTotal: job.st.declaredTotal || 0,
             cursor: r.cursor,
         };

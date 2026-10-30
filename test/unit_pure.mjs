@@ -1447,6 +1447,10 @@ console.log('== 微博整档抓取（weibo-archive）==');
     const nrE = await takePages(stE, async () => ({ data: { list: [] } }), 3, 0);
     ok('接口给空页 → done + empty-page，fetched 记 1（不是把请求数当帖子数）',
         nrE.done === true && nrE.stopped === 'empty-page' && nrE.fetched === 1);
+    const stF = newArchiveState('42', { features: [0] });
+    const nrF = await takePages(stF, async () => { throw new Error('HTTP 403（微博限流或风控）'); }, 3, 0);
+    ok('拉取失败要单独标 failed（真机踩过：403 时 done=false，面板于是每滚一下都重敲一个注定失败的端点）',
+        nrF.failed === true && nrF.done === false && nrF.fetched === 0 && /403/.test(nrF.stopped));
 }
 
 console.log('== 整档抓取的后台接线（源码钉子）==');
@@ -1516,6 +1520,16 @@ console.log('== 面板「API 模式 · 无限下拉」接线（源码钉子）==
     ok('补页只发一个后台动作 weiboArchiveNext，带 tabId、页数夹在 1~10（同一次下拉不许并发敲两下）',
         /action: 'weiboArchiveNext', tabId: S\.tabId/.test(gm) && /Math\.min\(10, Number\(pages\)/.test(gm)
         && /if \(S\.apiBusy\) return/.test(gm));
+    {
+        const i = bg.indexOf('weiboArchiveNext: async');
+        const nx = bg.slice(i, i + 3000);
+        ok('weiboArchiveNext 必须自己装 Referer 规则并在 finally 摘掉（真机实测：装规则 200、不装 403；这条漏了面板就"勾了 API 模式一条都不显示"）',
+            i > 0 && /waSetReferer\(WA_API_RULE/.test(nx) && /finally\s*\{[\s\S]{0,80}waClearReferer\(WA_API_RULE\)/.test(nx));
+        ok('Next 要把 failed 透回面板（403/限流要能停手，不能只报 done=false 让面板一直重试）',
+            /failed: !!r\.failed/.test(nx));
+    }
+    ok('面板把 failed 也当成「到底」，并把原因写进摘要（error 分支必须存在）',
+        /done: !!res\.done \|\| !!res\.failed/.test(gm) && /error: res\.failed/.test(gm));
     ok('API 模式不依赖「全部微博」也要把帖子并进来（这两个开关是两条不同数据来源，卡成一个就会勾了看不见）',
         /if \(!S\.weiboFlag \|\| \(!S\.feedAll && !S\.apiMode\)\) return null;/.test(gm));
     ok('回来的帖子按 mid 去重后塞进 S.extraPosts，并留上限（和「帮我翻页」同一条路，重扫才认得）',

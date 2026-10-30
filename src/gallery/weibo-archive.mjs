@@ -14,7 +14,7 @@ export const ARCHIVE_STORE_KEY = 'mtbWeiboArchive';
 /* 构建标记：改一次归档相关代码就 +1。真人 Edge 的 ESM service worker 实测会连着几次
    「重新加载」后仍跑上一版（本仓库开发中踩过三次），有这个字段，一条 weiboArchiveState
    就能判定浏览器到底加载了哪一版，不用靠行为反推。 */
-export const WA_BUILD = 'wa4';
+export const WA_BUILD = 'wa5';
 export const MYMBLOG_API = 'https://weibo.com/ajax/statuses/mymblog';
 // feature 分桶实测：只有 0 报 data.total，1/2/14 各回 20 条但 total=-1，9/24 空。
 // 0 是主页时间线，其余几个是页面顶部那些标签（视频/文章/…），并集才接近「全部」。
@@ -227,7 +227,7 @@ export async function takePages(st, fetchPage, n = 1, featOpt) {
     const feat = Number.isFinite(Number(featOpt)) ? Number(featOpt) : (st.features && st.features.length ? st.features[0] : 0);
     const pf = st.perFeature[feat] || (st.perFeature[feat] = { cursor: '', page: 0, added: 0, end: false, error: '' });
     const pages = Math.max(1, Math.min(10, Number(n) || 1));
-    const out = { fetched: 0, added: 0, fresh: [], done: false, stopped: '', cursor: pf.cursor || '', declaredTotal: st.declaredTotal || 0 };
+    const out = { fetched: 0, added: 0, fresh: [], done: false, failed: false, stopped: '', cursor: pf.cursor || '', declaredTotal: st.declaredTotal || 0 };
     if (pf.end) { out.done = true; out.stopped = 'already-end'; return out; }
     if (!st.byId) st.byId = new Set(st.posts.map((p) => p.id));
     let cursor = pf.cursor || '';
@@ -237,6 +237,9 @@ export async function takePages(st, fetchPage, n = 1, featOpt) {
         try { payload = await fetchPage({ uid: st.uid, feature: feat, page: pf.page + 1, sinceId: cursor }); }
         catch (e) {
             out.stopped = String((e && e.message) || e);
+            // 失败要单独标出来：调用方（面板无限下拉）必须因此停手，
+            // 不能把「这一页没拿到」当成「还没到底」，每滚一下又去敲一个 403
+            out.failed = true;
             pf.error = out.stopped;
             break;
         }

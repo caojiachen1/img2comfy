@@ -559,7 +559,9 @@ async function apiMore(pages) {
     S.extraPosts = S.extraPosts.slice(-3000);
     S.apiInfo = {
         total: res.total || 0, declaredTotal: res.declaredTotal || 0, added: res.added || 0,
-        done: !!res.done, stopped: res.stopped || '',
+        // 失败（403/限流/掉登录）也算「别再下拉了」：否则用户每滚一下都去重敲一个注定 403 的端点
+        done: !!res.done || !!res.failed, stopped: res.stopped || '',
+        error: res.failed ? (res.stopped || '拉取失败') : '',
     };
     await collect(true);
     await syncBatchState();
