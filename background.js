@@ -8,7 +8,7 @@ import { ensureBuiltins } from './src/common/builtin-scripts.js';
 import { base64ToBytes, bytesToBase64, sniffMime, sanitizeFilename, filenameFromUrl, extFromMime, bytesFingerprint, uniqueUploadName } from './src/common/util.js';
 import { collectPageImages, weiboFeedPage, weiboLoadMorePages, scrollToPost } from './src/gallery/collect.mjs';
 import { upgradeWeiboImageUrl, imageDedupeKey, weiboImageTierUrl, weiboStatusToPost, mergeFeedPosts, isWeiboHost, clampLoadPages } from './src/common/gallery.js';
-import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan, uniqPics, normFeatures, reconcileDone } from './src/gallery/weibo-archive.mjs';
+import { MYMBLOG_API, ARCHIVE_STORE_KEY, newArchiveState, restoreArchive, serializeArchive, publicArchive, crawlArchive, mediaPlan, uniqPics, normFeatures, reconcileDone, takePages } from './src/gallery/weibo-archive.mjs';
 
 const HOST_PAGE = 'src/host/host.html';
 let hostTabId = null;
@@ -101,6 +101,12 @@ const EXT_SCHEMA = {
             returns: '{ ok, started, total, alreadyDone, tier, recounted, note }',
         },
         weiboArchiveMediaState: { desc: '轮询图片落盘进度（ok/fail/bytes/currentKey/errors）' },
+        weiboArchiveNext: {
+            desc: '面板「API 模式 · 无限下拉」的增量入口：只推进时间线游标 1~10 页就返回（同步等得起），'
+                + '顺手把新帖存进该标签页采集缓存的 extra，面板下一次 collectImages {feed:true} 自然并进来',
+            params: { tabId: 'number 必填（必须停在个人主页 weibo.com/u/<uid>，uid 从地址取）', pages: '1~10，默认 1' },
+            returns: '{ ok, uid, fetched, added, posts[面板帖子形状], done, stopped, total, declaredTotal, cursor }',
+        },
         weiboArchiveCancel: { desc: '停整档与图片两个任务（在页与页、图与图之间生效）' },
         scrollToPost: {
             desc: '跳到某条微博：被虚拟列表回收的会自动往下翻屏挂出来并高亮，不新开标签',
@@ -755,6 +761,42 @@ const HANDLERS = {
 
     weiboArchiveMediaState: async () => ({ ok: true, media: publicWaMedia() }),
 
+    // 面板「API 模式 · 无限下拉」的增量入口：一次只推进 1~10 页就返回（约 0.5~5 秒，同步等得起），
+    // 转成帖子顺手存进该标签页采集缓存的 extra —— 和「帮我翻页」的 fetch 路由同一个落点，
+    // 所以面板随后的 collectImages {feed:true} 会自然把它们并进来，不用另写一套合并。
+    weiboArchiveNext: async (req) => {
+        const tabId = Number(req.tabId) || 0;
+        if (!tabId) throw new Error('tabId required');
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab) throw new Error('tab not found: ' + tabId);
+        const uid = waProfileUid(tab.url || '');
+        if (!uid) return { ok: false, needUid: true, error: 'API 模式要在个人主页上用（地址形如 weibo.com/u/<uid>），这个页面认不出 uid' };
+        const job = await waJobFor(uid);
+        const r = await takePages(job.st, waFetchPage, req.pages || 1, 0);
+        let host = '';
+        try { host = new URL(tab.url || '').hostname; } catch (e) { /* ignore */ }
+        const e = galleryCache.get(tabId) || {};
+        const extra = Array.isArray(e.extra) ? e.extra : [];
+        const seen = new Set(extra.map((p) => p && p.mid).filter(Boolean));
+        const posts = [];
+        for (const s of r.fresh) {
+            const p = weiboStatusToPost(s, 0, host);
+            if (!p.pics.length || (p.mid && seen.has(p.mid))) continue;
+            if (p.mid) seen.add(p.mid);
+            extra.push(p);
+            posts.push(p);
+        }
+        if (posts.length) {
+            galleryCache.set(tabId, { at: Date.now(), meta: e.meta || null, groups: Array.isArray(e.groups) ? e.groups : [], extra: extra.slice(-900) });
+        }
+        await waCheckpoint().catch(() => {});
+        return {
+            ok: true, uid, fetched: r.fetched, added: r.added, posts, done: !!r.done,
+            stopped: r.stopped || '', total: job.st.posts.length, declaredTotal: job.st.declaredTotal || 0,
+            cursor: r.cursor,
+        };
+    },
+
     scrollToPost: async (req) => {
         const tabId = Number(req.tabId) || 0;
         if (!tabId) throw new Error('tabId required');
@@ -1246,6 +1288,23 @@ async function waExistingFiles(uid) {
         if (!rows || rows.length < 1000) break;
     }
     return names;
+}
+
+/* 个人主页地址里的 uid：weibo.com/u/<uid>（桌面版主页）与 weibo.com/profile/<uid>（带名字的那版）。
+   不是主页（分组首页 /my/groups、搜索结果、m 站等）就拿不到 uid，API 模式必须明确拒绝而不是猜。 */
+function waProfileUid(url) {
+    const m = /weibo\.com\/(?:u|profile)\/(\d{5,})/i.exec(String(url || ''));
+    return m ? m[1] : '';
+}
+
+// 面板下拉与整档共用一份游标：同一个 uid 就复用现有任务，换 uid 才新建（断点只有一个槽位）
+async function waJobFor(uid) {
+    if (waJob && waJob.running) throw new Error('整档任务正在跑，先等它结束或用 weiboArchiveCancel');
+    if (waJob && String(waJob.st.uid) === String(uid)) return waJob;
+    const r = await waRestored();
+    const st = (r && String(r.st.uid) === String(uid)) ? r.st : newArchiveState(uid, { features: [0] });
+    waJob = { st, running: false, cancel: false, pub: publicArchive(st), checkpointEvery: 10, mediaDone: new Set(st.mediaDone || []) };
+    return waJob;
 }
 
 function publicWaMedia() {

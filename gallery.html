@@ -18,6 +18,7 @@
     <label class="g-view g-siteoff" id="siteOffWrap" hidden title="勾选后扩展在这个站点整体停用"><input type="checkbox" id="siteOff">禁用本站</label>
     <label class="g-view" title="只列屏幕上下各一屏内的图；关掉则列出这个页面已经加载的全部图"><input type="checkbox" id="onlyView">只看屏幕附近</label>
     <label class="g-view" id="feedAllWrap" title="连滚过去、被虚拟列表从页面上摘掉的微博一起收：图地址直接问微博自己那份信息流数据要，不用先把帖子滚出来"><input type="checkbox" id="feedAll">全部微博</label>
+    <label class="g-view" id="apiModeWrap" hidden title="勾上就不用再点「帮我翻页」：列表滚到底自动向微博的读流接口要下一页，一路往下能翻到这个账号最早那条。微博页面自己最多让你翻到最近几百条就到底，这条绕过了那个截断。只读、不滚动你的页面"><input type="checkbox" id="apiMode">API 模式</label>
     <button id="btnWide" title="下拉面板最宽只能 800px，点这里用接近全屏的大窗打开">⤢ 大窗</button>
     <button id="btnRefresh" title="重新扫描当前页面">刷新</button>
     <button id="btnMore" hidden title="替你把微博的信息流往后翻页加载：先叫微博自己加载下一页（页面画面不动），它不肯就照页面那条读流请求直接向后端要后面几页。全程只读、不滚动你的页面">帮我翻页</button>

@@ -14,7 +14,7 @@ export const ARCHIVE_STORE_KEY = 'mtbWeiboArchive';
 /* 构建标记：改一次归档相关代码就 +1。真人 Edge 的 ESM service worker 实测会连着几次
    「重新加载」后仍跑上一版（本仓库开发中踩过三次），有这个字段，一条 weiboArchiveState
    就能判定浏览器到底加载了哪一版，不用靠行为反推。 */
-export const WA_BUILD = 'wa3';
+export const WA_BUILD = 'wa4';
 export const MYMBLOG_API = 'https://weibo.com/ajax/statuses/mymblog';
 // feature 分桶实测：只有 0 报 data.total，1/2/14 各回 20 条但 total=-1，9/24 空。
 // 0 是主页时间线，其余几个是页面顶部那些标签（视频/文章/…），并集才接近「全部」。
@@ -216,6 +216,55 @@ export async function crawlArchive(deps, st) {
     st.done = !st.canceled && !st.error;
     st.finishedAt = Date.now();
     return publicArchive(st);
+}
+
+/* 面板「API 模式 · 无限下拉」用的增量抓取：一次只推进第一个桶的游标 1~10 页就返回，
+   并把这一批新采到的**原始 status** 一起带回去（调用方要按面板形状映射）。
+   和 crawlArchive 共用同一份 perFeature 游标状态，所以下拉过的内容再点整档不会重复敲接口。
+   停的条件和整档一致：空页 / 游标两次不动 / 收满 declaredTotal，都写进 stopped 让人看得见。 */
+export async function takePages(st, fetchPage, n = 1, featOpt) {
+    // 面板只要时间线，所以调用方会显式传 0；不传才退回「这份档案的第一个桶」
+    const feat = Number.isFinite(Number(featOpt)) ? Number(featOpt) : (st.features && st.features.length ? st.features[0] : 0);
+    const pf = st.perFeature[feat] || (st.perFeature[feat] = { cursor: '', page: 0, added: 0, end: false, error: '' });
+    const pages = Math.max(1, Math.min(10, Number(n) || 1));
+    const out = { fetched: 0, added: 0, fresh: [], done: false, stopped: '', cursor: pf.cursor || '', declaredTotal: st.declaredTotal || 0 };
+    if (pf.end) { out.done = true; out.stopped = 'already-end'; return out; }
+    if (!st.byId) st.byId = new Set(st.posts.map((p) => p.id));
+    let cursor = pf.cursor || '';
+    let same = 0;
+    for (let i = 0; i < pages; i++) {
+        let payload;
+        try { payload = await fetchPage({ uid: st.uid, feature: feat, page: pf.page + 1, sinceId: cursor }); }
+        catch (e) {
+            out.stopped = String((e && e.message) || e);
+            pf.error = out.stopped;
+            break;
+        }
+        const pg = parseArchivePage(payload);
+        out.fetched++;
+        pf.page++;
+        if (pg.declaredTotal > (st.declaredTotal || 0)) st.declaredTotal = pg.declaredTotal;
+        for (const s of pg.list) {
+            const r = normStatus(s, st.uid);
+            if (!r || st.byId.has(r.id)) continue;
+            st.byId.add(r.id);
+            st.posts.push(r);
+            out.fresh.push(s);
+        }
+        st.seenPages++;
+        out.cursor = pg.cursor || cursor;
+        same = pg.cursor && pg.cursor === cursor ? same + 1 : 0;
+        cursor = out.cursor;
+        pf.cursor = cursor;
+        out.declaredTotal = st.declaredTotal || 0;
+        if (!pg.list.length) { pf.end = true; out.stopped = 'empty-page'; break; }
+        if (same >= 2) { pf.end = true; out.stopped = 'cursor-stuck'; break; }
+        if (st.declaredTotal && st.posts.length >= st.declaredTotal) { pf.end = true; out.stopped = 'reached-total'; break; }
+    }
+    out.added = out.fresh.length;
+    out.done = !!pf.end;
+    out.posts = st.posts.length;
+    return out;
 }
 
 // 落盘形态：Set 不可序列化，所以剥掉 byId，恢复时再按 posts 重建

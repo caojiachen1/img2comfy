@@ -12,7 +12,7 @@ import { BUILTIN_SCRIPTS, ensureBuiltins } from '../src/common/builtin-scripts.j
 import { fillTemplate, fillTemplateRaw, formatBytes, ratioText, sanitizeFilename, sniffMime, base64ToBytes, bytesToBase64, bytesFingerprint, uniqueUploadName, extFromMime } from '../src/common/util.js';
 import { upgradeWeiboImageUrl, weiboImageTierUrl, imageDedupeKey, isWeiboHost, accountInitial, mergeFeedPosts, weiboStatusToPost, weiboStatusUrl, clampLoadPages } from '../src/common/gallery.js';
 import { UI_THEMES, DEFAULT_UI_THEME, normalizeUiTheme, uiThemeLabel } from '../src/common/theme.js';
-import { parseWeiboDate, eventDateOf, normStatus, parseArchivePage, addPosts, newArchiveState, crawlArchive, serializeArchive, restoreArchive, publicArchive, uniqPics, mediaPlan, normFeatures, reconcileDone, ARCHIVE_STORE_KEY, DEFAULT_FEATURES, TIERS, WA_BUILD } from '../src/gallery/weibo-archive.mjs';
+import { parseWeiboDate, eventDateOf, normStatus, parseArchivePage, addPosts, newArchiveState, crawlArchive, serializeArchive, restoreArchive, publicArchive, uniqPics, mediaPlan, normFeatures, reconcileDone, takePages, ARCHIVE_STORE_KEY, DEFAULT_FEATURES, TIERS, WA_BUILD } from '../src/gallery/weibo-archive.mjs';
 
 let pass = 0, fail = 0;
 const notes = [];
@@ -1423,6 +1423,30 @@ console.log('== 微博整档抓取（weibo-archive）==');
             'E:/mtb-weibo/42/2026-10-10/' + pids[2] + ' (1).jpg'])].join(',') === pids[0] + ',' + pids[2]);
     ok('账本与磁盘不一致时以磁盘为准（实测账本记 7 张、磁盘只剩 2 张，只信账本就永久漏下那 5 张）',
         reconcileDone(pids, []).size === 0 && reconcileDone(pids, ['E:\\x\\无关文件.jpg']).size === 0);
+
+    // 面板「API 模式 · 无限下拉」的增量入口
+    const stN = newArchiveState('42', { features: [1, 2, 14] });
+    let seq = 0;
+    const nr1 = await takePages(stN, async (q) => {
+        if (q.feature !== 0) throw new Error('API 模式必须只敲时间线桶，实际敲了 ' + q.feature);
+        seq++;
+        return { data: { list: [mk(seq * 2 - 1), mk(seq * 2)], since_id: 'p' + seq, total: 6 } };
+    }, 2, 0);
+    ok('takePages 认显式桶号：档案里存的是别的桶也不许沿用（面板只要时间线）', nr1.fetched === 2 && nr1.added === 4);
+    ok('takePages 把这一批原始 status 带回去（面板按自己的形状映射），游标随之前进',
+        nr1.fresh.length === 4 && nr1.cursor === 'p2' && stN.perFeature[0].page === 2);
+    const nr1b = await takePages(stN, async (q) => ({ data: { list: [mk(1), mk(2)], since_id: 'p2b', total: 6 } }), 1, 0);
+    ok('同一批帖子再下拉一次不会重复计数（按 id 去重，面板才不会越滚越多重复组）', nr1b.added === 0);
+    const nr2 = await takePages(stN, async () => ({ data: { list: [mk(5), mk(6)], since_id: 'p3', total: 6 } }), 1, 0);
+    ok('收满 declaredTotal 就 done + stopped=reached-total（面板据此停止下拉，不再敲接口）',
+        nr2.done === true && nr2.stopped === 'reached-total' && nr2.posts === 6);
+    const nr3 = await takePages(stN, async () => { throw new Error('不该再被调用'); }, 1, 0);
+    ok('已到底之后再下拉直接返回 already-end，一次接口都不敲（防止用户滚到底还在烧限流）',
+        nr3.stopped === 'already-end' && nr3.fetched === 0);
+    const stE = newArchiveState('42', { features: [0] });
+    const nrE = await takePages(stE, async () => ({ data: { list: [] } }), 3, 0);
+    ok('接口给空页 → done + empty-page，fetched 记 1（不是把请求数当帖子数）',
+        nrE.done === true && nrE.stopped === 'empty-page' && nrE.fetched === 1);
 }
 
 console.log('== 整档抓取的后台接线（源码钉子）==');
@@ -1467,6 +1491,43 @@ console.log('== 整档抓取的后台接线（源码钉子）==');
             .every((n) => bg.indexOf(n + ': {') > 0 && bg.indexOf(n + ': {') < a));
     ok('限流/风控要停下并说清原因，不许闷头把微博敲穿',
         /限流或风控/.test(run) || /限流或风控/.test(bg));
+}
+
+console.log('== 面板「API 模式 · 无限下拉」接线（源码钉子）==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const html = read('gallery.html');
+    const gm = read('src/gallery/gallery.mjs');
+    const bg = read('background.js');
+    ok('面板顶部有「API 模式」那颗勾选（与「全部微博」并列，只在微博页显示）',
+        /id="apiModeWrap"/.test(html) && /id="apiMode"/.test(html) && /API 模式/.test(html));
+    ok('勾选的说明要写清它绕过的是什么（微博页面自己翻到最近几百条就到底），否则用户不知道为什么要开',
+        /截断|最多让你翻到/.test(html));
+    ok('apiMode 走和 feedAll 同一套持久化：写 settings.gallery.apiMode 并 patchSettings 回后台',
+        /S\.apiMode = \(S\.settings\.gallery \|\| \{\}\)\.apiMode === true/.test(gm)
+        && /patch: \{ gallery: \{ apiMode: S\.apiMode \} \}/.test(gm));
+    ok('勾上 API 模式就藏掉「帮我翻页」与它的页数选择（两条路做同一件事，留着会让人以为要点）',
+        /\$\('#btnMore'\)\.hidden = !S\.weiboFlag \|\| S\.apiMode/.test(gm)
+        && /\$\('#morePagesWrap'\)\.hidden = !S\.weiboFlag \|\| S\.apiMode/.test(gm));
+    ok('无限下拉监听的是面板自己的滚动容器 #panelImages，离底 400px 触发、passive、并且 busy/已到底都不许再敲',
+        /\$\('#panelImages'\)/.test(gm) && /addEventListener\('scroll'/.test(gm) && /400/.test(gm)
+        && /\{ passive: true \}/.test(gm) && /if \(!S\.apiMode \|\| S\.apiBusy \|\| S\.running\) return/.test(gm)
+        && /S\.apiInfo && S\.apiInfo\.done\) return/.test(gm));
+    ok('补页只发一个后台动作 weiboArchiveNext，带 tabId、页数夹在 1~10（同一次下拉不许并发敲两下）',
+        /action: 'weiboArchiveNext', tabId: S\.tabId/.test(gm) && /Math\.min\(10, Number\(pages\)/.test(gm)
+        && /if \(S\.apiBusy\) return/.test(gm));
+    ok('API 模式不依赖「全部微博」也要把帖子并进来（这两个开关是两条不同数据来源，卡成一个就会勾了看不见）',
+        /if \(!S\.weiboFlag \|\| \(!S\.feedAll && !S\.apiMode\)\) return null;/.test(gm));
+    ok('回来的帖子按 mid 去重后塞进 S.extraPosts，并留上限（和「帮我翻页」同一条路，重扫才认得）',
+        /S\.extraPosts\.push\(p\)/.test(gm) && /S\.extraPosts = S\.extraPosts\.slice\(-3000\)/.test(gm));
+    ok('摘要必须写明 API 模式拉到几条/共几条、到底没有、或为什么停了',
+        /API 模式已拉/.test(gm) && /已到底/.test(gm) && /API 模式停了/.test(gm));
+    ok('后台侧 weiboArchiveNext 已注册且进了 EXT_SCHEMA（外部控制方要能自发现）',
+        /weiboArchiveNext: async/.test(bg) && /weiboArchiveNext: \{/.test(bg));
+    ok('认不出 uid 要直说「要在个人主页用」，不许拿分组首页的 URL 猜一个 uid',
+        /weibo\.com\/u\/<uid>/.test(bg) && /function waProfileUid/.test(bg));
+    ok('补来的帖子存进该标签页缓存的 extra，上限与「帮我翻页」一致（-900），两处不一致会让面板重开时数量跳变',
+        (bg.match(/extra: extra\.slice\(-900\)/g) || []).length >= 2);
 }
 
 __summary();process.exit(fail ? 1 : 0);

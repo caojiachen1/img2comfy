@@ -315,7 +315,7 @@ MV3 扩展页的 `script-src 'self'` 挡掉了跨源脚本与 `blob:` 模块，�
 
 ```bash
 node scripts/check-imports.mjs        # 语法 + 相对路径 + 具名导入是否存在（50+ 文件）
-node test/unit_pure.mjs              # 414 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言/微博整档抓取与后台接线）
+node test/unit_pure.mjs              # 432 条纯算法 + 主题体检（重采样/色彩/滤波/边缘/CV/算子链/设置/人脸数学/微博图 URL 与尺寸档位/界面风格五档的 CSS 文本断言/微博整档抓取与后台接线）
 node test/run_browser.mjs            # 页面级：内容脚本包 + 工具栏 + 拖拽 + 算子链 + 视频取帧
 node test/run_browser.mjs --ai       # 再加：vendor + slimSAM/swin2SR/YuNet 真实推理 + 设置页
 node test/run_browser.mjs --ai --only=sr|sam|face|llm|script|options   # 单跑某一阶段
@@ -449,6 +449,14 @@ SSIM/PSNR/MSE、帧间差、内容区测量。
    （如 `𝟚𝟘𝟚𝟜𝟘𝟞𝟘𝟠` → `2024-06-08`）——图博
    正文不写穿搭只写日期码，这是聚合主键）与 `created_at`（微博那个 `new Date()` 不可靠的英文日期，自己拆）。
 
+6. **面板「API 模式」**（`gallery.html` 顶部那颗勾选，只在微博页显示）：勾上之后**不用再点「帮我翻页」**，
+   列表滚到离底 400px 就自动向后端要下一页并追加，一路往下能翻到这个账号最早那条 —— 绕过的正是微博页面
+   自己那个「最近几百条到底」的截断。走的是 `weiboArchiveNext`（一次只推进 1~10 页就返回，所以同步等得起），
+   回来的帖子和「帮我翻页」fetch 路由同一套形状、同一个 `extra` 落点，所以合并/渲染/勾选逻辑一行都没另写。
+   与「全部微博」是**两条不同的数据来源**，所以没勾「全部微博」时 API 模式照样要能并进来（这两个开关卡成一个，
+   就会出现"勾了却一条都不显示"）。摘要里始终写明「已拉 N/M 条」「已到底」或停下的原因；
+   到底之后不再敲接口（防止用户滚到底还在烧限流）。
+
    **真机 E2E 已跑通**（登录态真人 Edge）：1176 条 / 59 页 / 48 秒，`complete=true`、`stopped=reached-total`；
    与一份**独立的 Python 抓取**逐条对表 —— id 集合相同、1176 条的 `pics` 数组全部相等、唯一图 4558 张零差异、
    日期零不一致、场次码解出 1042 条一致；`Dump to:download` 落盘 670KB JSON，`Media tier=card limit=3` 落 3 张图
@@ -494,7 +502,7 @@ src/common/gallery.js         微博图 URL 升级/去重键/域名判定等纯�
 src/gallery/weibo-archive.mjs 微博整档：接口游标翻页、按 id 去重、断点序列化、图片落盘计划（零 chrome 依赖，可在 Node 里跑断言）
 vendor/                       transformers.js + onnxruntime-web + QuickJS wasm（setup-vendor.mjs 生成，已 gitignore）
 scripts/                      build-content / setup-vendor / check-imports
-test/                         unit_pure（414 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
+test/                         unit_pure（432 条）、run_browser + harness_page/harness_ai/harness_options/harness_stub、
                               gallery_probe（有头，本页图片/批量发送）、cdp.mjs、旧的 run_headless + harness + cors_server
 ```
 
@@ -524,7 +532,7 @@ test/                         unit_pure（414 条）、run_browser + harness_pag
   留给作者定：要么补上消费 `showImage` 的过滤，要么把断言改成「只要求可取链类按钮都在」。
   这里只如实记红，不擅自改测试让它变绿。
 
-- 端到端验证覆盖到：414 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
+- 端到端验证覆盖到：432 条算法与主题单测、内容脚本包在真实浏览器里的工具栏/拖拽/算子链/视频取帧/图层命中、
   slimSAM 与 swin2SR 的真实推理、SCRFD+ArcFace 的加载+推理+解码+人脸库比对（同一人 0.98/0.73、异人 0.04）。
   **看图说话/提问/OCR 不再在这条链上**：它们改调外部 LLM API，验证换成「请求形状 + 应答取字 + 报错文案」
   （`node test/run_browser.mjs --only=llm` 拿桩后台跑 `AiEngine`，验的是没装运行时也能出文）。

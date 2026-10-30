@@ -47,6 +47,10 @@ const S = {
     raw: null,
     weiboFlag: false,
     feedAll: true,
+    // API 模式：不靠「帮我翻页」，滚到底就向读流接口要下一页（能翻过微博页面自己的截断）
+    apiMode: false,
+    apiBusy: false,
+    apiInfo: null,
     feedStats: null,
     feedError: '',
     feedTotal: 0,
@@ -103,6 +107,29 @@ function bindEvents() {
         }
         void (async () => { await collect(true); await syncBatchState(); })();
     };
+    $('#apiMode').onchange = () => {
+        if (S.running) return;
+        S.apiMode = $('#apiMode').checked;
+        S.settings.gallery = { ...(S.settings.gallery || {}), apiMode: S.apiMode };
+        chrome.runtime.sendMessage({ action: 'patchSettings', patch: { gallery: { apiMode: S.apiMode } } }).catch(() => {});
+        S.apiInfo = null;
+        void (async () => {
+            await collect(true);
+            await syncBatchState();
+            // 勾上就先要几页，别逼用户先滚一趟才知道有没有生效；滚到底会自动接着要
+            if (S.apiMode) await apiMore(3);
+        })();
+    };
+    // 无限下拉：滚到离底 400px 内就补下一页。用 passive 监听，不抢用户自己的滚动
+    {
+        const main = $('#panelImages');
+        if (main) main.addEventListener('scroll', () => {
+            if (!S.apiMode || S.apiBusy || S.running) return;
+            if (S.apiInfo && S.apiInfo.done) return;
+            if (main.scrollHeight - main.scrollTop - main.clientHeight > 400) return;
+            void apiMore(2);
+        }, { passive: true });
+    }
     $('#selAll').onchange = () => {
         if (S.running) return;
         const on = $('#selAll').checked;
@@ -196,6 +223,8 @@ async function loadSettings() {
     $('#sendTier').value = ((S.settings.gallery || {}).sendTier) || 'card';
     S.feedAll = (S.settings.gallery || {}).feedAll !== false;
     $('#feedAll').checked = S.feedAll;
+    S.apiMode = (S.settings.gallery || {}).apiMode === true;
+    $('#apiMode').checked = S.apiMode;
     S.jumpMode = normJumpMode((S.settings.gallery || {}).jumpMode);
     S.jumpMissing = (S.settings.gallery || {}).jumpMissing === 'tab' ? 'tab' : 'scroll';
     $('#morePages').value = String(clampLoadPages((S.settings.gallery || {}).loadPages));
@@ -281,9 +310,11 @@ async function collect(keepSelection) {
         syncSiteOff();
         S.weiboFlag = isWeiboHost(host);
         $('#feedAllWrap').hidden = !S.weiboFlag;
-        $('#btnMore').hidden = !S.weiboFlag;
-        $('#morePagesWrap').hidden = !S.weiboFlag;
-        $('#btnMore').disabled = !(S.weiboFlag && S.feedAll) || S.moreBusy;
+        $('#apiModeWrap').hidden = !S.weiboFlag;
+        // 勾了 API 模式，「帮我翻页」和它的页数选择就是多余的：滚到底会自动要下一页
+        $('#btnMore').hidden = !S.weiboFlag || S.apiMode;
+        $('#morePagesWrap').hidden = !S.weiboFlag || S.apiMode;
+        $('#btnMore').disabled = !(S.weiboFlag && S.feedAll) || S.moreBusy || S.apiMode;
     } catch (e) {
         showEmpty('读取当前页面失败', truncate(e.message || e, 180) + '。刷新网页或重新加载扩展后再试。');
         return;
@@ -416,7 +447,9 @@ async function jumpToGroup(g) {
 // 光扫 DOM 拿不到，而列表里每条都带 pic_ids/pic_infos。读不到就算了，不影响正常扫描。
 async function readFeedPosts() {
     S.feedError = '';
-    if (!S.weiboFlag || !S.feedAll) return null;
+    // API 模式自己就会往 S.extraPosts 里塞帖子，所以「全部微博」没勾也要让它并进来，
+    // 否则勾了 API 模式却一条都看不见 —— 这两个开关是两条不同的数据来源，不是一个的开关
+    if (!S.weiboFlag || (!S.feedAll && !S.apiMode)) return null;
     try {
         const res = await chrome.scripting.executeScript({
             target: { tabId: S.tabId, allFrames: false }, world: 'MAIN', func: weiboFeedPage, args: [{ max: 300 }],
@@ -494,6 +527,43 @@ async function loadMorePages() {
     } else {
         toast('没加载到更多' + (res && (res.stopped || res.error) ? '：' + (res.stopped || res.error) : ''), true);
     }
+}
+
+/* 「API 模式」的补页：让后台按 since_id 游标向微博的读流接口要接下来 1~N 页（不碰页面、不滚动）。
+   回来的已经是面板要的帖子形状（和「帮我翻页」fetch 路由同一套 weiboStatusToPost），
+   所以照同一套按 mid 去重塞进 S.extraPosts，再重扫一次就能渲染。
+   和「帮我翻页」的关键差别：这条绕过了微博页面自己那个「最近几百条到底」的截断。 */
+async function apiMore(pages) {
+    if (S.apiBusy) return;
+    S.apiBusy = true;
+    let res = null;
+    try {
+        res = await chrome.runtime.sendMessage({ action: 'weiboArchiveNext', tabId: S.tabId, pages: Math.max(1, Math.min(10, Number(pages) || 2)) });
+    } catch (e) {
+        res = { ok: false, error: truncate(String((e && e.message) || e || ''), 90) };
+    }
+    S.apiBusy = false;
+    if (!res || res.ok !== true) {
+        // 认不出 uid（不在个人主页）与限流都要停下并说清，不能每滚一下又敲一次
+        S.apiInfo = { done: true, error: (res && res.error) || '后台没有应答' };
+        toast('API 模式没拿到更多' + (S.apiInfo.error ? '：' + S.apiInfo.error : ''), true);
+        await collect(true);
+        return;
+    }
+    const seen = new Set(S.extraPosts.map((p) => p && p.mid).filter(Boolean));
+    for (const p of res.posts || []) {
+        if (!p.pics.length || (p.mid && seen.has(p.mid))) continue;
+        if (p.mid) seen.add(p.mid);
+        S.extraPosts.push(p);
+    }
+    S.extraPosts = S.extraPosts.slice(-3000);
+    S.apiInfo = {
+        total: res.total || 0, declaredTotal: res.declaredTotal || 0, added: res.added || 0,
+        done: !!res.done, stopped: res.stopped || '',
+    };
+    await collect(true);
+    await syncBatchState();
+    if (res.done) toast(res.stopped === 'reached-total' ? 'API 模式：已经拉到这个账号的最后一条' : 'API 模式：微博说没有更多了（' + (res.stopped || 'end') + '）');
 }
 
 async function scanOnce() {
@@ -706,12 +776,16 @@ function buildSummary(data) {
     const fixed = data.enriched ? ` · 补齐折叠 ${data.enriched} 张` : '';
     const st = S.feedStats;
     const fromFeed = st && (st.groups || st.items) ? ` · 按微博数据补出 ${st.groups} 条 / ${st.items} 张` : '';
+    // API 模式必须把「拉到哪了 / 共多少条 / 到底没有」写在摘要里，否则用户不知道下拉还有没有用
+    const ai = S.apiInfo;
+    const api = !S.apiMode ? '' : (ai && ai.error ? ` · API 模式停了：${ai.error}`
+        : ` · API 模式已拉 ${ai ? ai.total : 0}${ai && ai.declaredTotal ? '/' + ai.declaredTotal : ''} 条${ai && ai.done ? '（已到底）' : '，往下滚自动接着拉'}`);
     const feedErr = (S.feedAll && S.weiboFlag && S.feedError && !st) ? ` · 信息流数据没读到` : '';
     // 无用图片不再算「被忽略」：它们收在最后一个折叠组里，想看的可以展开
     const junk = data.junk ? ` · 无用图片 ${data.junk} 张（默认收起）` : '';
     const ignored = Math.max(0, (data.dropped || 0) - (data.junk || 0));
     const drop = ignored ? ` · 已忽略 ${ignored} 张` : '';
-    return `${data.host || ''} · ${kind} · ${data.total} 张图片${fixed}${fromFeed}${feedErr}${truncated}${off}${junk}${drop}${kept}`;
+    return `${data.host || ''} · ${kind} · ${data.total} 张图片${fixed}${fromFeed}${api}${feedErr}${truncated}${off}${junk}${drop}${kept}`;
 }
 
 function renderGroups() {
