@@ -172,6 +172,18 @@ export function mergeFeedPosts(acc, posts, meta = {}) {
             if (key) break;
         }
         if (!key) {
+            // 账户段只是命名空间，**帖子 id 本身就能唯一定位一条内容**。
+            // 小红书作者 uid 有两个来源（卡片底部链接 / 页面本身），账户段对不上但 #ps<id> 相同时
+            // 必须认回同一组，否则「展开全部图」会另起一组，用户看到同一笔记出现两次。
+            for (const idv of ids) {
+                const tail = '#ps' + idv;
+                for (const g of acc.groups) {
+                    if (String(g.key || '').slice(-tail.length) === tail) { key = g.key; break; }
+                }
+                if (key) break;
+            }
+        }
+        if (!key) {
             for (const pic of pics) {
                 const found = acc.byPid.get(pic.dk);
                 // 只认 DOM 量出来的那个组：feed 组自己按 mid 就能认回来，

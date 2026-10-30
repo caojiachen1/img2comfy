@@ -14,7 +14,7 @@ export const ARCHIVE_STORE_KEY = 'mtbWeiboArchive';
 /* 构建标记：改一次归档相关代码就 +1。真人 Edge 的 ESM service worker 实测会连着几次
    「重新加载」后仍跑上一版（本仓库开发中踩过三次），有这个字段，一条 weiboArchiveState
    就能判定浏览器到底加载了哪一版，不用靠行为反推。 */
-export const WA_BUILD = 'wa8';
+export const WA_BUILD = 'wa9';
 export const MYMBLOG_API = 'https://weibo.com/ajax/statuses/mymblog';
 // feature 分桶实测：只有 0 报 data.total，1/2/14 各回 20 条但 total=-1，9/24 空。
 // 0 是主页时间线，其余几个是页面顶部那些标签（视频/文章/…），并集才接近「全部」。

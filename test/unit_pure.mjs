@@ -1658,4 +1658,43 @@ console.log('== 小红书展开的后台与面板接线（源码钉子）==');
         /\.g-group-inv, \.g-group-only/.test(read('src/gallery/gallery.css')));
 }
 
+console.log('== 小红书按笔记分组与缓存合并（源码钉子 + mergeFeedPosts）==');
+{
+    const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
+    const col = read('src/gallery/collect.mjs');
+    const bg = read('background.js');
+    ok('采集器对小红书按「一条笔记一组」分（findCard 只认 article，不特殊处理就会把 30 张封面挤成一个页面组）',
+        col.includes('const xhs = ') && col.includes('function xhsPostOf')
+        && col.includes('const xp = xhsPostOf(el);') && col.includes('if (xp) return xp;'));
+    ok('组键必须是 `acct:<作者uid>#ps<笔记id>`，和 mergeFeedPosts 认回的格式一致（否则展开结果另起一组、同一笔记出现两次）',
+        col.includes("'acct:' + (uid || note) + '#ps' + note"));
+    ok('作者 uid 有两个来源：卡片底部的 /user/profile/<uid>，个人主页上卡片不重复作者链接就退回页面自己的 uid',
+        col.includes('a[href*="/user/profile/"]') && col.includes('let uid = pageUid;'));
+    ok('永久链接要带上卡片自己的 xsec_token（小红书不带 token 打不开），并且 memo 住同一笔记不重复查 DOM',
+        col.includes('xsec_token=') && col.includes('xhsMemo'));
+    ok('galleryCachePut 对 extra 是**合并**不是覆盖（面板 saveToCache 也写 extra，覆盖会把后台逐条解析的结果抹掉）',
+        /const prev = galleryCache\.get\(id\);/.test(bg) && /byId\.set\(k, p\)/.test(bg)
+        && !/entry\.extra\.slice\(0, 900\)/.test(bg));
+
+    // mergeFeedPosts 的后缀认回：账户段对不上但 #ps<id> 相同必须并回同一组
+    const acc = { groups: [], byKey: new Map(), seen: new Set(), byPid: new Map() };
+    const g0 = { key: 'acct:AAA#psnote9', label: 'A', items: [{ key: 'k0', url: 'https://x/0.jpg', y: 1 }], y: 1 };
+    acc.groups.push(g0); acc.byKey.set(g0.key, g0); acc.seen.add('k0');
+    const st = mergeFeedPosts(acc, [{
+        mid: 'note9', bid: 'note9', uid: 'BBB', name: 'B', text: '同一条笔记', url: 'https://www.xiaohongshu.com/explore/note9',
+        pics: [{ url: 'https://x/1.jpg', width: 10, height: 10 }],
+    }], { pageUrl: 'https://www.xiaohongshu.com/explore' });
+    ok('mergeFeedPosts：作者段不同（AAA vs BBB）也要靠 `#ps<id>` 后缀认回同一组，不许另起一组',
+        acc.groups.length === 1 && g0.items.length === 2 && st.matched === 1);
+    const acc2 = { groups: [], byKey: new Map(), seen: new Set(), byPid: new Map() };
+    const h0 = { key: 'acct:AAA#psother', label: 'A', items: [{ key: 'h0', url: 'https://x/0.jpg', y: 1 }], y: 1 };
+    acc2.groups.push(h0); acc2.byKey.set(h0.key, h0); acc2.seen.add('h0');
+    mergeFeedPosts(acc2, [{
+        mid: 'note9', uid: 'AAA', name: 'A', text: '另一条笔记', url: '',
+        pics: [{ url: 'https://x/9.jpg', width: 1, height: 1 }],
+    }], { pageUrl: '' });
+    ok('反向对照：id 不同就不许被后缀认回凑到同一组（那会把两条笔记的图混进一张卡片）',
+        acc2.groups.length === 2 && h0.items.length === 1);
+}
+
 __summary();process.exit(fail ? 1 : 0);

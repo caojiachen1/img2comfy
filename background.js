@@ -1102,8 +1102,24 @@ const HANDLERS = {
             }
             groups.push(g); n += items.length;
         }
-        // 「帮我翻页」直接要来的帖子（不在页面列表里，重扫也拿不到）跟着标签页一起存
-        const extra = Array.isArray(entry.extra) ? entry.extra.slice(0, 900).filter((p) => p && Array.isArray(p.pics)) : [];
+        // 「帮我翻页」/「展开每条笔记」要来的帖子不在页面列表里，重扫拿不到 —— 跟着标签页一起存。
+        // 这里是**合并**不是覆盖：面板自己 saveToCache 时也带一份 extra，直接覆盖会把后台
+        // 逐条落进来的解析结果抹掉（实测：面板一刷新，20 组展开结果全没了）
+        const prev = galleryCache.get(id);
+        const byId = new Map();
+        const noId = [];
+        const take = (p) => p && Array.isArray(p.pics) && p.pics.length;
+        for (const p of (prev && Array.isArray(prev.extra) ? prev.extra : [])) {
+            if (!take(p)) continue;
+            const k = String(p.mid || p.bid || p.id || '');
+            if (k) byId.set(k, p); else noId.push(p);
+        }
+        for (const p of (Array.isArray(entry.extra) ? entry.extra : [])) {
+            if (!take(p)) continue;
+            const k = String(p.mid || p.bid || p.id || '');
+            if (k) byId.set(k, p); else noId.push(p);
+        }
+        const extra = noId.concat([...byId.values()]).slice(-900);
         galleryCache.set(id, { at: Date.now(), meta: entry.meta || null, groups, extra });
         return { ok: true, items: n, groups: groups.length, extra: extra.length };
     },

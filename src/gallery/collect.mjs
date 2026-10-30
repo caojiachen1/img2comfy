@@ -50,6 +50,11 @@ export async function collectPageImages(options = {}) {
     }
     // 顶层页是微博时，iframe 里的图片也按微博规则升级/分组
     const weibo = opt.weibo === true || /(^|\.)weibo\.(com|cn)$/i.test(host);
+    // 小红书：卡片是 <section> 而不是 article，findCard 认不出就会全部落到「页面组」，
+    // 30 张封面挤成一组 —— 用户读作「分组不对」。它每条笔记的封面都包在
+    // <a href="/explore/<noteId>?xsec_token=…"> 里，作者链接在卡片底部，按这个分组。
+    const xhs = /(^|\.)xiaohongshu\.com$/i.test(host);
+    const pageUid = (location.href.match(/xiaohongshu\.com\/user\/profile\/([0-9a-f]{20,32})/i) || [])[1] || '';
     const pageUrl = location.href;
     const pageTitle = (document.title || host || '本页图片').trim();
     const JUNK_URL = /(?:^data:image\/svg|favicon|sprite|emoji|(?:^|[\/_.-])icon(?:[\/_.-]|$)|\/icons?\/|\/avatar|\/avatars?\/|profile_image|\/logo(?:[\/_.-]|$)|pixel|spacer|1x1|transparent|blank\.(?:gif|png)|sinaimg\.cn\/crop\.|\/\/tva[x]?\d*\.)/i;
@@ -382,9 +387,68 @@ export async function collectPageImages(options = {}) {
         };
     }
 
+    /* 小红书一张笔记卡片 → 一组。
+       组键刻意做成 `acct:<作者uid>#ps<笔记id>`，和 mergeFeedPosts 认回的格式一致，
+       这样「展开每条笔记的全部图」补进来的那些帖子会**并进同一组**，而不是另起一组重复显示。
+       作者 uid 优先取卡片底部的 /user/profile/<uid> 链接；个人主页上卡片不重复作者链接，
+       就退回页面自己的 uid（两条来源本来就同一个作者）。 */
+    function xhsPostOf(el) {
+        const NOTE = /xiaohongshu\.com\/(?:explore|search_result|profile)\/([0-9a-f]{24})/i;
+        const USER = /xiaohongshu\.com\/user\/profile\/([0-9a-f]{20,32})/i;
+        let note = '';
+        let token = '';
+        let container = null;
+        const direct = el && el.closest ? el.closest('a[href]') : null;
+        if (direct) {
+            const m = NOTE.exec(String(direct.href || ''));
+            if (m) { note = m[1]; container = parentOf(direct) || direct; }
+        }
+        if (!note) {
+            let node = el && el.parentElement;
+            for (let i = 0; node && i < 9; i++, node = parentOf(node)) {
+                const q = node.querySelectorAll ? node.querySelectorAll('a[href]') : [];
+                for (const a of q) {
+                    const m = NOTE.exec(String(a.href || ''));
+                    if (m) { note = m[1]; container = node; break; }
+                }
+                if (note) break;
+            }
+        }
+        if (!note) return null;
+        let uid = pageUid;
+        let name = '';
+        if (container && container.querySelector) {
+            const ua = container.querySelector('a[href*="/user/profile/"]');
+            const um = ua && USER.exec(String(ua.href || ''));
+            if (um) uid = um[1];
+            if (ua) name = cleanText(ua.innerText || ua.textContent).slice(0, 40);
+        }
+        let href = '';
+        try {
+            const anc = el && el.closest ? el.closest('a[href]') : null;
+            href = String((anc && anc.href) || '');
+        } catch (e) { /* ignore */ }
+        token = (/[?&]xsec_token=([^&]+)/.exec(href) || [])[1] || '';
+        const title = container ? cleanText((container.querySelector('.title, [class*="title"], footer') || {}).innerText || '') : '';
+        if (xhsMemo.has(note)) return xhsMemo.get(note);
+        const info = {
+            key: 'acct:' + (uid || note) + '#ps' + note,
+            label: name || pageTitle,
+            sub: (title || '').slice(0, 72),
+            url: 'https://www.xiaohongshu.com/explore/' + note + (token ? '?xsec_token=' + decodeURIComponent(token) : ''),
+        };
+        xhsMemo.set(note, info);
+        return info;
+    }
+
+    const xhsMemo = new Map();
     const cardCache = new WeakMap();
     const postCards = new Map();   // 组键 → 微博容器，用来补被折叠的九宫格图
     function infoFor(el) {
+        if (xhs) {
+            const xp = xhsPostOf(el);
+            if (xp) return xp;
+        }
         const card = findCard(el);
         if (!card) return pageGroup;
         if (cardCache.has(card)) return cardCache.get(card) || pageGroup;
